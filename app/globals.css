@@ -1,0 +1,195 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+
+@custom-variant dark (&:is(.dark *));
+
+/* SnowUI design system tokens */
+/*
+  SnowUI design tokens.
+  Palette, radii and type scale are grounded in the SnowUI dashboard design:
+  soft, airy surfaces, near-black ink, hairline borders and a set of pastel
+  data-visualization accents (mint, sky, lavender, green, indigo).
+*/
+
+@theme inline {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+
+  /* shadcn-compatible semantic colors */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  /* SnowUI brand surfaces + data accents */
+  --color-surface-blue: var(--surface-blue);
+  --color-surface-purple: var(--surface-purple);
+  --color-surface-mint: var(--surface-mint);
+  --color-surface-subtle: var(--surface-subtle);
+  --color-brand-mint: var(--brand-mint);
+  --color-brand-sky: var(--brand-sky);
+  --color-brand-lavender: var(--brand-lavender);
+  --color-brand-green: var(--brand-green);
+  --color-brand-blue: var(--brand-blue);
+  --color-brand-indigo: var(--brand-indigo);
+
+  /* status */
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+
+  /* chart tokens */
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* sidebar tokens */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+
+  /* radii — Figma: controls 8, cards 12/16, containers 24 */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-2xl: 28px;
+}
+
+:root {
+  color-scheme: light;
+
+  --background: #ffffff;
+  --foreground: #1c1c1c;
+  --card: #ffffff;
+  --card-foreground: #1c1c1c;
+  --popover: #ffffff;
+  --popover-foreground: #1c1c1c;
+
+  --primary: #1c1c1c;
+  --primary-foreground: #ffffff;
+  --secondary: #f7f9fb;
+  --secondary-foreground: #1c1c1c;
+  --muted: #f7f9fb;
+  --muted-foreground: rgba(28, 28, 28, 0.4);
+  --accent: #f7f9fb;
+  --accent-foreground: #1c1c1c;
+
+  --destructive: #ef4d4d;
+  --destructive-foreground: #ffffff;
+  --success: #71dd8c;
+  --warning: #f5b74f;
+
+  --border: rgba(28, 28, 28, 0.1);
+  --input: rgba(28, 28, 28, 0.1);
+  --ring: #7dbbff;
+
+  /* brand surfaces */
+  --surface-blue: #e6f1fd;
+  --surface-purple: #edeefc;
+  --surface-mint: #e5faf5;
+  --surface-subtle: #f7f9fb;
+
+  /* brand data accents */
+  --brand-mint: #6be6d3;
+  --brand-sky: #7dbbff;
+  --brand-lavender: #b899eb;
+  --brand-green: #71dd8c;
+  --brand-blue: #4c98fd;
+  --brand-indigo: #4f507f;
+
+  --chart-1: #7dbbff;
+  --chart-2: #6be6d3;
+  --chart-3: #b899eb;
+  --chart-4: #71dd8c;
+  --chart-5: #4f507f;
+
+  --sidebar: #ffffff;
+  --sidebar-foreground: #1c1c1c;
+  --sidebar-accent: #f7f9fb;
+  --sidebar-accent-foreground: #1c1c1c;
+  --sidebar-border: rgba(28, 28, 28, 0.1);
+}
+
+.dark {
+  color-scheme: dark;
+
+  --background: #1c1c1c;
+  --foreground: #ffffff;
+  --card: #232323;
+  --card-foreground: #ffffff;
+  --popover: #232323;
+  --popover-foreground: #ffffff;
+
+  --primary: #ffffff;
+  --primary-foreground: #1c1c1c;
+  --secondary: #ffffff0a;
+  --secondary-foreground: #ffffff;
+  --muted: #ffffff0a;
+  --muted-foreground: rgba(255, 255, 255, 0.4);
+  --accent: #ffffff0f;
+  --accent-foreground: #ffffff;
+
+  --destructive: #ef4d4d;
+  --destructive-foreground: #ffffff;
+  --success: #71dd8c;
+  --warning: #f5b74f;
+
+  --border: rgba(255, 255, 255, 0.1);
+  --input: rgba(255, 255, 255, 0.12);
+  --ring: #7dbbff;
+
+  /* brand surfaces — muted for dark ink */
+  --surface-blue: #20344a;
+  --surface-purple: #2b2c46;
+  --surface-mint: #1f3d3a;
+  --surface-subtle: #ffffff0a;
+
+  --brand-mint: #6be6d3;
+  --brand-sky: #7dbbff;
+  --brand-lavender: #b899eb;
+  --brand-green: #71dd8c;
+  --brand-blue: #4c98fd;
+  --brand-indigo: #a0bce8;
+
+  --chart-1: #7dbbff;
+  --chart-2: #6be6d3;
+  --chart-3: #b899eb;
+  --chart-4: #71dd8c;
+  --chart-5: #a0bce8;
+
+  --sidebar: #1c1c1c;
+  --sidebar-foreground: #ffffff;
+  --sidebar-accent: #ffffff0f;
+  --sidebar-accent-foreground: #ffffff;
+  --sidebar-border: rgba(255, 255, 255, 0.1);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: 'cv11', 'ss01';
+    -webkit-font-smoothing: antialiased;
+  }
+}

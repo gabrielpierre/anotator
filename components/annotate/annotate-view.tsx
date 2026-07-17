@@ -1,0 +1,1353 @@
+"use client"
+
+import Image from "next/image"
+import { useCallback, useEffect, useRef, useState } from "react"
+import {
+  MousePointer2,
+  Square,
+  Spline,
+  Circle,
+  Tag,
+  Hand,
+  ZoomIn,
+  ZoomOut,
+  Undo2,
+  Redo2,
+  Save,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
+  Trash2,
+  Check,
+  Plus,
+} from "lucide-react"
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
+import { Button } from "@/components/ui/button"
+import { classes } from "@/lib/mock-data"
+import { cn } from "@/lib/utils"
+import {
+  AutoAnnotationCard,
+  availableModels,
+  type ModelInfo,
+  type PredictionLayer,
+  type Suggestion,
+} from "@/components/annotate/auto-annotation-card"
+
+type ToolKey = "select" | "pan" | "box" | "polygon" | "point" | "tag"
+
+const tools: { icon: typeof MousePointer2; label: string; tool: ToolKey; key: string }[] = [
+  { icon: MousePointer2, label: "Selecionar", tool: "select", key: "V" },
+  { icon: Hand, label: "Mover", tool: "pan", key: "H" },
+  { icon: Square, label: "Caixa", tool: "box", key: "B" },
+  { icon: Spline, label: "Polígono", tool: "polygon", key: "P" },
+  { icon: Circle, label: "Ponto", tool: "point", key: "K" },
+  { icon: Tag, label: "Rótulo", tool: "tag", key: "T" },
+]
+
+type ClassItem = { name: string; color: string; parent?: string }
+
+const initialClassList: ClassItem[] = classes.slice(0, 9).map((c) => ({ name: c.name, color: c.color }))
+
+const newClassPalette = [
+  "oklch(0.65 0.18 25)",
+  "oklch(0.6 0.15 300)",
+  "oklch(0.7 0.14 160)",
+  "oklch(0.68 0.16 70)",
+  "oklch(0.62 0.17 220)",
+]
+
+type Shape =
+  | { id: number; type: "box"; cls: string; conf?: number; x: number; y: number; w: number; h: number }
+  | { id: number; type: "polygon"; cls: string; points: { x: number; y: number }[] }
+  | { id: number; type: "point"; cls: string; x: number; y: number }
+
+const initialShapes: Shape[] = [
+  { id: 88213, type: "box", cls: "car", conf: 0.93, x: 0.14, y: 0.52, w: 0.2, h: 0.22 },
+  { id: 88214, type: "box", cls: "car", conf: 0.91, x: 0.33, y: 0.52, w: 0.15, h: 0.18 },
+  { id: 88215, type: "box", cls: "bus", conf: 0.88, x: 0.4, y: 0.34, w: 0.16, h: 0.3 },
+  { id: 88216, type: "box", cls: "truck", conf: 0.87, x: 0.56, y: 0.36, w: 0.14, h: 0.26 },
+]
+
+const clamp = (v: number, min = 0, max = 1) => Math.min(max, Math.max(min, v))
+const MIN_SCALE = 0.4
+const MAX_SCALE = 8
+const MIN_BOX = 0.01
+
+type Handle = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
+
+const handles: { id: Handle; cls: string; cursor: string }[] = [
+  { id: "nw", cls: "left-0 top-0 -translate-x-1/2 -translate-y-1/2", cursor: "nwse-resize" },
+  { id: "n", cls: "left-1/2 top-0 -translate-x-1/2 -translate-y-1/2", cursor: "ns-resize" },
+  { id: "ne", cls: "right-0 top-0 translate-x-1/2 -translate-y-1/2", cursor: "nesw-resize" },
+  { id: "e", cls: "right-0 top-1/2 translate-x-1/2 -translate-y-1/2", cursor: "ew-resize" },
+  { id: "se", cls: "right-0 bottom-0 translate-x-1/2 translate-y-1/2", cursor: "nwse-resize" },
+  { id: "s", cls: "left-1/2 bottom-0 -translate-x-1/2 translate-y-1/2", cursor: "ns-resize" },
+  { id: "sw", cls: "left-0 bottom-0 -translate-x-1/2 translate-y-1/2", cursor: "nesw-resize" },
+  { id: "w", cls: "left-0 top-1/2 -translate-x-1/2 -translate-y-1/2", cursor: "ew-resize" },
+]
+
+const POLY_CLOSE_DIST = 0.02
+
+export function AnnotateView() {
+  const [tool, setTool] = useState<ToolKey>("box")
+  const [classList, setClassList] = useState<ClassItem[]>(initialClassList)
+  // Nenhuma classe ativa por padrão: o usuário desenha primeiro e escolhe a classe depois.
+  const [activeClass, setActiveClass] = useState<string | null>(null)
+  const colorFor = useCallback(
+    (cls: string) => {
+      const item = classList.find((c) => c.name === cls)
+      if (item) return item.color
+      // Subclasse herda a cor do pai se não encontrada diretamente
+      return "var(--brand-blue)"
+    },
+    [classList],
+  )
+  // Ferramenta temporária (ex.: mover durante um arrasto com a ferramenta de caixa ativa)
+  const [tempTool, setTempTool] = useState<ToolKey | null>(null)
+  const [returnToolAfterSelect, setReturnToolAfterSelect] = useState<ToolKey | null>(null)
+  // Picker de classe com autocomplete: aberto após desenhar (isNew) ou por duplo clique.
+  // filterParent restringe as sugestões às subclasses de uma classe.
+  const [classPicker, setClassPicker] = useState<{
+    id: number
+    x: number
+    y: number
+    isNew?: boolean
+    filterParent?: string
+  } | null>(null)
+  const [classQuery, setClassQuery] = useState("")
+  // Adição de classe/subclasse
+  const [addingClass, setAddingClass] = useState<{ parent: string | null } | null>(null)
+  const [newClassName, setNewClassName] = useState("")
+  const [shapes, setShapes] = useState<Shape[]>(initialShapes)
+  const [selectedId, setSelectedId] = useState<number | null>(88213)
+  const selectedIdRef = useRef(selectedId)
+  selectedIdRef.current = selectedId
+  const [view, setView] = useState({ s: 1, tx: 0, ty: 0 })
+  const [draft, setDraft] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
+  const [polyDraft, setPolyDraft] = useState<{ x: number; y: number }[] | null>(null)
+  const polyDraftRef = useRef(polyDraft)
+  polyDraftRef.current = polyDraft
+  const [cursorNorm, setCursorNorm] = useState<{ x: number; y: number } | null>(null)
+  const lastPolyClick = useRef(0)
+  const [saved, setSaved] = useState(false)
+
+  // ---- Navegação de imagens ----
+  const TOTAL_IMAGES = 1250
+  const [imageIndex, setImageIndex] = useState(342)
+
+  // ---- Autoanotação: sugestões e camadas de predição ----
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([])
+  const [hiddenLayers, setHiddenLayers] = useState<string[]>([])
+  const nextSuggestionId = useRef(95000)
+
+  const layerUnit = (m: ModelInfo) =>
+    m.task === "Segmentação" ? "máscaras" : m.task === "Classificação" ? "labels" : "sugestões"
+
+  const predictionLayers: PredictionLayer[] = availableModels
+    .map((m) => ({
+      modelId: m.id,
+      label: `${m.name} ${m.version}`,
+      unit: layerUnit(m),
+      count: suggestions.filter((s) => s.origin.model_id === m.id).length,
+      visible: !hiddenLayers.includes(m.id),
+    }))
+    .filter((l) => l.count > 0)
+
+  const generateSuggestions = (params: {
+    models: ModelInfo[]
+    threshold: number
+    nmsIou: number
+    classes: string[]
+    scope: string
+    applyMode: string
+    replaceModels: string[]
+  }) => {
+    const pool = params.classes.length > 0 ? params.classes : classList.map((c) => c.name)
+    const timestamp = new Date().toISOString()
+    const created: Suggestion[] = []
+
+    for (const model of params.models) {
+      const count = 3 + Math.floor(Math.random() * 4)
+      for (let i = 0; i < count; i++) {
+        const conf = Math.round((params.threshold + Math.random() * (1 - params.threshold)) * 100) / 100
+        created.push({
+          id: nextSuggestionId.current++,
+          cls: pool[Math.floor(Math.random() * pool.length)],
+          conf,
+          x: clamp(0.05 + Math.random() * 0.75),
+          y: clamp(0.2 + Math.random() * 0.5),
+          w: 0.06 + Math.random() * 0.12,
+          h: 0.08 + Math.random() * 0.14,
+          status: "proposed",
+          origin: {
+            model_id: model.id,
+            model_version: model.version,
+            confidence: conf,
+            threshold_used: params.threshold,
+            nms_iou: params.nmsIou,
+            timestamp,
+            scope: params.scope,
+            user_id: "gabriel",
+          },
+        })
+      }
+    }
+
+    setSuggestions((prev) => [
+      ...prev.filter((s) => !params.replaceModels.includes(s.origin.model_id)),
+      ...created,
+    ])
+    setHiddenLayers((prev) => prev.filter((id) => !params.models.some((m) => m.id === id)))
+
+    return {
+      created: created.length,
+      ignored: Math.floor(Math.random() * 5),
+      conflicts: params.replaceModels.length > 0 ? 0 : Math.floor(Math.random() * 3),
+    }
+  }
+
+  const modelLabelFor = (modelId: string, version: string) => {
+    const m = availableModels.find((x) => x.id === modelId)
+    return m ? `${m.name} ${version}` : modelId
+  }
+
+  const containerRef = useRef<HTMLDivElement>(null)
+  const stageRef = useRef<HTMLDivElement>(null)
+  const viewRef = useRef(view)
+  viewRef.current = view
+  const toolRef = useRef(tool)
+  toolRef.current = tool
+  const nextId = useRef(90000)
+
+  const past = useRef<Shape[][]>([])
+  const future = useRef<Shape[][]>([])
+  const [, forceRender] = useState(0)
+
+  const commit = useCallback((updater: (prev: Shape[]) => Shape[]) => {
+    setShapes((prev) => {
+      past.current.push(prev)
+      if (past.current.length > 50) past.current.shift()
+      future.current = []
+      return updater(prev)
+    })
+    forceRender((n) => n + 1)
+  }, [])
+
+  const undo = useCallback(() => {
+    setShapes((prev) => {
+      const last = past.current.pop()
+      if (!last) return prev
+      future.current.push(prev)
+      return last
+    })
+    forceRender((n) => n + 1)
+  }, [])
+
+  const redo = useCallback(() => {
+    setShapes((prev) => {
+      const next = future.current.pop()
+      if (!next) return prev
+      past.current.push(prev)
+      return next
+    })
+    forceRender((n) => n + 1)
+  }, [])
+
+  // Convert a client point to normalized [0..1] stage coordinates.
+  const clientToNorm = useCallback((clientX: number, clientY: number) => {
+    const r = stageRef.current!.getBoundingClientRect()
+    return { x: (clientX - r.left) / r.width, y: (clientY - r.top) / r.height }
+  }, [])
+
+  // Wheel zoom toward cursor (native, non-passive so we can preventDefault).
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const rect = el.getBoundingClientRect()
+      const cx = rect.left + rect.width / 2
+      const cy = rect.top + rect.height / 2
+      const mx = e.clientX - cx
+      const my = e.clientY - cy
+      const { s, tx, ty } = viewRef.current
+      const factor = Math.exp(-e.deltaY * 0.0015)
+      const ns = clamp(s * factor, MIN_SCALE, MAX_SCALE)
+      const k = ns / s
+      setView({ s: ns, tx: mx - k * (mx - tx), ty: my - k * (my - ty) })
+    }
+    el.addEventListener("wheel", onWheel, { passive: false })
+    return () => el.removeEventListener("wheel", onWheel)
+  }, [])
+
+  const zoomBy = useCallback((factor: number) => {
+    setView((v) => ({ ...v, s: clamp(v.s * factor, MIN_SCALE, MAX_SCALE) }))
+  }, [])
+  const resetView = useCallback(() => setView({ s: 1, tx: 0, ty: 0 }), [])
+
+  const dragWindow = (onMove: (e: PointerEvent) => void, onUp?: (e: PointerEvent) => void) => {
+    const move = (e: PointerEvent) => onMove(e)
+    const up = (e: PointerEvent) => {
+      window.removeEventListener("pointermove", move)
+      window.removeEventListener("pointerup", up)
+      onUp?.(e)
+    }
+    window.addEventListener("pointermove", move)
+    window.addEventListener("pointerup", up)
+  }
+
+  // Resolve a classe a usar ao desenhar:
+  // - sem classe ativa → desenha sem classe e abre o autocomplete
+  // - classe ativa com subclasses (e nenhuma subclasse ativa) → aplica a classe pai
+  //   provisoriamente e abre o autocomplete filtrado nas subclasses
+  // - classe ativa sem subclasses, ou subclasse ativa → aplica direto
+  const resolveDrawClass = () => {
+    if (!activeClass) return { cls: "", filterParent: undefined as string | undefined, needsPicker: true }
+    const item = classList.find((c) => c.name === activeClass)
+    if (item && !item.parent && classList.some((c) => c.parent === item.name)) {
+      return { cls: item.name, filterParent: item.name, needsPicker: true }
+    }
+    return { cls: activeClass, filterParent: undefined, needsPicker: false }
+  }
+
+  // Abre o picker de classe ancorado ao lado do shape.
+  const openPickerForShape = (shape: Shape, opts: { isNew?: boolean; filterParent?: string } = {}) => {
+    const r = containerRef.current?.getBoundingClientRect()
+    const sr = stageRef.current?.getBoundingClientRect()
+    if (!r || !sr) return
+    let ax = sr.left
+    let ay = sr.top
+    if (shape.type === "box") {
+      ax = sr.left + (shape.x + shape.w) * sr.width + 8
+      ay = sr.top + shape.y * sr.height
+    } else if (shape.type === "point") {
+      ax = sr.left + shape.x * sr.width + 10
+      ay = sr.top + shape.y * sr.height
+    } else {
+      const p = shape.points[0]
+      ax = sr.left + p.x * sr.width + 8
+      ay = sr.top + p.y * sr.height
+    }
+    setClassQuery("")
+    setClassPicker({ id: shape.id, x: ax - r.left, y: ay - r.top, ...opts })
+  }
+
+  // Cancela o picker. Se o shape acabou de ser criado e ficou sem classe, remove-o.
+  const cancelPicker = () => {
+    setClassPicker((picker) => {
+      if (picker?.isNew) {
+        const shape = shapes.find((s) => s.id === picker.id)
+        if (shape && !shape.cls) {
+          commit((prev) => prev.filter((s) => s.id !== picker.id))
+          setSelectedId(null)
+        }
+      }
+      return null
+    })
+    setClassQuery("")
+  }
+  const cancelPickerRef = useRef(cancelPicker)
+  cancelPickerRef.current = cancelPicker
+
+  // Aplica a classe escolhida no autocomplete.
+  const applyPickerClass = (name: string) => {
+    if (!classPicker) return
+    commit((prev) => prev.map((s) => (s.id === classPicker.id ? { ...s, cls: name } : s)))
+    setClassPicker(null)
+    setClassQuery("")
+  }
+
+  // Sugestões do autocomplete: filtradas pela query e, se aplicável, pelas subclasses do pai.
+  const pickerPool = classPicker?.filterParent
+    ? classList.filter((c) => c.name === classPicker.filterParent || c.parent === classPicker.filterParent)
+    : classList
+  const pickerQuery = classQuery.trim().toLowerCase()
+  const pickerSuggestions = (
+    pickerQuery ? pickerPool.filter((c) => c.name.toLowerCase().includes(pickerQuery)) : pickerPool
+  ).slice(0, 8)
+
+  // Pan por arrasto — usado pela ferramenta mão e pelo botão do meio do mouse.
+  const startPan = useCallback(
+    (e: { clientX: number; clientY: number }) => {
+      const start = { x: e.clientX, y: e.clientY }
+      const base = { ...viewRef.current }
+      dragWindow((ev) => {
+        setView({ s: base.s, tx: base.tx + (ev.clientX - start.x), ty: base.ty + (ev.clientY - start.y) })
+      })
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+
+  // Pointer down on the empty stage.
+  const onStagePointerDown = (e: React.PointerEvent) => {
+    // Botão do meio (scroll pressionado): sempre move a imagem, em qualquer ferramenta.
+    if (e.button === 1) {
+      e.preventDefault()
+      startPan(e)
+      return
+    }
+    if (e.button !== 0) return
+    cancelPicker()
+    const t = toolRef.current
+
+    if (t === "pan") {
+      startPan(e)
+      return
+    }
+
+    if (t === "select") {
+      setSelectedId(null)
+      if (returnToolAfterSelect) {
+        setTool(returnToolAfterSelect)
+        setTempTool(null)
+        setReturnToolAfterSelect(null)
+      }
+      return
+    }
+
+    if (t === "point") {
+      const p = clientToNorm(e.clientX, e.clientY)
+      const id = nextId.current++
+      const resolved = resolveDrawClass()
+      const shape: Shape = { id, type: "point", cls: resolved.cls, x: clamp(p.x), y: clamp(p.y) }
+      commit((prev) => [...prev, shape])
+      setSelectedId(id)
+      if (resolved.needsPicker) openPickerForShape(shape, { isNew: true, filterParent: resolved.filterParent })
+      return
+    }
+
+    if (t === "polygon") {
+      const p = { x: clamp(clientToNorm(e.clientX, e.clientY).x), y: clamp(clientToNorm(e.clientX, e.clientY).y) }
+      const pts = polyDraftRef.current ?? []
+      const now = Date.now()
+      const isDouble = now - lastPolyClick.current < 260
+      lastPolyClick.current = now
+      if (pts.length >= 3) {
+        const first = pts[0]
+        if (Math.hypot(p.x - first.x, p.y - first.y) < POLY_CLOSE_DIST || isDouble) {
+          finishPolygon()
+          return
+        }
+      }
+      setPolyDraft([...pts, p])
+      return
+    }
+
+    if (t === "box") {
+      const start = clientToNorm(e.clientX, e.clientY)
+      setSelectedId(null)
+      let last: { x: number; y: number; w: number; h: number } | null = null
+      dragWindow(
+        (ev) => {
+          const cur = clientToNorm(ev.clientX, ev.clientY)
+          last = {
+            x: Math.min(start.x, cur.x),
+            y: Math.min(start.y, cur.y),
+            w: Math.abs(cur.x - start.x),
+            h: Math.abs(cur.y - start.y),
+          }
+          setDraft(last)
+        },
+        () => {
+          setDraft(null)
+          if (last && last.w > 0.01 && last.h > 0.01) {
+            const id = nextId.current++
+            const d = last
+            const resolved = resolveDrawClass()
+            const shape: Shape = { id, type: "box", cls: resolved.cls, x: clamp(d.x), y: clamp(d.y), w: d.w, h: d.h }
+            commit((prev) => [...prev, shape])
+            setSelectedId(id)
+            if (resolved.needsPicker) openPickerForShape(shape, { isNew: true, filterParent: resolved.filterParent })
+          }
+        },
+      )
+    }
+  }
+
+  const finishPolygon = useCallback(() => {
+    const pts = polyDraftRef.current
+    if (pts && pts.length >= 3) {
+      const id = nextId.current++
+      const resolved = resolveDrawClass()
+      const shape: Shape = { id, type: "polygon", cls: resolved.cls, points: pts }
+      commit((prev) => [...prev, shape])
+      setSelectedId(id)
+      if (resolved.needsPicker) openPickerForShape(shape, { isNew: true, filterParent: resolved.filterParent })
+    }
+    setPolyDraft(null)
+    setCursorNorm(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeClass, commit, classList])
+
+  // Move a shape (box/point/polygon). Boxes and polygons clicked from drawing
+  // tools switch to selection so edit affordances stay available after the click.
+  const startMove = (e: React.PointerEvent, shape: Shape) => {
+    // Botão do meio: pan da imagem mesmo sobre um objeto.
+    if (e.button === 1) {
+      e.preventDefault()
+      e.stopPropagation()
+      startPan(e)
+      return
+    }
+    if (e.button !== 0) return
+    e.stopPropagation()
+    if (classPicker?.id === shape.id) {
+      setClassPicker(null)
+      setClassQuery("")
+    } else {
+      cancelPicker()
+    }
+    const currentTool = toolRef.current
+    if (currentTool === "tag") {
+      setSelectedId(shape.id)
+      if (activeClass) {
+        commit((prev) => prev.map((s) => (s.id === shape.id ? { ...s, cls: activeClass } : s)))
+      } else {
+        // Sem classe ativa: abre o autocomplete para escolher a classe deste objeto.
+        openPickerForShape(shape)
+      }
+      return
+    }
+    // Polígono em desenho: cliques sobre objetos continuam adicionando vértices.
+    if (currentTool === "polygon" && polyDraftRef.current?.length) return
+    if (currentTool === "pan") return
+    const shouldSwitchToSelect = currentTool !== "select" && (shape.type === "box" || shape.type === "polygon")
+    const isTemporary = currentTool !== "select" && !shouldSwitchToSelect
+    if (shouldSwitchToSelect) {
+      setTool("select")
+      setTempTool(null)
+      setReturnToolAfterSelect(currentTool)
+    }
+    if (isTemporary) setTempTool("select")
+    setSelectedId(shape.id)
+    const start = clientToNorm(e.clientX, e.clientY)
+    let moved = false
+    const before = shape
+    const beforeShapes = shapes
+    dragWindow(
+      (ev) => {
+        const cur = clientToNorm(ev.clientX, ev.clientY)
+        const dx = cur.x - start.x
+        const dy = cur.y - start.y
+        if (Math.abs(dx) > 0.002 || Math.abs(dy) > 0.002) moved = true
+        setShapes((prev) =>
+          prev.map((s) => {
+            if (s.id !== before.id) return s
+            if (before.type === "box" && s.type === "box")
+              return { ...s, x: clamp(before.x + dx, 0, 1 - s.w), y: clamp(before.y + dy, 0, 1 - s.h) }
+            if (before.type === "point" && s.type === "point")
+              return { ...s, x: clamp(before.x + dx), y: clamp(before.y + dy) }
+            if (before.type === "polygon" && s.type === "polygon")
+              return { ...s, points: before.points.map((pt) => ({ x: clamp(pt.x + dx), y: clamp(pt.y + dy) })) }
+            return s
+          }),
+        )
+      },
+      () => {
+        // Volta para a ferramenta original após o arrasto temporário.
+        if (isTemporary) setTempTool(null)
+        if (moved) {
+          past.current.push(beforeShapes)
+          future.current = []
+        }
+      },
+    )
+  }
+
+  // Resize a box from any of the 8 handles (delta-based, matches the review workspace).
+  const startResize = (e: React.PointerEvent, box: Extract<Shape, { type: "box" }>, mode: Handle) => {
+    e.stopPropagation()
+    setSelectedId(box.id)
+    const start = { x: box.x, y: box.y, w: box.w, h: box.h }
+    const p0 = clientToNorm(e.clientX, e.clientY)
+    const before = shapes
+    dragWindow(
+      (ev) => {
+        const cur = clientToNorm(ev.clientX, ev.clientY)
+        const dx = cur.x - p0.x
+        const dy = cur.y - p0.y
+        const b = { ...start }
+        if (mode.includes("e")) b.w = clamp(start.w + dx, MIN_BOX, 1 - start.x)
+        if (mode.includes("s")) b.h = clamp(start.h + dy, MIN_BOX, 1 - start.y)
+        if (mode.includes("w")) {
+          const nx = clamp(start.x + dx, 0, start.x + start.w - MIN_BOX)
+          b.x = nx
+          b.w = start.w + (start.x - nx)
+        }
+        if (mode.includes("n")) {
+          const ny = clamp(start.y + dy, 0, start.y + start.h - MIN_BOX)
+          b.y = ny
+          b.h = start.h + (start.y - ny)
+        }
+        setShapes((prev) => prev.map((s) => (s.id === box.id ? { ...s, ...b } : s)))
+      },
+      () => {
+        past.current.push(before)
+        future.current = []
+      },
+    )
+  }
+
+  const deleteSelected = useCallback(() => {
+    const id = selectedIdRef.current
+    if (id != null) {
+      commit((prev) => prev.filter((s) => s.id !== id))
+      setSelectedId(null)
+    }
+  }, [commit])
+
+  // Keyboard shortcuts.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement
+      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault()
+        e.shiftKey ? redo() : undo()
+        return
+      }
+      if (e.key === "Delete" || e.key === "Backspace") {
+        e.preventDefault()
+        deleteSelected()
+        return
+      }
+      if (e.key === "Enter" && polyDraft) {
+        finishPolygon()
+        return
+      }
+      if (e.key === "Escape") {
+        setPolyDraft(null)
+        setCursorNorm(null)
+        setDraft(null)
+        cancelPickerRef.current()
+        return
+      }
+      const match = tools.find((t) => t.key.toLowerCase() === e.key.toLowerCase())
+      if (match) {
+        setReturnToolAfterSelect(null)
+        setTempTool(null)
+        setTool(match.tool)
+        return
+      }
+      const rootClasses = classList.filter((c) => !c.parent)
+      const n = Number.parseInt(e.key, 10)
+      if (!Number.isNaN(n) && n >= 1 && n <= Math.min(9, rootClasses.length)) {
+        // Pressionar o mesmo número novamente desmarca a classe ativa.
+        setActiveClass((prev) => (prev === rootClasses[n - 1].name ? null : rootClasses[n - 1].name))
+      }
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [undo, redo, deleteSelected, finishPolygon, polyDraft, classList])
+
+  const handleSave = () => {
+    setSaved(true)
+    setTimeout(() => setSaved(false), 1600)
+  }
+
+  const cursor =
+    tool === "pan" ? "grab" : tool === "box" || tool === "polygon" || tool === "point" ? "crosshair" : "default"
+
+  const pct = (v: number) => `${v * 100}%`
+
+  return (
+    <div className="flex h-[calc(100dvh-3.5rem)] flex-col lg:flex-row">
+      {/* Tool rail */}
+      <div className="flex shrink-0 items-center gap-1 border-b border-border bg-card px-3 py-2 lg:flex-col lg:border-b-0 lg:border-r lg:py-4">
+        {tools.map((t) => (
+          <button
+            key={t.label}
+            type="button"
+            onClick={() => {
+              setReturnToolAfterSelect(null)
+              setTempTool(null)
+              setTool(t.tool)
+            }}
+            title={`${t.label} (${t.key})`}
+            aria-label={t.label}
+            aria-pressed={(tempTool ?? tool) === t.tool}
+            className={cn(
+              "flex size-10 items-center justify-center rounded-lg transition-colors",
+              (tempTool ?? tool) === t.tool
+                ? "bg-brand-blue text-white"
+                : "text-muted-foreground hover:bg-muted hover:text-foreground",
+            )}
+          >
+            <t.icon className="size-5" />
+          </button>
+        ))}
+      </div>
+
+      {/* Canvas */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex items-center justify-between gap-2 border-b border-border bg-card px-4 py-2">
+          <div className="flex items-center gap-2 text-sm">
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Imagem anterior"
+              onClick={() => setImageIndex((i) => Math.max(1, i - 1))}
+              disabled={imageIndex <= 1}
+            >
+              <ChevronLeft className="size-4" />
+            </Button>
+            <span className="tabular-nums text-muted-foreground">
+              {imageIndex.toLocaleString("pt-BR")} / {TOTAL_IMAGES.toLocaleString("pt-BR")}
+            </span>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Próxima imagem"
+              onClick={() => setImageIndex((i) => Math.min(TOTAL_IMAGES, i + 1))}
+              disabled={imageIndex >= TOTAL_IMAGES}
+            >
+              <ChevronRight className="size-4" />
+            </Button>
+            <span className="ml-2 font-medium text-foreground">
+              Imagem {String(imageIndex).padStart(6, "0")}.jpg
+            </span>
+          </div>
+          <div className="flex items-center gap-1">
+            <Button variant="ghost" size="icon" aria-label="Desfazer" onClick={undo} disabled={past.current.length === 0}>
+              <Undo2 className="size-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="Refazer"
+              onClick={redo}
+              disabled={future.current.length === 0}
+            >
+              <Redo2 className="size-4" />
+            </Button>
+            <Button variant="ghost" size="icon" aria-label="Diminuir zoom" onClick={() => zoomBy(1 / 1.2)}>
+              <ZoomOut className="size-4" />
+            </Button>
+            <button
+              type="button"
+              onClick={resetView}
+              title="Redefinir zoom"
+              className="min-w-12 rounded px-1 text-xs tabular-nums text-muted-foreground hover:text-foreground"
+            >
+              {Math.round(view.s * 100)}%
+            </button>
+            <Button variant="ghost" size="icon" aria-label="Aumentar zoom" onClick={() => zoomBy(1.2)}>
+              <ZoomIn className="size-4" />
+            </Button>
+            <Button size="sm" className="ml-1" onClick={handleSave}>
+              {saved ? <Check className="size-4" /> : <Save className="size-4" />}
+              {saved ? "Salvo" : "Salvar"}
+            </Button>
+          </div>
+        </div>
+
+        <div
+          ref={containerRef}
+          className="relative flex flex-1 items-center justify-center overflow-hidden bg-[#0b0d10] p-6 touch-none select-none"
+        >
+          <div
+            ref={stageRef}
+            className="relative aspect-[16/9] w-full max-w-4xl overflow-hidden rounded-lg shadow-2xl"
+            style={{ transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`, cursor }}
+            onPointerDown={onStagePointerDown}
+            onPointerMove={(e) => {
+              if (toolRef.current === "polygon" && polyDraftRef.current?.length) {
+                const p = clientToNorm(e.clientX, e.clientY)
+                setCursorNorm({ x: clamp(p.x), y: clamp(p.y) })
+              }
+            }}
+            onPointerLeave={() => setCursorNorm(null)}
+          >
+            <Image
+              src="/street-scene.png"
+              alt="Cena de rua para anotação"
+              fill
+              className="pointer-events-none object-cover"
+              sizes="(max-width: 1024px) 100vw, 896px"
+              priority
+              draggable={false}
+            />
+
+            {/* Committed shapes */}
+            {shapes.map((s) => {
+              const color = colorFor(s.cls)
+              const selected = s.id === selectedId
+              if (s.type === "box") {
+                return (
+                  <div
+                    key={s.id}
+                    onPointerDown={(e) => startMove(e, s)}
+                    onDoubleClick={(e) => {
+                      e.stopPropagation()
+                      const r = containerRef.current?.getBoundingClientRect()
+                      if (!r) return
+                      setSelectedId(s.id)
+                      setClassQuery("")
+                      setClassPicker({ id: s.id, x: e.clientX - r.left, y: e.clientY - r.top })
+                    }}
+                    className={cn("absolute rounded-[3px] border-2", tool !== "pan" && tool !== "tag" && "cursor-move")}
+                    style={{
+                      left: pct(s.x),
+                      top: pct(s.y),
+                      width: pct(s.w),
+                      height: pct(s.h),
+                      borderColor: color,
+                      boxShadow: selected ? `0 0 0 2px var(--background), 0 0 0 4px ${color}` : undefined,
+                    }}
+                  >
+                    <span
+                      className="pointer-events-none absolute -top-[22px] left-0 whitespace-nowrap rounded px-1.5 py-0.5 text-xs font-medium text-white"
+                      style={{ backgroundColor: color, transform: `scale(${1 / view.s})`, transformOrigin: "bottom left" }}
+                    >
+                      {s.cls || "definir classe..."}
+                      {s.conf ? ` ${s.conf}` : ""}
+                    </span>
+                    {selected &&
+                      tool === "select" &&
+                      handles.map((h) => (
+                        <span
+                          key={h.id}
+                          onPointerDown={(e) => startResize(e, s, h.id)}
+                          className={cn("absolute rounded-sm border border-white bg-brand-blue", h.cls)}
+                          style={{
+                            width: `${9 / view.s}px`,
+                            height: `${9 / view.s}px`,
+                            cursor: h.cursor,
+                          }}
+                        />
+                      ))}
+                  </div>
+                )
+              }
+              if (s.type === "point") {
+                return (
+                  <button
+                    key={s.id}
+                    type="button"
+                    onPointerDown={(e) => startMove(e, s)}
+                    className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white"
+                    style={{
+                      left: pct(s.x),
+                      top: pct(s.y),
+                      width: 14 / view.s,
+                      height: 14 / view.s,
+                      backgroundColor: color,
+                      boxShadow: selected ? `0 0 0 ${3 / view.s}px ${color}` : undefined,
+                    }}
+                    aria-label={`Ponto ${s.cls}`}
+                  />
+                )
+              }
+              // polygon
+              const pointsAttr = s.points.map((p) => `${p.x * 100},${p.y * 100}`).join(" ")
+              return (
+                <svg
+                  key={s.id}
+                  viewBox="0 0 100 100"
+                  preserveAspectRatio="none"
+                  className="pointer-events-none absolute inset-0 size-full"
+                >
+                  <polygon
+                    points={pointsAttr}
+                    fill={color}
+                    fillOpacity={selected ? 0.28 : 0.16}
+                    stroke={color}
+                    strokeWidth={selected ? 2.5 : 1.75}
+                    vectorEffect="non-scaling-stroke"
+                    className="pointer-events-auto cursor-move"
+                    onPointerDown={(e) => startMove(e as unknown as React.PointerEvent, s)}
+                    onDoubleClick={(e) => {
+                      e.stopPropagation()
+                      if (toolRef.current === "polygon" && polyDraftRef.current?.length) return
+                      const r = containerRef.current?.getBoundingClientRect()
+                      if (!r) return
+                      setSelectedId(s.id)
+                      setClassQuery("")
+                      setClassPicker({ id: s.id, x: e.clientX - r.left, y: e.clientY - r.top })
+                    }}
+                  />
+                </svg>
+              )
+            })}
+
+            {/* Sugestões de autoanotação (status: proposed) — visual diferenciado das anotações manuais */}
+            {suggestions
+              .filter((s) => !hiddenLayers.includes(s.origin.model_id))
+              .map((s) => {
+                const color = colorFor(s.cls)
+                return (
+                  <div
+                    key={`sug-${s.id}`}
+                    className="pointer-events-none absolute rounded-[3px] border-2 border-dashed"
+                    style={{
+                      left: pct(s.x),
+                      top: pct(s.y),
+                      width: pct(s.w),
+                      height: pct(s.h),
+                      borderColor: color,
+                      backgroundColor: `color-mix(in oklch, ${color} 10%, transparent)`,
+                    }}
+                  >
+                    <span
+                      className="pointer-events-none absolute -top-[22px] left-0 whitespace-nowrap rounded px-1.5 py-0.5 text-xs font-medium text-white/95"
+                      style={{
+                        backgroundColor: `color-mix(in oklch, ${color} 75%, black)`,
+                        transform: `scale(${1 / view.s})`,
+                        transformOrigin: "bottom left",
+                      }}
+                    >
+                      {s.cls} {s.conf.toFixed(2)} · {modelLabelFor(s.origin.model_id, s.origin.model_version)}
+                    </span>
+                  </div>
+                )
+              })}
+
+            {/* Box draft */}
+            {draft && (
+              <div
+                className="pointer-events-none absolute rounded-[3px] border-2 border-dashed"
+                style={{
+                  left: pct(draft.x),
+                  top: pct(draft.y),
+                  width: pct(draft.w),
+                  height: pct(draft.h),
+                  borderColor: colorFor(activeClass ?? ""),
+                  backgroundColor: "color-mix(in oklch, " + colorFor(activeClass ?? "") + " 18%, transparent)",
+                }}
+              />
+            )}
+
+            {/* Polygon draft */}
+            {polyDraft &&
+              polyDraft.length > 0 &&
+              (() => {
+                const color = colorFor(activeClass ?? "")
+                const last = polyDraft[polyDraft.length - 1]
+                const first = polyDraft[0]
+                const nearFirst =
+                  polyDraft.length >= 3 &&
+                  !!cursorNorm &&
+                  Math.hypot(cursorNorm.x - first.x, cursorNorm.y - first.y) < POLY_CLOSE_DIST
+                const previewPts = cursorNorm ? [...polyDraft, cursorNorm] : polyDraft
+                return (
+                  <>
+                    <svg
+                      viewBox="0 0 100 100"
+                      preserveAspectRatio="none"
+                      className="pointer-events-none absolute inset-0 size-full"
+                    >
+                      {previewPts.length >= 3 && (
+                        <polygon
+                          points={previewPts.map((p) => `${p.x * 100},${p.y * 100}`).join(" ")}
+                          fill={color}
+                          fillOpacity={0.15}
+                          stroke="none"
+                        />
+                      )}
+                      {/* placed segments */}
+                      <polyline
+                        points={polyDraft.map((p) => `${p.x * 100},${p.y * 100}`).join(" ")}
+                        fill="none"
+                        stroke={color}
+                        strokeWidth={2}
+                        strokeLinejoin="round"
+                        vectorEffect="non-scaling-stroke"
+                      />
+                      {/* rubber-band segment to cursor */}
+                      {cursorNorm && (
+                        <line
+                          x1={last.x * 100}
+                          y1={last.y * 100}
+                          x2={cursorNorm.x * 100}
+                          y2={cursorNorm.y * 100}
+                          stroke={color}
+                          strokeWidth={1.75}
+                          strokeDasharray="3 2"
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      )}
+                      {/* closing hint back to the first vertex */}
+                      {polyDraft.length >= 2 && cursorNorm && (
+                        <line
+                          x1={cursorNorm.x * 100}
+                          y1={cursorNorm.y * 100}
+                          x2={first.x * 100}
+                          y2={first.y * 100}
+                          stroke={color}
+                          strokeWidth={1.25}
+                          strokeDasharray="2 3"
+                          strokeOpacity={nearFirst ? 0.9 : 0.4}
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      )}
+                    </svg>
+                    {polyDraft.map((p, i) => {
+                      const isFirst = i === 0
+                      const highlight = isFirst && nearFirst
+                      const size = (isFirst ? 13 : 9) / view.s
+                      return (
+                        <span
+                          key={i}
+                          className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white"
+                          style={{
+                            left: pct(p.x),
+                            top: pct(p.y),
+                            width: size,
+                            height: size,
+                            backgroundColor: highlight ? "#fff" : color,
+                            boxShadow: highlight ? `0 0 0 ${3 / view.s}px ${color}` : undefined,
+                          }}
+                        />
+                      )
+                    })}
+                  </>
+                )
+              })()}
+          </div>
+
+          {/* Picker de classe com autocomplete: após desenhar ou por duplo clique */}
+          {classPicker && (
+            <div
+              role="dialog"
+              aria-label={classPicker.isNew ? "Definir classe do novo objeto" : "Trocar classe do objeto"}
+              className="absolute z-20 w-56 rounded-lg border border-border bg-popover p-2 shadow-xl"
+              style={{
+                left: clamp(classPicker.x, 8, (containerRef.current?.clientWidth ?? 400) - 232),
+                top: clamp(classPicker.y, 8, (containerRef.current?.clientHeight ?? 300) - 300),
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              <p className="px-1 pb-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                {classPicker.filterParent
+                  ? `Subclasse de ${classPicker.filterParent}`
+                  : classPicker.isNew
+                    ? "Definir classe"
+                    : "Trocar classe"}
+              </p>
+              <input
+                autoFocus
+                value={classQuery}
+                onChange={(e) => setClassQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    e.stopPropagation()
+                    cancelPicker()
+                    return
+                  }
+                  if (e.key === "Enter" && pickerSuggestions.length > 0) {
+                    e.preventDefault()
+                    applyPickerClass(pickerSuggestions[0].name)
+                  }
+                }}
+                placeholder="Digite o nome da classe..."
+                aria-label="Nome da classe"
+                className="h-8 w-full rounded-md border border-border bg-background px-2 text-sm text-foreground outline-none focus:border-brand-blue"
+              />
+              <ul className="mt-1 flex max-h-52 flex-col overflow-y-auto" role="listbox" aria-label="Sugestões de classe">
+                {pickerSuggestions.length === 0 && (
+                  <li className="px-2 py-1.5 text-xs text-muted-foreground">Nenhuma classe encontrada.</li>
+                )}
+                {pickerSuggestions.map((c, i) => {
+                  const currentCls = shapes.find((s) => s.id === classPicker.id)?.cls
+                  return (
+                    <li key={c.name}>
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={i === 0}
+                        onClick={() => applyPickerClass(c.name)}
+                        className={cn(
+                          "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted",
+                          i === 0 && "bg-muted/60",
+                          c.parent && !classPicker.filterParent && "pl-6",
+                        )}
+                      >
+                        <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: c.color }} />
+                        <span className="min-w-0 flex-1 truncate">{c.name}</span>
+                        {currentCls === c.name && <Check className="size-3.5 shrink-0 text-brand-blue" />}
+                        {i === 0 && currentCls !== c.name && (
+                          <kbd className="shrink-0 rounded bg-background px-1 text-[10px] text-muted-foreground">
+                            Enter
+                          </kbd>
+                        )}
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
+          )}
+
+          {/* Hint */}
+          <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 text-xs text-white/80 backdrop-blur">
+            {tool === "box" &&
+              (activeClass
+                ? `Arraste para desenhar como "${activeClass}" · duplo clique troca a classe`
+                : "Arraste para desenhar · escolha a classe depois no autocomplete")}
+            {tool === "polygon" &&
+              (polyDraft?.length
+                ? "Clique no primeiro ponto para fechar · Enter ou duplo-clique finaliza · Esc cancela"
+                : "Clique para adicionar o primeiro vértice do polígono")}
+            {tool === "point" && "Clique para adicionar um ponto"}
+            {tool === "pan" && "Arraste para mover · scroll para zoom"}
+            {tool === "select" && "Clique para selecionar · arraste para mover · Delete remove"}
+            {tool === "tag" &&
+              (activeClass
+                ? `Clique em um objeto para aplicar "${activeClass}"`
+                : "Clique em um objeto para escolher a classe")}
+          </div>
+        </div>
+
+        {/* Filmstrip: preview das imagens vizinhas do lote */}
+        <div className="flex items-center gap-2 border-t border-border bg-card px-3 py-2">
+          <button
+            type="button"
+            aria-label="Retroceder 10 imagens"
+            onClick={() => setImageIndex((i) => Math.max(1, i - 10))}
+            className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <ChevronsLeft className="size-4" />
+          </button>
+          <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+            {(() => {
+              const windowStart = Math.max(1, Math.min(imageIndex - 4, TOTAL_IMAGES - 9))
+              return Array.from({ length: 10 }, (_, i) => windowStart + i).map((n) => {
+                const isCurrent = n === imageIndex
+                return (
+                  <button
+                    key={n}
+                    type="button"
+                    onClick={() => setImageIndex(n)}
+                    aria-label={`Ir para a imagem ${n}`}
+                    aria-current={isCurrent ? "true" : undefined}
+                    className={cn(
+                      "relative aspect-video h-12 shrink-0 overflow-hidden rounded-md border-2 transition-colors",
+                      isCurrent ? "border-brand-blue" : "border-transparent hover:border-border",
+                    )}
+                  >
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src="/street-scene.png" alt={`Imagem ${n}`} className="size-full object-cover" />
+                    <span className="absolute bottom-0 right-0 rounded-tl bg-black/60 px-1 text-[9px] tabular-nums text-white">
+                      {n}
+                    </span>
+                  </button>
+                )
+              })
+            })()}
+          </div>
+          <button
+            type="button"
+            aria-label="Avançar 10 imagens"
+            onClick={() => setImageIndex((i) => Math.min(TOTAL_IMAGES, i + 10))}
+            className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <ChevronsRight className="size-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* Right panel */}
+      <aside className="flex w-full shrink-0 flex-col gap-4 overflow-y-auto border-t border-border bg-card p-4 lg:w-80 lg:border-l lg:border-t-0">
+        <Card>
+          <CardHeader>
+            <CardTitle>Classes</CardTitle>
+            <span className="text-xs text-muted-foreground">Atalhos 1-9</span>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-1">
+            {classList.map((c, i) => {
+              const isActive = activeClass === c.name
+              const shortcutIndex = classList.filter((x) => !x.parent).findIndex((x) => x.name === c.name)
+              return (
+                <div key={c.name} className="flex flex-col">
+                  <div
+                    className={cn(
+                      "group flex items-center justify-between rounded-lg transition-colors",
+                      isActive ? "bg-muted ring-1 ring-brand-blue/40" : "hover:bg-muted",
+                    )}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setActiveClass((prev) => (prev === c.name ? null : c.name))}
+                      aria-pressed={isActive}
+                      title={isActive ? "Clique para desmarcar" : undefined}
+                      className={cn("flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-sm", c.parent && "pl-6")}
+                    >
+                      <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: c.color }} />
+                      <span className="truncate text-foreground">{c.name}</span>
+                    </button>
+                    <span className="flex shrink-0 items-center gap-1 pr-2">
+                      {isActive && !c.parent && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAddingClass({ parent: c.name })
+                            setNewClassName("")
+                          }}
+                          title={`Adicionar subclasse em ${c.name}`}
+                          aria-label={`Adicionar subclasse em ${c.name}`}
+                          className="inline-flex size-5 items-center justify-center rounded text-muted-foreground hover:bg-background hover:text-foreground"
+                        >
+                          <Plus className="size-3.5" />
+                        </button>
+                      )}
+                      {!c.parent && shortcutIndex >= 0 && shortcutIndex < 9 && (
+                        <kbd className="rounded bg-background px-1.5 text-xs text-muted-foreground">
+                          {shortcutIndex + 1}
+                        </kbd>
+                      )}
+                    </span>
+                  </div>
+                  {/* Input inline para nova subclasse desta classe */}
+                  {addingClass?.parent === c.name && (
+                    <form
+                      className="mt-1 flex items-center gap-1.5 pl-6"
+                      onSubmit={(e) => {
+                        e.preventDefault()
+                        const name = newClassName.trim()
+                        if (!name || classList.some((x) => x.name === name)) return
+                        // Insere a subclasse logo após o pai (e suas subclasses existentes)
+                        setClassList((prev) => {
+                          const idx = prev.findIndex((x) => x.name === c.name)
+                          let insertAt = idx + 1
+                          while (insertAt < prev.length && prev[insertAt].parent === c.name) insertAt++
+                          const next = [...prev]
+                          next.splice(insertAt, 0, { name, color: c.color, parent: c.name })
+                          return next
+                        })
+                        setAddingClass(null)
+                        setNewClassName("")
+                      }}
+                    >
+                      <input
+                        autoFocus
+                        value={newClassName}
+                        onChange={(e) => setNewClassName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") setAddingClass(null)
+                        }}
+                        placeholder={`Subclasse de ${c.name}...`}
+                        aria-label={`Nome da subclasse de ${c.name}`}
+                        className="h-7 min-w-0 flex-1 rounded-md bg-muted px-2 text-xs text-foreground outline-none focus:ring-2 focus:ring-ring/50"
+                      />
+                      <Button type="submit" size="sm" variant="outline" className="h-7 px-2 text-xs">
+                        OK
+                      </Button>
+                    </form>
+                  )}
+                </div>
+              )
+            })}
+
+            {/* Nova classe raiz */}
+            {addingClass && addingClass.parent === null ? (
+              <form
+                className="mt-1 flex items-center gap-1.5"
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  const name = newClassName.trim()
+                  if (!name || classList.some((x) => x.name === name)) return
+                  const color = newClassPalette[classList.length % newClassPalette.length]
+                  setClassList((prev) => [...prev, { name, color }])
+                  setActiveClass(name)
+                  setAddingClass(null)
+                  setNewClassName("")
+                }}
+              >
+                <input
+                  autoFocus
+                  value={newClassName}
+                  onChange={(e) => setNewClassName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setAddingClass(null)
+                  }}
+                  placeholder="Nome da nova classe..."
+                  aria-label="Nome da nova classe"
+                  className="h-8 min-w-0 flex-1 rounded-md bg-muted px-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring/50"
+                />
+                <Button type="submit" size="sm" variant="outline" className="h-8 px-2 text-xs">
+                  OK
+                </Button>
+              </form>
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  setAddingClass({ parent: null })
+                  setNewClassName("")
+                }}
+                className="mt-1 flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-sm text-brand-blue hover:bg-muted"
+              >
+                <Plus className="size-4" />
+                Nova classe
+              </button>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Objetos ({shapes.length})</CardTitle>
+            {selectedId != null && (
+              <button
+                type="button"
+                onClick={deleteSelected}
+                className="flex items-center gap-1 text-xs text-destructive hover:underline"
+              >
+                <Trash2 className="size-3.5" />
+                Remover
+              </button>
+            )}
+          </CardHeader>
+          <CardContent className="flex max-h-64 flex-col gap-1 overflow-y-auto">
+            {shapes.length === 0 && <p className="px-2 py-4 text-sm text-muted-foreground">Nenhum objeto ainda.</p>}
+            {shapes.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => setSelectedId(s.id)}
+                aria-pressed={selectedId === s.id}
+                className={cn(
+                  "flex items-center justify-between rounded-lg px-2 py-1.5 text-sm transition-colors",
+                  selectedId === s.id ? "bg-muted ring-1 ring-brand-blue/40" : "hover:bg-muted",
+                )}
+              >
+                <span className="flex items-center gap-2 text-foreground">
+                  <span className="size-2.5 rounded-sm" style={{ backgroundColor: colorFor(s.cls) }} />
+                  {s.cls}
+                  <span className="text-xs text-muted-foreground">
+                    {s.type === "box" ? "caixa" : s.type === "polygon" ? "polígono" : "ponto"}
+                  </span>
+                </span>
+                <span className="text-xs tabular-nums text-muted-foreground">#{s.id}</span>
+              </button>
+            ))}
+          </CardContent>
+        </Card>
+
+        <AutoAnnotationCard
+          classNames={classList.map((c) => c.name)}
+          imageIndex={imageIndex}
+          totalImages={TOTAL_IMAGES}
+          layers={predictionLayers}
+          suggestionModelIds={[...new Set(suggestions.map((s) => s.origin.model_id))]}
+          onGenerate={generateSuggestions}
+          onClearSuggestions={() => {
+            setSuggestions([])
+            setHiddenLayers([])
+          }}
+          onToggleLayer={(modelId) =>
+            setHiddenLayers((prev) =>
+              prev.includes(modelId) ? prev.filter((id) => id !== modelId) : [...prev, modelId],
+            )
+          }
+          onRemoveLayer={(modelId) => {
+            setSuggestions((prev) => prev.filter((s) => s.origin.model_id !== modelId))
+            setHiddenLayers((prev) => prev.filter((id) => id !== modelId))
+          }}
+        />
+      </aside>
+    </div>
+  )
+}
