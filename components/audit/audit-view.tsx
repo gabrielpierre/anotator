@@ -1,12 +1,15 @@
 "use client"
 
+import * as React from "react"
 import { Search, Download, Check, X, Pencil, GitCommit, Play, ArrowUpRight, Bot } from "lucide-react"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/snowui/input"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader } from "@/components/app/primitives"
-import { auditEvents } from "@/lib/mock-data"
+import { downloadBackendFile, fetchAuditEvents } from "@/lib/api/client"
+import { formatDateTimePt } from "@/lib/api/status"
+import type { BackendAuditEvent } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
 const actionMeta: Record<string, { icon: typeof Check; tone: string; bg: string }> = {
@@ -24,6 +27,23 @@ function initials(name: string) {
 }
 
 export function AuditView() {
+  const [events, setEvents] = React.useState<BackendAuditEvent[] | null>(null)
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    fetchAuditEvents({ limit: 200 }, controller.signal)
+      .then((page) => setEvents(page.items))
+      .catch(() => setEvents(null))
+    return () => controller.abort()
+  }, [])
+
+  const rows = events ?? []
+  const systemCount = rows.filter((event) => event.actor === "system" || event.actor === "Sistema").length
+  const acceptedCount = rows.filter((event) => event.action.includes("accepted") || event.action.includes("aceitou")).length
+  const correctedCount = rows.filter(
+    (event) => event.action.includes("correct") || event.action.includes("reject") || event.action.includes("corrigiu"),
+  ).length
+
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <PageHeader
@@ -32,7 +52,7 @@ export function AuditView() {
         actions={
           <>
             <Input placeholder="Buscar eventos..." aria-label="Buscar eventos" icon={<Search />} className="w-48" />
-            <Button variant="outline">
+            <Button variant="outline" onClick={() => void downloadBackendFile("/audit/events/export", "audit-events.csv")}>
               <Download className="size-4" />
               Exportar log
             </Button>
@@ -41,10 +61,10 @@ export function AuditView() {
       />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <MetricCard label="Eventos hoje" value="248" hint="+32 na última hora" tone="blue" />
-        <MetricCard label="Aceitas" value="182" hint="73% das decisões" tone="mint" />
-        <MetricCard label="Rejeitadas / corrigidas" value="54" hint="22% das decisões" tone="subtle" />
-        <MetricCard label="Eventos do sistema" value="12" hint="pipelines + releases" tone="purple" />
+        <MetricCard label="Eventos" value={String(rows.length)} hint="janela carregada" tone="blue" />
+        <MetricCard label="Aceitas" value={String(acceptedCount)} hint="decisões positivas" tone="mint" />
+        <MetricCard label="Rejeitadas / corrigidas" value={String(correctedCount)} hint="revisões humanas" tone="subtle" />
+        <MetricCard label="Eventos do sistema" value={String(systemCount)} hint="pipelines + releases" tone="purple" />
       </div>
 
       <Card>
@@ -53,7 +73,7 @@ export function AuditView() {
           <span className="text-xs text-muted-foreground">Ordenado do mais recente</span>
         </CardHeader>
         <CardContent className="flex flex-col gap-1">
-          {auditEvents.map((e, i) => {
+          {rows.map((e, i) => {
             const meta = actionMeta[e.action] ?? { icon: Check, tone: "text-muted-foreground", bg: "bg-muted" }
             const ini = initials(e.actor)
             return (
@@ -78,21 +98,24 @@ export function AuditView() {
                     </span>{" "}
                     <span className={meta.tone}>{e.action}</span> {e.target}
                   </p>
-                  {e.reason !== "—" && (
+                  {e.reason && e.reason !== "—" && (
                     <p className="text-xs text-muted-foreground">Motivo: {e.reason}</p>
                   )}
                 </div>
                 <div className="flex shrink-0 flex-col items-end gap-1">
-                  <span className="text-xs text-muted-foreground">{e.time}</span>
-                  {e.conf != null && (
+                  <span className="text-xs text-muted-foreground">{formatDateTimePt(e.created_at)}</span>
+                  {e.confidence != null && (
                     <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] tabular-nums text-muted-foreground">
-                      conf {e.conf}
+                      conf {e.confidence}
                     </span>
                   )}
                 </div>
               </div>
             )
           })}
+          {rows.length === 0 && (
+            <p className="px-2 py-6 text-center text-sm text-muted-foreground">Nenhum evento de auditoria.</p>
+          )}
         </CardContent>
       </Card>
     </div>

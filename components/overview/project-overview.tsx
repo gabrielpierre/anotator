@@ -4,7 +4,7 @@ import * as React from "react"
 import Link from "next/link"
 import {
   Sliders,
-  Plus,
+  Upload,
   HardDrive,
   ImageIcon,
   PenLine,
@@ -18,7 +18,6 @@ import {
   ChevronRight,
   FileClock,
   GitCommitVertical,
-  Camera,
 } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
@@ -26,79 +25,100 @@ import { Badge } from "@/components/snowui/badge"
 import { DonutChart } from "@/components/snowui/charts"
 import { MetricLineChart, SparkLineChart } from "@/components/app/charts"
 import { StatusBadge, ProgressBar } from "@/components/app/primitives"
-import { ProjectDialog } from "@/components/projects/project-dialog"
-import { classes, modelEvolution, project } from "@/lib/mock-data"
-import { fetchDashboard, fetchTasks, mockFallbackEnabled } from "@/lib/api/client"
-import { formatPtNumber, labelsFromTasks } from "@/lib/api/status"
-import { useCurrentUser } from "@/lib/auth/user-context"
-import type { BackendDashboard, BackendProject, BackendTask } from "@/lib/api/types"
+import { ImportBatchDialog } from "@/components/data/import-batch-dialog"
+import { ProjectDialog, type ProjectDialogTarget } from "@/components/projects/project-dialog"
+import {
+  fetchAuditEvents,
+  fetchDashboard,
+  fetchDatasetReleases,
+  fetchJobs,
+  fetchModelVersions,
+  fetchTasks,
+  fetchTrainingRuns,
+} from "@/lib/api/client"
+import { formatDateTimePt, formatPtNumber, labelsFromTasks, toUiJobStatus } from "@/lib/api/status"
+import { projectRecordFromBackend, useCurrentUser } from "@/lib/auth/user-context"
+import type {
+  BackendAuditEvent,
+  BackendDashboard,
+  BackendDatasetRelease,
+  BackendJob,
+  BackendModelVersion,
+  BackendProject,
+  BackendTask,
+  BackendTrainingRun,
+} from "@/lib/api/types"
 
-const kpis = [
-  { label: "Imagens importadas", value: "10.250", sub: "+320 esta semana", subTone: "text-brand-green", icon: ImageIcon, tone: "bg-surface-blue text-brand-blue" },
-  { label: "Imagens anotadas", value: "8.420", sub: "82% do total", subTone: "text-muted-foreground", icon: PenLine, tone: "bg-surface-mint text-brand-mint", bar: 82 },
-  { label: "Objetos anotados", value: "43.718", sub: "+1.254 esta semana", subTone: "text-brand-green", icon: Box, tone: "bg-surface-purple text-brand-lavender" },
-  { label: "Anotações pendentes", value: "93", sub: "0,9% do total", subTone: "text-muted-foreground", icon: Clock, tone: "bg-warning/15 text-warning", valueTone: "text-warning" },
+const kpiMeta = [
+  { label: "Imagens importadas", subTone: "text-brand-green", icon: ImageIcon, tone: "bg-surface-blue text-brand-blue" },
+  { label: "Imagens anotadas", subTone: "text-muted-foreground", icon: PenLine, tone: "bg-surface-mint text-brand-mint" },
+  { label: "Objetos anotados", subTone: "text-brand-green", icon: Box, tone: "bg-surface-purple text-brand-lavender" },
+  { label: "Anotações pendentes", subTone: "text-muted-foreground", icon: Clock, tone: "bg-warning/15 text-warning", valueTone: "text-warning" },
 ]
 
-const activities = [
-  { icon: Boxes, title: "Treinamento #18 iniciado", time: "há 18 min" },
-  { icon: GitCommitVertical, title: "Dataset release_014 criado", time: "há 45 min" },
-  { icon: FileClock, title: "93 anotações movidas para revisão", time: "há 1 h" },
-  { icon: GitCommitVertical, title: "Pipeline det→cls→seg concluído", time: "há 2 h" },
-  { icon: Camera, title: "Exportação COCO iniciada", time: "há 2 h" },
-]
-
-const attentions = [
-  { icon: AlertCircle, tone: "bg-warning/15 text-warning", title: "93 anotações", desc: "Precisam ser revisadas", href: "/revisar" },
-  { icon: TriangleAlert, tone: "bg-destructive/12 text-destructive", title: "2 jobs falharam", desc: "Ver detalhes", href: "/jobs" },
-  { icon: Info, tone: "bg-surface-blue text-brand-blue", title: "Classe rara", desc: "\"traffic light\" com baixa cobertura", href: "/dados" },
-  { icon: Info, tone: "bg-surface-mint text-brand-mint", title: "Backup recomendado", desc: "Último backup há 3 dias", href: "/dados" },
+const classColors = [
+  "var(--brand-blue)",
+  "var(--brand-green)",
+  "var(--brand-lavender)",
+  "var(--warning)",
+  "var(--brand-indigo)",
+  "var(--brand-sky)",
 ]
 
 export function ProjectOverview() {
   const [dashboard, setDashboard] = React.useState<BackendDashboard | null>(null)
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
-  const [projectModalOpen, setProjectModalOpen] = React.useState(false)
-  const useMocks = mockFallbackEnabled()
-  const { isAdmin } = useCurrentUser()
+  const [releases, setReleases] = React.useState<BackendDatasetRelease[]>([])
+  const [trainingRuns, setTrainingRuns] = React.useState<BackendTrainingRun[]>([])
+  const [models, setModels] = React.useState<BackendModelVersion[]>([])
+  const [jobs, setJobs] = React.useState<BackendJob[]>([])
+  const [auditEvents, setAuditEvents] = React.useState<BackendAuditEvent[]>([])
+  const [importDialogOpen, setImportDialogOpen] = React.useState(false)
+  const [customizeOpen, setCustomizeOpen] = React.useState(false)
+  const { isAdmin, projects, updateProject } = useCurrentUser()
 
   React.useEffect(() => {
     const controller = new AbortController()
     fetchDashboard("default", controller.signal).then(setDashboard).catch(() => setDashboard(null))
     fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
+    fetchDatasetReleases(controller.signal).then(setReleases).catch(() => setReleases([]))
+    fetchTrainingRuns(controller.signal).then(setTrainingRuns).catch(() => setTrainingRuns([]))
+    fetchModelVersions(controller.signal).then(setModels).catch(() => setModels([]))
+    fetchJobs(controller.signal).then(setJobs).catch(() => setJobs([]))
+    fetchAuditEvents({ limit: 5 }, controller.signal).then((page) => setAuditEvents(page.items)).catch(() => setAuditEvents([]))
     return () => controller.abort()
   }, [])
 
-  const overviewKpis = dashboard
-    ? [
-        {
-          ...kpis[0],
-          value: formatPtNumber(dashboard.stats.images),
-          sub: `${dashboard.stats.tasks} tasks sincronizadas`,
-        },
-        {
-          ...kpis[1],
-          value: formatPtNumber(dashboard.stats.images || (useMocks ? project.imagesAnnotated : 0)),
-          sub: "Sincronizado do CVAT",
-          bar: dashboard.stats.images > 0 ? 100 : useMocks ? kpis[1].bar : 0,
-        },
-        {
-          ...kpis[2],
-          value: formatPtNumber(
-            dashboard.class_distribution.reduce((total, item) => total + item.count, 0) ||
-              (useMocks ? project.objectsAnnotated : 0),
-          ),
-          sub: "Labels/classes conhecidas",
-        },
-        {
-          ...kpis[3],
-          value: formatPtNumber(dashboard.stats.pending_review),
-          sub: `${dashboard.stats.jobs_running} jobs ativos`,
-        },
-      ]
-    : useMocks
-      ? kpis
-      : kpis.map((kpi) => ({ ...kpi, value: "0", sub: "Aguardando backend", bar: 0 }))
+  const stats = dashboard?.stats
+  const taskList = tasks ?? []
+  const annotatedImages = taskList
+    .filter((task) => task.status.toLowerCase() === "completed")
+    .reduce((total, task) => total + task.size, 0)
+  const importedImages = stats?.images ?? taskList.reduce((total, task) => total + task.size, 0)
+  const objectCount = dashboard?.class_distribution.reduce((total, item) => total + item.count, 0) ?? 0
+  const overviewKpis = [
+    {
+      ...kpiMeta[0],
+      value: formatPtNumber(importedImages),
+      sub: `${formatPtNumber(stats?.tasks ?? taskList.length)} tasks sincronizadas`,
+    },
+    {
+      ...kpiMeta[1],
+      value: formatPtNumber(annotatedImages),
+      sub: "Tasks concluídas no CVAT",
+      bar: importedImages > 0 ? Math.round((annotatedImages / importedImages) * 100) : 0,
+    },
+    {
+      ...kpiMeta[2],
+      value: formatPtNumber(objectCount),
+      sub: "Labels/classes conhecidas",
+    },
+    {
+      ...kpiMeta[3],
+      value: formatPtNumber(stats?.pending_review ?? 0),
+      sub: `${formatPtNumber(stats?.jobs_running ?? 0)} jobs ativos`,
+    },
+  ]
 
   const taskClasses = labelsFromTasks(tasks)
   const classItems =
@@ -107,7 +127,7 @@ export function ProjectOverview() {
           name: item.name,
           count: item.count,
           share: item.share,
-          color: classes[index % classes.length]?.color ?? "var(--brand-blue)",
+          color: classColors[index % classColors.length],
         }))
       : taskClasses.length > 0
         ? taskClasses.map((item) => ({
@@ -116,14 +136,101 @@ export function ProjectOverview() {
             share: Math.round((100 / taskClasses.length) * 100) / 100,
             color: item.color,
           }))
-      : useMocks
-        ? classes
-        : []
+      : []
 
-  const activityItems = useMocks ? activities : []
-  const attentionItems = useMocks ? attentions : []
-  const modelEvolutionItems = useMocks ? modelEvolution : []
+  const failedJobs = jobs.filter((job) => job.status === "failed")
+  const activeTrainingRuns = trainingRuns.filter((run) => run.status === "running" || run.status === "queued")
+  const latestRelease = releases[0] ?? null
+  const latestReleaseCounts = snapshotCounts(latestRelease?.snapshot ?? {})
+  const currentModel = bestModel(models)
+  const modelEvolutionItems = models
+    .map((model) => {
+      const map = bestMapFromMetrics(model.metrics)
+      return map === null
+        ? null
+        : {
+            version: `${model.name} ${model.version}`,
+            map,
+          }
+    })
+    .filter((item): item is { version: string; map: number } => item !== null)
+  const activityItems = auditEvents.map((event) => ({
+    icon: auditIcon(event.action),
+    title: `${event.action} - ${event.target}`,
+    time: formatDateTimePt(event.created_at),
+  }))
+  const attentionItems = [
+    ...(stats?.pending_review
+      ? [
+          {
+            icon: AlertCircle,
+            tone: "bg-warning/15 text-warning",
+            title: `${formatPtNumber(stats.pending_review)} anotações`,
+            desc: "Precisam ser revisadas",
+            href: "/revisar",
+          },
+        ]
+      : []),
+    ...(failedJobs.length
+      ? [
+          {
+            icon: TriangleAlert,
+            tone: "bg-destructive/12 text-destructive",
+            title: `${formatPtNumber(failedJobs.length)} jobs falharam`,
+            desc: "Ver detalhes",
+            href: "/jobs",
+          },
+        ]
+      : []),
+    ...(!taskList.length
+      ? [
+          {
+            icon: Info,
+            tone: "bg-surface-blue text-brand-blue",
+            title: "Sem lotes importados",
+            desc: "Suba imagens para iniciar o projeto",
+            href: "/dados",
+          },
+        ]
+      : []),
+    ...(taskList.length && !releases.length
+      ? [
+          {
+            icon: Info,
+            tone: "bg-surface-mint text-brand-mint",
+            title: "Sem release",
+            desc: "Crie uma versão do dataset",
+            href: "/releases",
+          },
+        ]
+      : []),
+  ]
+  const recommendedAction = recommendation({
+    pendingReview: stats?.pending_review ?? 0,
+    failedJobs: failedJobs.length,
+    tasks: taskList.length,
+    releases: releases.length,
+    trainingRuns: trainingRuns.length,
+  })
   const currentProjectStorage = storageFromProject(dashboard?.project ?? null)
+  const contextProject = projects.find((project) => project.id === dashboard?.project?.id) ?? projects[0] ?? null
+  const customizeTarget: ProjectDialogTarget | null = dashboard?.project
+    ? {
+        id: dashboard.project.id,
+        name: dashboard.project.name,
+        storagePath: currentProjectStorage?.path ?? contextProject?.storagePath ?? "",
+        quotaGb: currentProjectStorage?.quotaGb ?? contextProject?.quotaGb ?? 40,
+        annotatorIds: contextProject?.annotatorIds ?? [],
+      }
+    : contextProject
+      ? {
+          id: contextProject.id,
+          name: contextProject.name,
+          storagePath: contextProject.storagePath,
+          quotaGb: contextProject.quotaGb,
+          annotatorIds: contextProject.annotatorIds,
+        }
+      : null
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -136,44 +243,37 @@ export function ProjectOverview() {
         </div>
         {isAdmin && (
           <div className="flex items-center gap-2">
-            <Button variant="outline" size="lg">
+            <Button
+              variant="outline"
+              size="lg"
+              onClick={() => setCustomizeOpen(true)}
+              disabled={!customizeTarget}
+            >
               <Sliders className="size-4" />
               Personalizar
             </Button>
-            <Button size="lg" onClick={() => setProjectModalOpen(true)}>
-              <Plus className="size-4" />
-              Novo projeto
+            <Button size="lg" onClick={() => setImportDialogOpen(true)}>
+              <Upload className="size-4" />
+              Importar lote
             </Button>
           </div>
         )}
       </div>
+      <ImportBatchDialog open={importDialogOpen} onClose={() => setImportDialogOpen(false)} />
       <ProjectDialog
-        open={projectModalOpen}
-        mode="create"
-        onClose={() => setProjectModalOpen(false)}
-        onSaved={(project) => {
-          setDashboard((current) =>
-            current
-              ? {
-                  ...current,
-                  project,
-                  stats: { ...current.stats, projects: current.stats.projects + 1 },
-                }
-              : {
-                  project,
-                  stats: {
-                    projects: 1,
-                    tasks: 0,
-                    images: 0,
-                    jobs_running: 0,
-                    pending_review: 0,
-                    dataset_releases: 0,
-                    training_runs: 0,
-                  },
-                  class_distribution: [],
-                  recent_jobs: [],
-                },
-          )
+        open={customizeOpen}
+        mode="edit"
+        project={customizeTarget}
+        onClose={() => setCustomizeOpen(false)}
+        onSaved={(project, _mode, annotatorIds) => {
+          const record = projectRecordFromBackend(project, annotatorIds)
+          void updateProject(project.id, {
+            name: record.name,
+            storagePath: record.storagePath,
+            quotaGb: record.quotaGb,
+            annotatorIds,
+          })
+          setDashboard((current) => (current ? { ...current, project } : current))
         }}
       />
 
@@ -181,22 +281,24 @@ export function ProjectOverview() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-6">
         <Card tone="subtle" className="flex flex-col justify-between gap-6 lg:col-span-2 xl:col-span-2">
           <div className="flex flex-col gap-3">
-            <div className="flex items-center gap-2 text-warning">
-              <AlertCircle className="size-4" />
+            <div className={`flex items-center gap-2 ${recommendedAction.tone}`}>
+              <recommendedAction.icon className="size-4" />
               <span className="text-sm font-medium">Próxima ação recomendada</span>
             </div>
             <p className="text-lg font-medium leading-snug text-balance">
-              Revisar 93 anotações classificadas como possíveis erros.
+              {recommendedAction.title}
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button size="lg" nativeButton={false} render={<Link href="/revisar" />}>
-              Continuar revisão
+            <Button size="lg" nativeButton={false} render={<Link href={recommendedAction.href} />}>
+              {recommendedAction.primaryLabel}
               <ArrowRight className="size-4" />
             </Button>
-            <Button variant="outline" size="lg" nativeButton={false} render={<Link href="/revisar" />}>
-              Ver fila de revisão
-            </Button>
+            {recommendedAction.secondaryHref && (
+              <Button variant="outline" size="lg" nativeButton={false} render={<Link href={recommendedAction.secondaryHref} />}>
+                {recommendedAction.secondaryLabel}
+              </Button>
+            )}
           </div>
         </Card>
 
@@ -211,7 +313,7 @@ export function ProjectOverview() {
             <span className={`text-3xl font-semibold tracking-tight tabular-nums ${kpi.valueTone ?? ""}`}>
               {kpi.value}
             </span>
-            {kpi.bar != null && <ProgressBar value={kpi.bar} color="bg-brand-green" />}
+            {"bar" in kpi && kpi.bar != null && <ProgressBar value={kpi.bar} color="bg-brand-green" />}
             <span className={`text-xs font-medium ${kpi.subTone}`}>{kpi.sub}</span>
           </Card>
         ))}
@@ -247,22 +349,32 @@ export function ProjectOverview() {
           <CardHeader>
             <div className="flex items-center gap-2">
               <CardTitle>Modelo atual</CardTitle>
-              <Badge variant="info">Melhor</Badge>
+              {currentModel && <Badge variant="info">Melhor</Badge>}
             </div>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            <div>
-              <p className="text-xl font-semibold tracking-tight">YOLO11m v18</p>
-              <p className="text-xs text-muted-foreground">mAP50-95</p>
-              <p className="text-3xl font-semibold tabular-nums">0,83</p>
-            </div>
-            <div className="-mx-2">
-              <SparkLineChart data={modelEvolutionItems} dataKey="map" color="var(--brand-blue)" highlightLast />
-            </div>
-            <div className="flex items-center justify-between text-xs text-muted-foreground">
-              <span>Dataset: release_014</span>
-              <StatusBadge status="aprovado" />
-            </div>
+            {currentModel ? (
+              <>
+                <div>
+                  <p className="text-xl font-semibold tracking-tight">
+                    {currentModel.name} {currentModel.version}
+                  </p>
+                  <p className="text-xs text-muted-foreground">mAP50-95</p>
+                  <p className="text-3xl font-semibold tabular-nums">
+                    {currentModel.map === null ? "--" : currentModel.map.toFixed(3).replace(".", ",")}
+                  </p>
+                </div>
+                <div className="-mx-2">
+                  <SparkLineChart data={modelEvolutionItems} dataKey="map" color="var(--brand-blue)" highlightLast />
+                </div>
+                <div className="flex items-center justify-between text-xs text-muted-foreground">
+                  <span>Dataset: {currentModel.dataset}</span>
+                  <StatusBadge status={modelStatus(currentModel.status)} />
+                </div>
+              </>
+            ) : (
+              <p className="text-sm text-muted-foreground">Nenhum modelo registrado no backend.</p>
+            )}
           </CardContent>
         </Card>
 
@@ -270,22 +382,37 @@ export function ProjectOverview() {
           <CardHeader>
             <div className="flex items-center gap-2">
               <CardTitle>Treinamentos ativos</CardTitle>
-              <Badge variant="info">1</Badge>
+              <Badge variant="info">{activeTrainingRuns.length}</Badge>
             </div>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
-            <Link href="/treinar/18" className="flex flex-col gap-3 rounded-xl border border-border p-4 transition-colors hover:bg-muted">
-              <div className="flex items-center justify-between">
-                <span className="font-medium">Treinamento #18</span>
-                <StatusBadge status="executando" />
-              </div>
-              <p className="text-xs text-muted-foreground">YOLO11m · release_014</p>
-              <ProgressBar value={37} color="bg-brand-green" />
-              <div className="flex items-center justify-between text-xs text-muted-foreground">
-                <span>Época 37/100</span>
-                <span>ETA 00:32:18</span>
-              </div>
-            </Link>
+            {activeTrainingRuns.slice(0, 2).map((run) => {
+              const epochs = numberFromRecord(run.config, "epochs") ?? 100
+              const epoch = numberFromRecord(run.metrics, "epoch") ?? Math.round((run.progress / 100) * epochs)
+              return (
+                <Link
+                  key={run.id}
+                  href={`/treinar/${run.id}`}
+                  className="flex flex-col gap-3 rounded-xl border border-border p-4 transition-colors hover:bg-muted"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium">Treinamento {run.id.slice(0, 8)}</span>
+                    <StatusBadge status={toUiJobStatus(run.status)} />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {run.base_model.replace(/\.pt$/i, "")} · {run.dataset_release_id.slice(0, 8)}
+                  </p>
+                  <ProgressBar value={run.progress} color="bg-brand-green" />
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Época {epoch}/{epochs}</span>
+                    <span>{formatDateTimePt(run.created_at)}</span>
+                  </div>
+                </Link>
+              )
+            })}
+            {activeTrainingRuns.length === 0 && (
+              <p className="text-sm text-muted-foreground">Nenhum treinamento ativo.</p>
+            )}
           </CardContent>
         </Card>
 
@@ -294,25 +421,31 @@ export function ProjectOverview() {
             <CardTitle>Último dataset release</CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
-            <div>
-              <p className="text-xl font-semibold tracking-tight">release_014</p>
-              <p className="text-xs text-muted-foreground">Criado em 14/07/2024 09:30</p>
-            </div>
-            <div className="grid grid-cols-3 gap-2 text-center">
-              {[
-                ["Imagens", "8.420"],
-                ["Objetos", "43.718"],
-                ["Tamanho", "128.6 GB"],
-              ].map(([l, v]) => (
-                <div key={l} className="rounded-lg bg-muted p-2">
-                  <p className="text-sm font-semibold tabular-nums">{v}</p>
-                  <p className="text-xs text-muted-foreground">{l}</p>
+            {latestRelease ? (
+              <>
+                <div>
+                  <p className="text-xl font-semibold tracking-tight">{latestRelease.name}</p>
+                  <p className="text-xs text-muted-foreground">Criado em {formatDateTimePt(latestRelease.created_at)}</p>
                 </div>
-              ))}
-            </div>
-            <Button variant="outline" className="w-full" nativeButton={false} render={<Link href="/releases" />}>
-              Ver detalhes do release
-            </Button>
+                <div className="grid grid-cols-3 gap-2 text-center">
+                  {[
+                    ["Imagens", formatPtNumber(latestReleaseCounts.images ?? 0)],
+                    ["Objetos", formatPtNumber(latestReleaseCounts.annotations ?? latestReleaseCounts.objects ?? 0)],
+                    ["Artefatos", latestRelease.artifact_uri ? "1" : "0"],
+                  ].map(([l, v]) => (
+                    <div key={l} className="rounded-lg bg-muted p-2">
+                      <p className="text-sm font-semibold tabular-nums">{v}</p>
+                      <p className="text-xs text-muted-foreground">{l}</p>
+                    </div>
+                  ))}
+                </div>
+                <Button variant="outline" className="w-full" nativeButton={false} render={<Link href="/releases" />}>
+                  Ver detalhes do release
+                </Button>
+              </>
+            ) : (
+              <p className="text-sm text-muted-foreground">Nenhum dataset release criado.</p>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -437,4 +570,118 @@ function numberFromUnknown(value: unknown) {
     return Number.isFinite(parsed) ? parsed : null
   }
   return null
+}
+
+function snapshotCounts(snapshot: Record<string, unknown>) {
+  const counts = snapshot.counts
+  return counts && typeof counts === "object"
+    ? (counts as { annotations?: number; images?: number; objects?: number })
+    : {}
+}
+
+function bestModel(models: BackendModelVersion[]) {
+  const ranked = models
+    .map((model) => ({
+      ...model,
+      map: bestMapFromMetrics(model.metrics),
+      dataset: model.dataset_release_id?.slice(0, 8) ?? "--",
+    }))
+    .sort((a, b) => (b.map ?? -1) - (a.map ?? -1))
+  return ranked[0] ?? null
+}
+
+function bestMapFromMetrics(metrics: Record<string, unknown>) {
+  for (const key of ["metrics/mAP50-95(B)", "map5095", "box_map", "box.map", "mAP50-95"]) {
+    const value = numberFromUnknown(metrics[key])
+    if (value !== null) return value
+  }
+  return null
+}
+
+function modelStatus(status: string) {
+  if (status === "archived") return "arquivado"
+  if (status === "registered" || status === "published") return "publicado"
+  if (status === "approved") return "aprovado"
+  return "em-construcao"
+}
+
+function numberFromRecord(record: Record<string, unknown>, key: string) {
+  return numberFromUnknown(record[key])
+}
+
+function recommendation({
+  pendingReview,
+  failedJobs,
+  tasks,
+  releases,
+  trainingRuns,
+}: {
+  pendingReview: number
+  failedJobs: number
+  tasks: number
+  releases: number
+  trainingRuns: number
+}) {
+  if (pendingReview > 0) {
+    return {
+      icon: AlertCircle,
+      tone: "text-warning",
+      title: `Revisar ${formatPtNumber(pendingReview)} anotações pendentes.`,
+      primaryLabel: "Continuar revisão",
+      href: "/revisar",
+      secondaryLabel: "Ver fila de revisão",
+      secondaryHref: "/revisar",
+    }
+  }
+  if (failedJobs > 0) {
+    return {
+      icon: TriangleAlert,
+      tone: "text-destructive",
+      title: `Verificar ${formatPtNumber(failedJobs)} jobs com falha.`,
+      primaryLabel: "Abrir jobs",
+      href: "/jobs",
+    }
+  }
+  if (tasks === 0) {
+    return {
+      icon: Upload,
+      tone: "text-brand-blue",
+      title: "Importar o primeiro lote de imagens do projeto.",
+      primaryLabel: "Importar lote",
+      href: "/dados",
+    }
+  }
+  if (releases === 0) {
+    return {
+      icon: GitCommitVertical,
+      tone: "text-brand-indigo",
+      title: "Criar um dataset release a partir das tasks sincronizadas.",
+      primaryLabel: "Criar release",
+      href: "/releases",
+    }
+  }
+  if (trainingRuns === 0) {
+    return {
+      icon: Boxes,
+      tone: "text-brand-green",
+      title: "Iniciar o primeiro treinamento com um release pronto.",
+      primaryLabel: "Novo treinamento",
+      href: "/treinar",
+    }
+  }
+  return {
+    icon: Info,
+    tone: "text-brand-green",
+    title: "Nenhuma ação operacional pendente no momento.",
+    primaryLabel: "Ver jobs",
+    href: "/jobs",
+  }
+}
+
+function auditIcon(action: string) {
+  if (action.includes("training")) return Boxes
+  if (action.includes("release")) return GitCommitVertical
+  if (action.includes("review")) return FileClock
+  if (action.includes("failed")) return TriangleAlert
+  return Info
 }

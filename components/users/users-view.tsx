@@ -13,6 +13,7 @@ import {
   roleLabels,
   type UserRole,
   type AppUser,
+  type NewUserInput,
   type ProjectRecord,
 } from "@/lib/auth/user-context"
 
@@ -330,17 +331,20 @@ function NewUserDialog({
 }: {
   open: boolean
   onClose: () => void
-  onCreate: (input: { name: string; email: string; role: UserRole }) => void
+  onCreate: (input: NewUserInput) => Promise<AppUser>
 }) {
   const [name, setName] = React.useState("")
   const [email, setEmail] = React.useState("")
+  const [password, setPassword] = React.useState("")
   const [role, setRole] = React.useState<UserRole>("anotador")
   const [error, setError] = React.useState<string | null>(null)
+  const [saving, setSaving] = React.useState(false)
 
   React.useEffect(() => {
     if (!open) return
     setName("")
     setEmail("")
+    setPassword("")
     setRole("anotador")
     setError(null)
     const onKey = (event: KeyboardEvent) => {
@@ -352,9 +356,10 @@ function NewUserDialog({
 
   if (!open) return null
 
-  function submit(event: React.FormEvent) {
+  async function submit(event: React.FormEvent) {
     event.preventDefault()
     const emailOk = /.+@.+\..+/.test(email.trim())
+    const initialPassword = password.trim()
     if (!name.trim()) {
       setError("Informe o nome do usuário.")
       return
@@ -363,8 +368,19 @@ function NewUserDialog({
       setError("Informe um e-mail válido.")
       return
     }
-    onCreate({ name: name.trim(), email: email.trim(), role })
-    onClose()
+    if (initialPassword.length < 6) {
+      setError("A senha deve ter ao menos 6 caracteres.")
+      return
+    }
+    setSaving(true)
+    try {
+      await onCreate({ name: name.trim(), email: email.trim(), password: initialPassword, role })
+      onClose()
+    } catch {
+      setError("Não foi possível criar o usuário.")
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -418,6 +434,19 @@ function NewUserDialog({
             />
           </label>
 
+          <label className="flex flex-col gap-1.5">
+            <span className="text-sm font-medium text-foreground">Senha inicial</span>
+            <input
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              type="password"
+              minLength={6}
+              autoComplete="new-password"
+              placeholder="Mínimo de 6 caracteres"
+              className="h-10 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue"
+            />
+          </label>
+
           <div className="flex flex-col gap-2">
             <span className="text-sm font-medium text-foreground">Perfil de acesso</span>
             <div className="grid grid-cols-2 gap-2">
@@ -452,9 +481,9 @@ function NewUserDialog({
           <Button type="button" variant="outline" onClick={onClose}>
             Cancelar
           </Button>
-          <Button type="submit">
+          <Button type="submit" disabled={saving}>
             <Users className="size-4" />
-            Criar usuário
+            {saving ? "Criando..." : "Criar usuário"}
           </Button>
         </div>
       </form>

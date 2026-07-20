@@ -14,8 +14,12 @@ export function AppShell({
   children: React.ReactNode
 }) {
   const [navOpen, setNavOpen] = React.useState(false)
-  const { isAuthenticated, authReady } = useCurrentUser()
+  const { isAuthenticated, authReady, projects } = useCurrentUser()
   const router = useRouter()
+  const currentProjectName = projects[0]?.name ?? "Projeto atual"
+  const resolvedBreadcrumb = breadcrumb.map((crumb) =>
+    crumb.label === "Projeto atual" ? { ...crumb, label: currentProjectName } : crumb,
+  )
 
   // Rotas do painel exigem sessão ativa — redireciona para o login caso contrário.
   // Aguarda a reidratação da sessão para não redirecionar prematuramente.
@@ -36,7 +40,7 @@ export function AppShell({
     <div className="flex min-h-svh bg-background">
       <AppSidebar open={navOpen} onClose={() => setNavOpen(false)} />
       <div className="flex min-w-0 flex-1 flex-col">
-        <AppTopbar breadcrumb={breadcrumb} onMenuClick={() => setNavOpen(true)} />
+        <AppTopbar breadcrumb={resolvedBreadcrumb} onMenuClick={() => setNavOpen(true)} />
         <main className="min-w-0 flex-1">{children}</main>
       </div>
     </div>

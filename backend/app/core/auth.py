@@ -1,8 +1,7 @@
 import secrets
-from collections.abc import Callable, Awaitable
+from collections.abc import Awaitable, Callable
 
 from fastapi import Request, Response
-from starlette.responses import JSONResponse
 
 from app.core.config import Settings
 
@@ -12,13 +11,15 @@ async def require_internal_api_key(
     call_next: Callable[[Request], Awaitable[Response]],
     settings: Settings,
 ) -> Response:
+    request.state.internal_api_key_authenticated = False
     if not settings.internal_api_key or request.method == "OPTIONS":
         return await call_next(request)
     if _is_exempt(request.url.path, settings.auth_exempt_paths):
         return await call_next(request)
     if _credential_matches(request, settings.internal_api_key):
+        request.state.internal_api_key_authenticated = True
         return await call_next(request)
-    return JSONResponse({"detail": "Missing or invalid API key"}, status_code=401)
+    return await call_next(request)
 
 
 def _is_exempt(path: str, exempt_paths: list[str]) -> bool:

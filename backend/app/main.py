@@ -3,18 +3,26 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect
 
 from app.api.v1.router import api_router
 from app.core.auth import require_internal_api_key
 from app.core.config import get_settings
-from app.core.database import Base, engine
+from app.core.database import SessionLocal, engine
+from app.services.security import ensure_default_admin
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
-    if settings.auto_create_tables:
-        Base.metadata.create_all(bind=engine)
+    if inspect(engine).has_table("users"):
+        with SessionLocal() as db:
+            ensure_default_admin(
+                db,
+                email=settings.default_admin_email,
+                password=settings.default_admin_password,
+                name=settings.default_admin_name,
+            )
     yield
 
 

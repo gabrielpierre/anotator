@@ -3,7 +3,14 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import Settings
 from app.core.database import Base
-from app.models import AnnotationRecord, AuditEvent, DatasetRelease, DerivedAsset, PipelineDefinition, PipelineRun
+from app.models import (
+    AnnotationRecord,
+    AuditEvent,
+    DatasetRelease,
+    DerivedAsset,
+    PipelineDefinition,
+    PipelineRun,
+)
 from app.services.artifacts import ArtifactStore
 from app.services.pipelines import run_pipeline
 

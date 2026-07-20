@@ -5,8 +5,8 @@ export default function AnotarPage() {
   return (
     <AppShell
       breadcrumb={[
-        { label: "Projetos", href: "/" },
-        { label: "Veículos - Cityscapes", href: "/" },
+        { label: "Projetos", href: "/projetos" },
+        { label: "Projeto atual", href: "/" },
         { label: "Anotar" },
       ]}
     >

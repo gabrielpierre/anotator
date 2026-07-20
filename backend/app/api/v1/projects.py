@@ -3,15 +3,29 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import desc, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from app.api.deps import db_session
-from app.models import AuditEvent, CvatLabel, DatasetRelease, JobRecord, Project, ReviewDecision, Task, TrainingRun
+from app.api.deps import current_admin, current_user, db_session, require_project_access
+from app.models import (
+    AuditEvent,
+    CvatLabel,
+    DatasetRelease,
+    JobRecord,
+    Project,
+    ProjectMember,
+    ReviewDecision,
+    Task,
+    TrainingRun,
+    User,
+)
 from app.schemas import (
     ClassDistribution,
     DashboardStats,
     ProjectCreate,
     ProjectDashboardRead,
+    ProjectMemberRead,
+    ProjectMembersPut,
     ProjectRead,
     ProjectUpdate,
 )
@@ -20,11 +34,23 @@ router = APIRouter()
 
 
 @router.get("", response_model=list[ProjectRead])
-def list_projects(db: Session = Depends(db_session)) -> list[Project]:
-    return list(db.scalars(select(Project).order_by(Project.name)).all())
+def list_projects(
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> list[Project]:
+    query = select(Project)
+    if user.role != "admin":
+        project_ids = select(ProjectMember.project_id).where(ProjectMember.user_id == user.id)
+        query = query.where(Project.id.in_(project_ids))
+    try:
+        return list(db.scalars(query.order_by(Project.name)).all())
+    except OperationalError:
+        if user.id == "internal-api-key":
+            return []
+        raise
 
 
-@router.post("", response_model=ProjectRead)
+@router.post("", response_model=ProjectRead, dependencies=[Depends(current_admin)])
 def create_project(payload: ProjectCreate, db: Session = Depends(db_session)) -> Project:
     external_id = payload.external_id.strip() if payload.external_id else _unique_external_id(db, payload.name)
     if db.scalar(select(Project).where(Project.external_id == external_id)) is not None:
@@ -68,7 +94,7 @@ def create_project(payload: ProjectCreate, db: Session = Depends(db_session)) ->
     return project
 
 
-@router.patch("/{project_id}", response_model=ProjectRead)
+@router.patch("/{project_id}", response_model=ProjectRead, dependencies=[Depends(current_admin)])
 def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depends(db_session)) -> Project:
     project = db.get(Project, project_id) or db.scalar(
         select(Project).where(Project.external_id == project_id)
@@ -84,6 +110,9 @@ def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depend
 
     raw = dict(project.raw or {})
     storage = dict(raw.get("storage") or {})
+    if payload.storage_path is not None and payload.storage_path.strip():
+        storage["path"] = payload.storage_path.strip()
+        changes["storage_path"] = storage["path"]
     if payload.storage_quota_gb is not None:
         storage["quota_gb"] = payload.storage_quota_gb
         storage["quota_bytes"] = payload.storage_quota_gb * 1024**3
@@ -110,13 +139,23 @@ def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depend
 
 
 @router.get("/{project_id}/dashboard", response_model=ProjectDashboardRead)
-def project_dashboard(project_id: str, db: Session = Depends(db_session)) -> ProjectDashboardRead:
+def project_dashboard(
+    project_id: str,
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> ProjectDashboardRead:
     if project_id == "default":
-        project = db.scalar(select(Project).order_by(Project.created_at))
+        if user.role == "admin":
+            project = db.scalar(select(Project).order_by(Project.created_at))
+        else:
+            project = db.scalar(
+                select(Project)
+                .join(ProjectMember, ProjectMember.project_id == Project.id)
+                .where(ProjectMember.user_id == user.id)
+                .order_by(Project.created_at)
+            )
     else:
-        project = db.get(Project, project_id) or db.scalar(
-            select(Project).where(Project.external_id == project_id)
-        )
+        project = require_project_access(db, user, project_id)
 
     task_query = select(Task)
     if project and project_id != "default":
@@ -161,6 +200,95 @@ def project_dashboard(project_id: str, db: Session = Depends(db_session)) -> Pro
     )
 
 
+@router.get("/{project_id}/members", response_model=list[ProjectMemberRead])
+def list_project_members(
+    project_id: str,
+    db: Session = Depends(db_session),
+    _: User = Depends(current_admin),
+) -> list[ProjectMember]:
+    project = db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return list(
+        db.scalars(
+            select(ProjectMember).where(ProjectMember.project_id == project.id).order_by(ProjectMember.created_at)
+        ).all()
+    )
+
+
+@router.put("/{project_id}/members", response_model=list[ProjectMemberRead])
+def put_project_members(
+    project_id: str,
+    payload: ProjectMembersPut,
+    db: Session = Depends(db_session),
+    actor: User = Depends(current_admin),
+) -> list[ProjectMember]:
+    project = db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    users = list(db.scalars(select(User).where(User.id.in_(payload.user_ids))).all()) if payload.user_ids else []
+    if len(users) != len(set(payload.user_ids)):
+        raise HTTPException(status_code=400, detail="One or more users were not found")
+
+    current = {member.user_id: member for member in db.scalars(select(ProjectMember).where(ProjectMember.project_id == project.id))}
+    requested = set(payload.user_ids)
+    for user_id, member in list(current.items()):
+        if user_id not in requested:
+            db.delete(member)
+    for user_id in requested:
+        if user_id not in current:
+            db.add(ProjectMember(project_id=project.id, user_id=user_id, role="anotador"))
+
+    _sync_project_annotators(db, project, sorted(requested))
+    db.add(
+        AuditEvent(
+            actor=actor.email,
+            action="project_members_updated",
+            target=project.id,
+            payload={"project_id": project.id, "user_ids": sorted(requested)},
+        )
+    )
+    db.commit()
+    return list(
+        db.scalars(
+            select(ProjectMember).where(ProjectMember.project_id == project.id).order_by(ProjectMember.created_at)
+        ).all()
+    )
+
+
+@router.delete("/{project_id}/members/{user_id}")
+def delete_project_member(
+    project_id: str,
+    user_id: str,
+    db: Session = Depends(db_session),
+    actor: User = Depends(current_admin),
+) -> dict[str, bool]:
+    project = db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    member = db.scalar(
+        select(ProjectMember).where(ProjectMember.project_id == project.id, ProjectMember.user_id == user_id)
+    )
+    if member is not None:
+        db.delete(member)
+    remaining = [
+        row
+        for row in db.scalars(select(ProjectMember.user_id).where(ProjectMember.project_id == project.id)).all()
+        if row != user_id
+    ]
+    _sync_project_annotators(db, project, remaining)
+    db.add(
+        AuditEvent(
+            actor=actor.email,
+            action="project_member_removed",
+            target=project.id,
+            payload={"project_id": project.id, "user_id": user_id},
+        )
+    )
+    db.commit()
+    return {"ok": True}
+
+
 def _unique_external_id(db: Session, name: str) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "project"
     base = base[:48]
@@ -171,3 +299,10 @@ def _unique_external_id(db: Session, name: str) -> str:
         if db.scalar(select(Project).where(Project.external_id == candidate)) is None:
             return candidate
     raise HTTPException(status_code=409, detail="Could not generate unique project external_id")
+
+
+def _sync_project_annotators(db: Session, project: Project, user_ids: list[str]) -> None:
+    raw = dict(project.raw or {})
+    raw["annotator_ids"] = user_ids
+    project.raw = raw
+    db.add(project)

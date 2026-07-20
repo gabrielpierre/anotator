@@ -1,29 +1,28 @@
 "use client"
 
 import * as React from "react"
-import { Check, ChevronRight, Download, FileArchive, FileJson, GitBranch, Package } from "lucide-react"
+import { Check, ChevronRight, Download, FileArchive, GitBranch, Package } from "lucide-react"
 
 import { PageHeader, StatusBadge } from "@/components/app/primitives"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/snowui/card"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { Button } from "@/components/ui/button"
-import { createDatasetRelease, fetchDatasetReleases, fetchTasks, mockFallbackEnabled } from "@/lib/api/client"
+import {
+  artifactDownloadPathFromUri,
+  createDatasetRelease,
+  datasetReleaseDownloadPath,
+  downloadBackendFile,
+  fetchDatasetReleases,
+  fetchTasks,
+} from "@/lib/api/client"
 import { formatDateTimePt, formatPtNumber } from "@/lib/api/status"
 import type { BackendDatasetRelease, BackendTask } from "@/lib/api/types"
-import { releases } from "@/lib/mock-data"
-
-const fallbackOutputs = [
-  { icon: FileJson, name: "Anotacoes (COCO)", file: "annotations_release_014.json", size: "3.2 MB" },
-  { icon: FileArchive, name: "Mascaras (YOLO format)", file: "masks_release_014.zip", size: "1.8 GB" },
-  { icon: FileArchive, name: "Crops para classificacao", file: "crops_release_014.zip", size: "4.6 GB" },
-]
 
 export function ReleasesView() {
   const [backendReleases, setBackendReleases] = React.useState<BackendDatasetRelease[] | null>(null)
   const [tasks, setTasks] = React.useState<BackendTask[]>([])
   const [creating, setCreating] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
-  const useMocks = mockFallbackEnabled()
 
   const reload = React.useCallback((signal?: AbortSignal) => {
     fetchDatasetReleases(signal).then(setBackendReleases).catch(() => setBackendReleases(null))
@@ -36,13 +35,12 @@ export function ReleasesView() {
     return () => controller.abort()
   }, [reload])
 
-  const realReleases = backendReleases && backendReleases.length > 0 ? backendReleases : null
-  const latestRelease = realReleases?.[0]
+  const realReleases = backendReleases ?? []
+  const latestRelease = realReleases[0]
   const latestSnapshot = latestRelease?.snapshot ?? {}
   const latestCounts = snapshotCounts(latestSnapshot)
   const latestArtifacts = snapshotArtifacts(latestSnapshot)
-  const buildingCount = realReleases?.filter((release) => release.status === "building").length ?? 0
-  const mockReleaseItems = useMocks ? releases : []
+  const buildingCount = realReleases.filter((release) => release.status === "building").length
 
   const handleCreateRelease = async () => {
     if (!tasks.length || creating) return
@@ -81,26 +79,26 @@ export function ReleasesView() {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <MetricCard
           label="Releases"
-          value={realReleases ? formatPtNumber(realReleases.length) : formatPtNumber(mockReleaseItems.length)}
+          value={formatPtNumber(realReleases.length)}
           hint={`${formatPtNumber(buildingCount)} em construcao`}
           tone="blue"
         />
         <MetricCard
           label="Ultimo release"
-          value={latestRelease?.name ?? mockReleaseItems[0]?.id ?? "--"}
-          hint={latestRelease ? formatDateTimePt(latestRelease.created_at) : mockReleaseItems[0]?.date ?? "--"}
+          value={latestRelease?.name ?? "--"}
+          hint={latestRelease ? formatDateTimePt(latestRelease.created_at) : "--"}
           tone="mint"
         />
         <MetricCard
           label="Objetos"
-          value={formatPtNumber(latestCounts.annotations ?? mockReleaseItems[0]?.objects ?? 0)}
-          hint={`${formatPtNumber(latestCounts.images ?? mockReleaseItems[0]?.images ?? 0)} imagens`}
+          value={formatPtNumber(latestCounts.annotations ?? 0)}
+          hint={`${formatPtNumber(latestCounts.images ?? 0)} imagens`}
           tone="purple"
         />
         <MetricCard
           label="Artefatos"
-          value={latestRelease?.artifact_uri ? "MinIO" : mockReleaseItems[0]?.size ?? "--"}
-          hint={`${formatPtNumber(latestArtifacts.length || (useMocks ? fallbackOutputs.length : 0))} arquivos`}
+          value={latestRelease?.artifact_uri ? "MinIO" : "--"}
+          hint={`${formatPtNumber(latestArtifacts.length)} arquivos`}
           tone="subtle"
         />
       </div>
@@ -111,7 +109,7 @@ export function ReleasesView() {
             <CardTitle>Historico de releases</CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            {realReleases
+            {realReleases.length
               ? realReleases.map((release) => {
                   const counts = snapshotCounts(release.snapshot)
                   return (
@@ -139,7 +137,15 @@ export function ReleasesView() {
                         <span className="text-sm tabular-nums text-muted-foreground">
                           {release.immutable ? "imutavel" : "mutavel"}
                         </span>
-                        <Button variant="ghost" size="icon" aria-label="Baixar release" disabled={!release.artifact_uri}>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label="Baixar release"
+                          disabled={!release.artifact_uri}
+                          onClick={() =>
+                            void downloadBackendFile(datasetReleaseDownloadPath(release.id), `${release.name}.zip`)
+                          }
+                        >
                           <Download className="size-4" />
                         </Button>
                         <ChevronRight className="size-4 text-muted-foreground" />
@@ -147,43 +153,13 @@ export function ReleasesView() {
                     </div>
                   )
                 })
-              : mockReleaseItems.length
-                ? mockReleaseItems.map((release) => (
-                  <div
-                    key={release.id}
-                    className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-border p-4 transition-colors hover:bg-muted/40"
-                  >
-                    <div className="flex items-center gap-3">
-                      <span className="flex size-10 items-center justify-center rounded-lg bg-surface-blue text-brand-blue">
-                        <GitBranch className="size-5" />
-                      </span>
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-medium text-foreground">{release.id}</span>
-                          <StatusBadge status={release.status as "publicado" | "em-construcao" | "arquivado"} />
-                        </div>
-                        <span className="text-xs text-muted-foreground">
-                          Criado em {release.date} - {release.images.toLocaleString("pt-BR")} imagens -{" "}
-                          {release.objects.toLocaleString("pt-BR")} objetos
-                        </span>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <span className="text-sm tabular-nums text-muted-foreground">{release.size}</span>
-                      <Button variant="ghost" size="icon" aria-label="Baixar release">
-                        <Download className="size-4" />
-                      </Button>
-                      <ChevronRight className="size-4 text-muted-foreground" />
-                    </div>
-                  </div>
-                ))
-                : <p className="text-sm text-muted-foreground">Nenhum release sincronizado.</p>}
+              : <p className="text-sm text-muted-foreground">Nenhum release sincronizado.</p>}
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader>
-            <CardTitle>Saidas do {latestRelease?.name ?? mockReleaseItems[0]?.id ?? "--"}</CardTitle>
+            <CardTitle>Saidas do {latestRelease?.name ?? "--"}</CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-2">
             {latestArtifacts.length
@@ -194,35 +170,17 @@ export function ReleasesView() {
                     file={String(artifact.filename ?? artifact.uri ?? "dataset.zip")}
                     size={formatBytes(Number(artifact.size_bytes ?? 0))}
                     disabled={!artifact.uri}
+                    onDownload={() => {
+                      if (artifact.uri) {
+                        void downloadBackendFile(
+                          artifactDownloadPathFromUri(String(artifact.uri)),
+                          String(artifact.filename ?? "artifact.zip"),
+                        )
+                      }
+                    }}
                   />
                 ))
-              : useMocks
-                ? fallbackOutputs.map((output) => {
-                  const Icon = output.icon
-                  return (
-                    <div
-                      key={output.name}
-                      className="flex items-center justify-between gap-3 rounded-xl border border-border p-3"
-                    >
-                      <div className="flex items-center gap-3">
-                        <span className="flex size-9 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-                          <Icon className="size-4" />
-                        </span>
-                        <div>
-                          <div className="text-sm font-medium text-foreground">{output.name}</div>
-                          <span className="text-xs text-muted-foreground">{output.file}</span>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs tabular-nums text-muted-foreground">{output.size}</span>
-                        <Button variant="ghost" size="icon" aria-label={`Baixar ${output.name}`}>
-                          <Download className="size-4" />
-                        </Button>
-                      </div>
-                    </div>
-                  )
-                })
-                : <p className="text-sm text-muted-foreground">Nenhum artefato disponivel.</p>}
+              : <p className="text-sm text-muted-foreground">Nenhum artefato disponivel.</p>}
             <div className="mt-2 flex items-center gap-2 rounded-lg bg-brand-green/12 px-3 py-2 text-xs text-brand-green">
               <Check className="size-4" />
               {latestRelease?.status === "ready"
@@ -241,11 +199,13 @@ function ArtifactRow({
   file,
   size,
   disabled,
+  onDownload,
 }: {
   name: string
   file: string
   size: string
   disabled: boolean
+  onDownload?: () => void
 }) {
   return (
     <div className="flex items-center justify-between gap-3 rounded-xl border border-border p-3">
@@ -260,7 +220,7 @@ function ArtifactRow({
       </div>
       <div className="flex items-center gap-2">
         <span className="text-xs tabular-nums text-muted-foreground">{size}</span>
-        <Button variant="ghost" size="icon" aria-label={`Baixar ${name}`} disabled={disabled}>
+        <Button variant="ghost" size="icon" aria-label={`Baixar ${name}`} disabled={disabled} onClick={onDownload}>
           <Download className="size-4" />
         </Button>
       </div>

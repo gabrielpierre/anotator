@@ -9,10 +9,9 @@ import { Badge } from "@/components/snowui/badge"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, StatusBadge } from "@/components/app/primitives"
 import { SparkLineChart } from "@/components/app/charts"
-import { fetchModelVersions, mockFallbackEnabled } from "@/lib/api/client"
+import { downloadBackendFile, fetchModelVersions, modelDownloadPath } from "@/lib/api/client"
 import { formatDateTimePt } from "@/lib/api/status"
 import type { BackendModelVersion } from "@/lib/api/types"
-import { models, modelEvolution } from "@/lib/mock-data"
 
 const familyTone: Record<string, "info" | "accent" | "neutral"> = {
   Detecção: "info",
@@ -23,6 +22,7 @@ const familyTone: Record<string, "info" | "accent" | "neutral"> = {
 
 type ModelRow = {
   id: string
+  modelId?: string
   family: string
   map: string
   mapValue: number
@@ -31,26 +31,14 @@ type ModelRow = {
   size: string
   createdAt: string
   best: boolean
-}
-
-function toMockModelRow(model: (typeof models)[number]): ModelRow {
-  return {
-    id: model.id,
-    family: model.family,
-    map: model.map,
-    mapValue: Number(model.map) || 0,
-    dataset: model.dataset,
-    status: model.status,
-    size: model.size,
-    createdAt: model.createdAt,
-    best: model.best,
-  }
+  downloadable: boolean
 }
 
 function toModelRow(model: BackendModelVersion): ModelRow {
   const mapValue = bestMapFromMetrics(model.metrics)
   return {
     id: `${model.name} ${model.version}`,
+    modelId: model.id,
     family: familyLabel(model.family),
     map: mapValue === null ? "--" : mapValue.toFixed(3),
     mapValue: mapValue ?? 0,
@@ -59,6 +47,7 @@ function toModelRow(model: BackendModelVersion): ModelRow {
     size: model.artifact_uri ? "MLflow" : "--",
     createdAt: formatDateTimePt(model.created_at),
     best: false,
+    downloadable: Boolean(model.artifact_uri),
   }
 }
 
@@ -89,7 +78,6 @@ function bestMapFromMetrics(metrics: Record<string, unknown>) {
 
 export function ModelsView() {
   const [backendModels, setBackendModels] = React.useState<BackendModelVersion[] | null>(null)
-  const useMocks = mockFallbackEnabled()
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -100,13 +88,16 @@ export function ModelsView() {
   }, [])
 
   const rows = React.useMemo(
-    () => (backendModels?.length ? backendModels.map(toModelRow) : useMocks ? models.map(toMockModelRow) : []),
-    [backendModels, useMocks],
+    () => (backendModels?.length ? backendModels.map(toModelRow) : []),
+    [backendModels],
   )
   const best = rows.reduce<ModelRow | null>(
     (current, row) => (!current || row.mapValue > current.mapValue ? row : current),
     null,
   )
+  const mapEvolution = rows
+    .filter((row) => row.mapValue > 0)
+    .map((row) => ({ version: row.id, map: row.mapValue }))
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -141,7 +132,7 @@ export function ModelsView() {
           hint="MLflow + banco"
           tone="purple"
         />
-        <MetricCard label="Tamanho total" value={useMocks ? "1.2 GB" : "--"} hint="artefatos" tone="subtle" />
+        <MetricCard label="Artefatos disponíveis" value={String(rows.filter((row) => row.downloadable).length)} hint="downloads reais" tone="subtle" />
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
@@ -182,7 +173,15 @@ export function ModelsView() {
                     </td>
                     <td className="px-5 py-3">
                       <div className="flex items-center justify-end gap-1">
-                        <Button variant="ghost" size="icon" aria-label="Baixar peso">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          aria-label="Baixar peso"
+                          disabled={!m.modelId || !m.downloadable}
+                          onClick={() => {
+                            if (m.modelId) void downloadBackendFile(modelDownloadPath(m.modelId), `${m.id}.pt`)
+                          }}
+                        >
                           <Download className="size-4" />
                         </Button>
                         <Button variant="ghost" size="icon" aria-label="Mais ações">
@@ -210,14 +209,14 @@ export function ModelsView() {
           </CardHeader>
           <CardContent>
             <SparkLineChart
-              data={useMocks ? modelEvolution : []}
+              data={mapEvolution}
               dataKey="map"
               color="var(--brand-blue)"
               height={200}
               highlightLast
             />
             <p className="mt-3 text-xs text-muted-foreground">
-              Ganho de +0.38 mAP entre v10 e v18 com o crescimento do dataset.
+              Evolução calculada a partir das métricas registradas no backend.
             </p>
           </CardContent>
         </Card>

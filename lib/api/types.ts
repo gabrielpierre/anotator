@@ -1,5 +1,53 @@
 export type BackendJobStatus = "queued" | "running" | "paused" | "succeeded" | "failed" | "canceled"
 
+export type BackendUserRole = "admin" | "anotador"
+
+export type BackendUser = {
+  id: string
+  name: string
+  email: string
+  role: BackendUserRole
+  status: string
+  avatar_url: string | null
+  raw: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+export type BackendUserCreate = {
+  name: string
+  email: string
+  password: string
+  role: BackendUserRole
+  avatar_url?: string | null
+}
+
+export type BackendUserUpdate = {
+  name?: string
+  email?: string
+  password?: string
+  current_password?: string
+  role?: BackendUserRole
+  status?: "active" | "inactive"
+  avatar_url?: string | null
+}
+
+export type BackendAuthSession = {
+  token: string
+  expires_at: string
+  user: BackendUser
+}
+
+export type BackendProjectMember = {
+  id: string
+  project_id: string
+  user_id: string
+  role: string
+  raw: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
 export type BackendProject = {
   id: string
   external_id: string
@@ -20,8 +68,20 @@ export type BackendProjectCreate = {
 
 export type BackendProjectUpdate = {
   name?: string
+  storage_path?: string
   storage_quota_gb?: number
   warn_at_percent?: number
+}
+
+export type BackendDirectoryEntry = {
+  name: string
+  path: string
+}
+
+export type BackendDirectoryListing = {
+  path: string
+  parent: string | null
+  entries: BackendDirectoryEntry[]
 }
 
 export type BackendTask = {
@@ -133,6 +193,22 @@ export type BackendJob = {
   updated_at: string
 }
 
+export type BackendJobCapacity = {
+  queued: number
+  running: number
+  active: number
+  cpu_count: number
+  memory_total_bytes: number | null
+  memory_available_bytes: number | null
+  gpu: Record<string, unknown>
+}
+
+export type BackendJobMetrics = {
+  job_id: string
+  metrics: Record<string, unknown>
+  snapshots: Record<string, unknown>[]
+}
+
 export type BackendInferenceRunCreate = {
   task_external_id: string
   cvat_job_id?: string | null
@@ -217,6 +293,26 @@ export type BackendDatasetRelease = {
   updated_at: string
 }
 
+export type BackendArtifact = {
+  id: string
+  name: string
+  kind: string
+  content_type: string | null
+  size_bytes: number | null
+  download_url: string
+  owner_type: string | null
+  owner_id: string | null
+}
+
+export type BackendPreparedDataset = {
+  release_id: string
+  status: string
+  artifact_uri: string | null
+  download_url: string | null
+  data_yaml: Record<string, unknown> | null
+  manifest: Record<string, unknown> | null
+}
+
 export type BackendDatasetReleaseCreate = {
   name: string
   project_id?: string | null
@@ -273,6 +369,20 @@ export type BackendModelVersion = {
   created_at: string
   updated_at: string
 }
+
+export type BackendModelVersionCreate = {
+  name: string
+  version: string
+  family?: string
+  base_model?: string
+  dataset_release_id?: string | null
+  artifact_uri?: string | null
+  metrics?: Record<string, unknown>
+  params?: Record<string, unknown>
+  status?: string
+}
+
+export type BackendModelVersionUpdate = Partial<BackendModelVersionCreate>
 
 export type BackendPipelineDefinition = {
   id: string
@@ -338,4 +448,36 @@ export type BackendDerivedAsset = {
   status: string
   created_at: string
   updated_at: string
+}
+
+export type BackendAuditEvent = {
+  id: string
+  actor: string
+  action: string
+  target: string
+  reason: string | null
+  confidence: number | null
+  payload: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+export type BackendAuditEventPage = {
+  items: BackendAuditEvent[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export type BackendImportTaskCreate = {
+  project_id?: string | null
+  name: string
+  labels?: Record<string, unknown>[]
+  source_path?: string | null
+  estimated_bytes?: number | null
+  sync_after_import?: boolean
+}
+
+export type BackendImportJob = {
+  job: BackendJob
 }

@@ -1,3 +1,5 @@
+import io
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.models import AuditEvent, DatasetRelease, ModelVersion, TrainingRun
 from app.schemas import TrainingRunCreate
+from app.services.artifacts import S3ArtifactStore
 
 ProgressCallback = Callable[[float, str | None], None]
 TrainingRunner = Callable[[dict[str, Any], ProgressCallback | None], dict[str, Any]]
@@ -137,6 +140,23 @@ def ultralytics_training_runner(
 
 def prepare_training_dataset(context: dict[str, Any], tmp_path: Path) -> Path:
     snapshot = context["dataset_snapshot"] if isinstance(context.get("dataset_snapshot"), dict) else {}
+    prepared = snapshot.get("prepared_dataset") if isinstance(snapshot.get("prepared_dataset"), dict) else {}
+    prepared_uri = prepared.get("artifact_uri") if isinstance(prepared, dict) else None
+    if prepared_uri:
+        settings: Settings = context["settings"]
+        blob = S3ArtifactStore(settings).get(str(prepared_uri))
+        dataset_dir = tmp_path / "prepared-dataset"
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(blob.content)) as archive:
+            archive.extractall(dataset_dir)
+        data_yaml = dataset_dir / "data.yaml"
+        if not data_yaml.exists():
+            matches = list(dataset_dir.rglob("data.yaml"))
+            if matches:
+                data_yaml = matches[0]
+        if data_yaml.exists():
+            return data_yaml
+
     labels = snapshot.get("labels") if isinstance(snapshot.get("labels"), list) else []
     class_names = [str(label.get("name")) for label in labels if isinstance(label, dict) and label.get("name")]
     if not class_names:

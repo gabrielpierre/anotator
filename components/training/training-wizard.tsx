@@ -25,7 +25,6 @@ import { Button } from "@/components/ui/button"
 import { StatRow, Meter } from "@/components/app/primitives"
 import { SparkLineChart } from "@/components/app/charts"
 import { createTrainingRun } from "@/lib/api/client"
-import { trainingCurves } from "@/lib/mock-data"
 import { cn } from "@/lib/utils"
 
 const STEPS = [
@@ -37,7 +36,7 @@ const STEPS = [
   { key: "iniciar", label: "Iniciar" },
 ]
 
-export function TrainingWizard({ release = "release_014" }: { release?: string }) {
+export function TrainingWizard({ release }: { release: string }) {
   const router = useRouter()
   const [step, setStep] = React.useState(0)
   const [cfg, setCfg] = React.useState<SplitConfig>({ ...defaultSplitConfig, release })
@@ -47,7 +46,7 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
     batchSize: "16",
     imageSize: "640",
     workers: "8",
-    device: "2x GPU (RTX 4090)",
+    device: "auto",
     patience: "30",
     seed: "42",
   })
@@ -209,13 +208,13 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
                   </div>
                   <div>
                     <p className="text-xs text-muted-foreground">Tempo estimado</p>
-                    <p className="text-xl font-semibold text-foreground">2h 18min</p>
+                    <p className="text-xl font-semibold text-foreground">--</p>
                   </div>
                 </div>
                 <div className="divide-y divide-border">
-                  <StatRow label="Por época" value="~1m 22s" />
-                  <StatRow label="Total de iterações" value="31.900" />
-                  <StatRow label="Tamanho do dataset" value="8.420 imagens" />
+                  <StatRow label="Por época" value="--" />
+                  <StatRow label="Total de iterações" value="--" />
+                  <StatRow label="Tamanho do dataset" value="--" />
                 </div>
               </CardContent>
             </Card>
@@ -224,8 +223,8 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
                 <CardTitle>Curva esperada de aprendizado</CardTitle>
               </CardHeader>
               <CardContent>
-                <SparkLineChart data={trainingCurves} dataKey="map5095" color="var(--brand-blue)" height={150} />
-                <p className="mt-1 text-center text-xs text-muted-foreground">mAP@0.5:0.95 estimado por época</p>
+                <SparkLineChart data={[]} dataKey="map5095" color="var(--brand-blue)" height={150} />
+                <p className="mt-1 text-center text-xs text-muted-foreground">A curva será preenchida após o treino reportar métricas.</p>
               </CardContent>
             </Card>
             <Card>
@@ -254,9 +253,6 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
                   <StatRow label="Modelo" value={trainingCfg.baseModel} />
                   <StatRow label="Dataset" value={release} />
                 </div>
-                <p className="pt-2 text-xs text-muted-foreground">
-                  8.420 imagens · 43.718 objetos · Criado em 14/07/2024 09:30
-                </p>
               </div>
               <div>
                 <p className="mb-1 text-xs font-medium tracking-wide text-muted-foreground">PARÂMETROS PRINCIPAIS</p>
@@ -277,7 +273,7 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
               <CardTitle>Recursos estimados</CardTitle>
             </CardHeader>
             <CardContent className="flex flex-col gap-3">
-              <Meter label="GPU (RTX 4090)" value={62} detail="~ 7.2 GB" color="bg-brand-green" />
+              <Meter label="GPU" value={0} detail="Definido pela configuração enviada ao backend" color="bg-brand-green" />
               <Meter label="Memória RAM" value={66} detail="~ 15.8 GB" color="bg-brand-blue" />
               <Meter label="CPU" value={54} detail="~ 6.5 cores" color="bg-brand-lavender" />
             </CardContent>
@@ -720,7 +716,7 @@ export type SplitConfig = {
 }
 
 export const defaultSplitConfig: SplitConfig = {
-  release: "release_014",
+  release: "",
   dataType: "video",
   groupBy: "Vídeo / sessão de captura",
   sampling: "Frames anotados + distância mínima",
@@ -740,22 +736,12 @@ export const defaultSplitConfig: SplitConfig = {
   augMode: "Online durante treinamento",
 }
 
-const BASE_IMAGES = 8420
-const BASE_OBJECTS = 43718
-const BASE_VIDEOS = 12
-const BASE_MINUTES = 222 // 03h42min
+const BASE_IMAGES = 0
+const BASE_OBJECTS = 0
+const BASE_VIDEOS = 0
+const BASE_MINUTES = 0
 
-const BASE_CLASSES: { name: string; total: number }[] = [
-  { name: "car", total: 15000 },
-  { name: "person", total: 9000 },
-  { name: "bicycle", total: 3000 },
-  { name: "bus", total: 2500 },
-  { name: "truck", total: 4200 },
-  { name: "motorcycle", total: 1800 },
-  { name: "traffic light", total: 4000 },
-  { name: "traffic sign", total: 120 },
-  { name: "rider", total: 4098 },
-]
+const BASE_CLASSES: { name: string; total: number }[] = []
 
 export type SplitRow = {
   key: "train" | "val" | "test" | "total"
@@ -1555,7 +1541,7 @@ function ResourcesStep({
       <CardContent className="flex flex-col gap-4">
         <Field label="Dispositivo">
           <SelectField
-            options={["2x GPU (RTX 4090)", "1x GPU (RTX 4090)", "CPU"]}
+            options={["auto", "0", "CPU"]}
             value={trainingCfg.device}
             onChange={(device) => setTrainingCfg((current) => ({ ...current, device }))}
           />
@@ -1566,9 +1552,9 @@ function ResourcesStep({
             onChange={(workers) => setTrainingCfg((current) => ({ ...current, workers }))}
           />
         </Field>
-        <Field label="Limite de memória por GPU (GB)"><TextField defaultValue="22" /></Field>
-        <ToggleRow label="Distribuir entre múltiplas GPUs (DDP)" defaultChecked />
-        <ToggleRow label="Cache de dataset em RAM" defaultChecked />
+        <Field label="Limite de memória por GPU (GB)"><TextField defaultValue="" /></Field>
+        <ToggleRow label="Distribuir entre múltiplas GPUs (DDP)" />
+        <ToggleRow label="Cache de dataset em RAM" />
       </CardContent>
     </Card>
   )

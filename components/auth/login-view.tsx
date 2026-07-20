@@ -28,11 +28,11 @@ export function LoginView() {
     if (isAuthenticated) router.replace("/")
   }, [isAuthenticated, router])
 
-  function handleSubmit(event: React.FormEvent) {
+  async function handleSubmit(event: React.FormEvent) {
     event.preventDefault()
     setSubmitting(true)
     setError(null)
-    const result = login(email, password)
+    const result = await login(email, password)
     if (result.ok) {
       router.replace("/")
     } else {
@@ -157,13 +157,10 @@ export function LoginView() {
             </form>
 
             <div className="rounded-lg border border-dashed border-border bg-surface-subtle p-3">
-              <p className="text-xs font-medium text-foreground">Credenciais de demonstração</p>
+              <p className="text-xs font-medium text-foreground">Credencial inicial local</p>
               <ul className="mt-1.5 flex flex-col gap-1 text-xs text-muted-foreground">
                 <li>
-                  Admin: <span className="font-medium text-foreground">gabriel@cvat.plus</span> / admin123
-                </li>
-                <li>
-                  Anotador: <span className="font-medium text-foreground">mariana@cvat.plus</span> / anotar123
+                  Admin: <span className="font-medium text-foreground">admin@cvat.plus</span> / admin123
                 </li>
               </ul>
             </div>

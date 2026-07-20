@@ -1,9 +1,11 @@
 import hashlib
 import html
+import io
 import json
 from collections.abc import Callable
 from typing import Any
 
+from PIL import Image
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -16,7 +18,8 @@ from app.models import (
     PipelineDefinition,
     PipelineRun,
 )
-from app.services.artifacts import ArtifactStore
+from app.services.artifacts import ArtifactStore, proxy_download_url
+from app.services.cvat_client import CvatClient
 
 ProgressCallback = Callable[[float, str | None], None]
 
@@ -76,12 +79,20 @@ def run_pipeline(
             padding=padding,
             definition=definition,
         )
-        asset.crop_uri = artifact_store.put_bytes(
-            f"derived-datasets/{target_release.id}/previews/{asset.external_id}.svg",
-            _preview_svg(asset).encode("utf-8"),
-            "image/svg+xml",
-        )
-        asset.preview_url = asset.crop_uri
+        crop = _crop_png(settings, annotation, asset.bbox, padding)
+        if crop is not None:
+            asset.crop_uri = artifact_store.put_bytes(
+                f"derived-datasets/{target_release.id}/crops/{asset.external_id}.png",
+                crop,
+                "image/png",
+            )
+        else:
+            asset.crop_uri = artifact_store.put_bytes(
+                f"derived-datasets/{target_release.id}/previews/{asset.external_id}.svg",
+                _preview_svg(asset).encode("utf-8"),
+                "image/svg+xml",
+            )
+        asset.preview_url = proxy_download_url(asset.crop_uri)
         db.add(asset)
         assets.append(asset)
         if index == len(selected) or index % 25 == 0:
@@ -394,6 +405,56 @@ def _preview_svg(asset: DerivedAsset) -> str:
   <text x="24" y="44" fill="#64748b" font-family="Arial, sans-serif" font-size="11">{score}</text>
 </svg>
 """
+
+
+def _crop_png(
+    settings: Settings,
+    annotation: AnnotationRecord,
+    bbox: dict[str, float],
+    padding: dict[str, Any],
+) -> bytes | None:
+    if not annotation.task_external_id or annotation.frame is None:
+        return None
+    if bbox.get("width", 0) <= 0 or bbox.get("height", 0) <= 0:
+        return None
+    try:
+        response = CvatClient(settings).retrieve_task_frame(annotation.task_external_id, annotation.frame)
+        with Image.open(io.BytesIO(response.content)) as image:
+            rgb = image.convert("RGB")
+            crop_box = _padded_crop_box(bbox, padding, rgb.width, rgb.height)
+            cropped = rgb.crop(crop_box)
+            output = io.BytesIO()
+            cropped.save(output, format="PNG")
+            return output.getvalue()
+    except Exception:
+        return None
+
+
+def _padded_crop_box(
+    bbox: dict[str, float],
+    padding: dict[str, Any],
+    image_width: int,
+    image_height: int,
+) -> tuple[int, int, int, int]:
+    x = float(bbox.get("x") or 0)
+    y = float(bbox.get("y") or 0)
+    width = float(bbox.get("width") or 0)
+    height = float(bbox.get("height") or 0)
+    value = float(padding.get("value") or 0)
+    if padding.get("mode") == "absolute":
+        pad_x = pad_y = value
+    else:
+        pad_x = width * value
+        pad_y = height * value
+    left = max(0, int(x - pad_x))
+    top = max(0, int(y - pad_y))
+    right = min(image_width, int(x + width + pad_x))
+    bottom = min(image_height, int(y + height + pad_y))
+    if right <= left:
+        right = min(image_width, left + 1)
+    if bottom <= top:
+        bottom = min(image_height, top + 1)
+    return left, top, right, bottom
 
 
 def _manifest(

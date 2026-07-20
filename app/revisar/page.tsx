@@ -5,9 +5,8 @@ export default function RevisarPage() {
   return (
     <AppShell
       breadcrumb={[
-        { label: "Projetos", href: "/" },
-        { label: "Veículos - Cityscapes", href: "/" },
-        { label: "Lote 3/10" },
+        { label: "Projetos", href: "/projetos" },
+        { label: "Projeto atual", href: "/" },
         { label: "Revisão" },
       ]}
     >

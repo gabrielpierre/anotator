@@ -7,6 +7,7 @@ from app.models import DatasetRelease, PipelineRun, TrainingRun
 from app.schemas import DatasetReleaseCreate, InferenceRunCreate
 from app.services.artifacts import S3ArtifactStore
 from app.services.cvat_client import CvatClient
+from app.services.imports import run_import_task_job
 from app.services.inference import run_inference
 from app.services.jobs import (
     JobCanceled,
@@ -17,10 +18,10 @@ from app.services.jobs import (
     succeed_job,
     update_job_progress,
 )
+from app.services.pipelines import run_pipeline
 from app.services.releases import build_dataset_release
 from app.services.sync import CvatSyncService
 from app.services.training import run_training
-from app.services.pipelines import run_pipeline
 
 
 @celery_app.task(name="app.tasks.sync_cvat")
@@ -42,6 +43,28 @@ def sync_cvat_task(job_id: str | None = None) -> dict[str, Any]:
     except Exception as exc:
         if job_id:
             fail_job(db, job_id, reason=str(exc))
+        raise
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.tasks.import_task")
+def import_task_job_task(job_id: str) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        settings = get_settings()
+        job = run_import_task_job(
+            db,
+            job_id=job_id,
+            settings=settings,
+            artifact_store=S3ArtifactStore(settings),
+            client=CvatClient(settings),
+        )
+        return {"status": job.status, "job_id": job.id, "cvat_task_id": (job.raw or {}).get("cvat_task_id")}
+    except JobCanceled:
+        return {"status": "canceled", "job_id": job_id}
+    except Exception as exc:
+        fail_job(db, job_id, reason=str(exc))
         raise
     finally:
         db.close()

@@ -65,6 +65,31 @@ class CvatClient:
         except httpx.HTTPError as exc:
             raise CvatClientError(str(exc)) from exc
 
+    def post_multipart(
+        self,
+        path: str,
+        *,
+        data: dict[str, Any] | None = None,
+        files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+        try:
+            response = httpx.post(
+                url,
+                headers=self._headers(),
+                params=params,
+                data=data or {},
+                files=files or [],
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            if not response.content:
+                return None
+            return response.json()
+        except httpx.HTTPError as exc:
+            raise CvatClientError(str(exc)) from exc
+
     def patch_json(
         self,
         path: str,
@@ -126,6 +151,37 @@ class CvatClient:
 
     def retrieve_task(self, task_id: str | int) -> dict[str, Any]:
         return self.get_json(f"/api/tasks/{task_id}")
+
+    def create_task(
+        self,
+        *,
+        name: str,
+        labels: list[dict[str, Any]],
+        project_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": name, "labels": labels}
+        if project_id is not None:
+            payload["project_id"] = project_id
+        result = self.post_json("/api/tasks", payload)
+        return result if isinstance(result, dict) else {}
+
+    def upload_task_data(
+        self,
+        task_id: str | int,
+        *,
+        files: list[tuple[str, bytes, str]],
+        image_quality: int = 70,
+    ) -> dict[str, Any]:
+        multipart = [
+            ("client_files", (filename, content, content_type))
+            for filename, content, content_type in files
+        ]
+        result = self.post_multipart(
+            f"/api/tasks/{task_id}/data",
+            data={"image_quality": str(image_quality), "sorting_method": "lexicographical"},
+            files=multipart,
+        )
+        return result if isinstance(result, dict) else {}
 
     def retrieve_task_data_meta(self, task_id: str | int) -> dict[str, Any]:
         return self.get_json(f"/api/tasks/{task_id}/data/meta")

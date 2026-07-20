@@ -1,24 +1,20 @@
 "use client"
 
 import * as React from "react"
-import Image from "next/image"
 import { Pause, Square, MoreHorizontal, Settings2, ChevronRight } from "lucide-react"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { StatusBadge, ProgressBar, StatRow, Meter } from "@/components/app/primitives"
 import { TabNav } from "@/components/app/tab-nav"
-import { MetricLineChart, SparkLineChart } from "@/components/app/charts"
-import { DonutChart } from "@/components/snowui/charts"
-import { ConfusionMatrix } from "@/components/training/confusion-matrix"
-import { fetchTrainingRun, mockFallbackEnabled, trainingRunEventsUrl } from "@/lib/api/client"
+import { MetricLineChart } from "@/components/app/charts"
+import {
+  artifactDownloadPathFromUri,
+  downloadBackendFile,
+  fetchTrainingRun,
+  trainingRunEventsUrl,
+} from "@/lib/api/client"
 import { formatDateTimePt, toUiJobStatus } from "@/lib/api/status"
 import type { BackendTrainingRun } from "@/lib/api/types"
-import {
-  trainingCurves,
-  trainingMetrics,
-  machineResources,
-  classes,
-} from "@/lib/mock-data"
 
 const TABS = [
   { key: "overview", label: "Visão geral" },
@@ -38,54 +34,9 @@ const chartSeries = [
   { key: "loss", label: "Loss", color: "var(--destructive)" },
 ]
 
-const kpis = [
-  { label: "Modelo base", value: "YOLO11m" },
-  { label: "Dataset", value: "release_014" },
-  { label: "Iniciado em", value: "14/07/2024 10:32" },
-  { label: "Tempo decorrido", value: "00:18:42" },
-  { label: "Época", value: "37 / 100" },
-  { label: "ETA", value: "00:32:18" },
-]
-
-const sizeDist = [
-  { label: "Pequeno (0 - 32²)", value: 18.7, color: "var(--brand-blue)" },
-  { label: "Médio (32² - 96²)", value: 41.2, color: "var(--brand-green)" },
-  { label: "Grande (> 96²)", value: 40.1, color: "var(--warning)" },
-]
-
-const examples = [
-  { src: "/crop-car.png", label: "car", conf: "0.94" },
-  { src: "/crop-truck.png", label: "truck", conf: "0.88" },
-  { src: "/crop-motorcycle.png", label: "motorcycle", conf: "0.77" },
-]
-
-const config = [
-  { label: "Modelo base", value: "YOLO11m" },
-  { label: "Dataset", value: "release_014" },
-  { label: "Épocas", value: "100" },
-  { label: "Imagem (imgsz)", value: "640" },
-  { label: "Batch size", value: "16" },
-  { label: "Optimizer", value: "AdamW" },
-  { label: "LR inicial", value: "0.001" },
-  { label: "Augmentação", value: "Ativada (padrão YOLO)" },
-  { label: "Peso de decaimento", value: "0.0005" },
-  { label: "Warmup", value: "3 épocas" },
-  { label: "Early stopping", value: "Desativado" },
-]
-
-const additionalInfo = [
-  { label: "Versão do código", value: "v1.6.2 (7b2d99a)" },
-  { label: "Versão do framework", value: "Ultralytics 8.2.28" },
-  { label: "Dispositivo", value: "2x GPU" },
-  { label: "Cache", value: "Habilitado" },
-  { label: "AMP (FP16)", value: "Habilitado" },
-  { label: "Workers", value: "8" },
-]
-
 export function TrainingDetail({ id }: { id: string }) {
   const [tab, setTab] = React.useState("overview")
   const [run, setRun] = React.useState<BackendTrainingRun | null>(null)
-  const useMocks = mockFallbackEnabled()
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -105,7 +56,7 @@ export function TrainingDetail({ id }: { id: string }) {
     }
   }, [id])
 
-  if (!run && !useMocks) {
+  if (!run) {
     return (
       <div className="flex flex-col gap-4 p-4 md:p-6">
         <h1 className="text-2xl font-semibold tracking-tight">Treinamento #{id}</h1>
@@ -118,17 +69,17 @@ export function TrainingDetail({ id }: { id: string }) {
     )
   }
 
-  const progress = Math.round(run?.progress ?? 37)
-  const displayKpis = run ? kpisFromRun(run) : kpis
-  const displayConfig = run ? configFromRun(run) : config
+  const progress = Math.round(run.progress)
+  const displayKpis = kpisFromRun(run)
+  const displayConfig = configFromRun(run)
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       {/* Header */}
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-semibold tracking-tight">Treinamento #{run?.id.slice(0, 8) ?? id}</h1>
-          <StatusBadge status={run ? toUiJobStatus(run.status) : "executando"} />
+          <h1 className="text-2xl font-semibold tracking-tight">Treinamento #{run.id.slice(0, 8)}</h1>
+          <StatusBadge status={toUiJobStatus(run.status)} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline">
@@ -170,11 +121,11 @@ export function TrainingDetail({ id }: { id: string }) {
         <div className="flex min-w-0 flex-col gap-6">
           <TabNav tabs={TABS} value={tab} onChange={setTab} />
 
-          {tab === "overview" && <OverviewTab />}
-          {tab === "metrics" && <MetricsTab />}
-          {tab === "per-class" && <PerClassTab />}
-          {tab === "resources" && <ResourcesTab />}
-          {tab === "logs" && <LogsTab />}
+          {tab === "overview" && <OverviewTab run={run} />}
+          {tab === "metrics" && <MetricsTab run={run} />}
+          {tab === "per-class" && <PerClassTab run={run} />}
+          {tab === "resources" && <ResourcesTab run={run} />}
+          {tab === "logs" && <LogsTab run={run} />}
           {tab === "artifacts" && <ArtifactsTab run={run} />}
           {tab === "config" && <ConfigTab run={run} />}
         </div>
@@ -204,34 +155,13 @@ export function TrainingDetail({ id }: { id: string }) {
               <CardTitle>Recursos da máquina</CardTitle>
             </CardHeader>
             <CardContent className="flex flex-col gap-4">
-              {machineResources.gpus.map((gpu) => (
-                <div key={gpu.name} className="flex flex-col gap-2">
-                  <span className="text-xs font-medium text-foreground">{gpu.name}</span>
-                  <Meter label="Utilização" value={gpu.util} color="bg-brand-blue" />
-                  <div className="flex items-center justify-between text-xs text-muted-foreground">
-                    <span>Memória</span>
-                    <span className="tabular-nums text-foreground">{gpu.mem}</span>
-                  </div>
-                </div>
-              ))}
               <div className="flex flex-col gap-2 border-t border-border pt-3">
-                <Meter label="CPU" value={machineResources.cpu.util} color="bg-brand-lavender" />
+                <Meter label="Progresso reportado" value={progress} color="bg-brand-lavender" />
                 <div className="flex items-center justify-between text-xs text-muted-foreground">
-                  <span>Memória RAM</span>
-                  <span className="tabular-nums text-foreground">{machineResources.cpu.mem}</span>
+                  <span>Device</span>
+                  <span className="tabular-nums text-foreground">{String(run.config.device ?? "auto")}</span>
                 </div>
               </div>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Informações adicionais</CardTitle>
-            </CardHeader>
-            <CardContent className="divide-y divide-border">
-              {additionalInfo.map((c) => (
-                <StatRow key={c.label} label={c.label} value={c.value} />
-              ))}
             </CardContent>
           </Card>
         </aside>
@@ -293,50 +223,97 @@ function metricText(value: number | null) {
   return value === null ? "--" : value.toFixed(3)
 }
 
-function OverviewTab() {
+function numberValue(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
+}
+
+function metricRows(metrics: Record<string, unknown>) {
+  const colors = ["var(--brand-sky)", "var(--brand-green)", "var(--brand-lavender)", "var(--warning)"]
+  return Object.entries(metrics)
+    .filter(([, value]) => numberValue(value) !== null)
+    .map(([key, value], index) => ({
+      key,
+      label: key,
+      value: metricText(numberValue(value)),
+      color: colors[index % colors.length],
+    }))
+}
+
+function chartDataFromMetrics(metrics: Record<string, unknown>) {
+  const history = metrics.history
+  if (Array.isArray(history)) {
+    return history.filter((item): item is Record<string, number | string> => Boolean(item) && typeof item === "object")
+  }
+  const row: Record<string, number | string> = { epoch: numberValue(metrics.epoch) ?? 0 }
+  for (const metric of metricRows(metrics)) {
+    const value = numberValue(metrics[metric.key])
+    if (value !== null) row[metric.key] = value
+  }
+  return Object.keys(row).length > 1 ? [row] : []
+}
+
+function perClassRows(metrics: Record<string, unknown>) {
+  const raw = metrics.per_class
+  if (!raw || typeof raw !== "object") return []
+  return Object.entries(raw as Record<string, unknown>).map(([name, value]) => {
+    const row = value && typeof value === "object" ? (value as Record<string, unknown>) : {}
+    return {
+      name,
+      instances: String(row.instances ?? row.count ?? "--"),
+      precision: metricText(numberValue(row.precision)),
+      recall: metricText(numberValue(row.recall)),
+      map: metricText(numberValue(row.map5095 ?? row.map ?? row["mAP50-95"])),
+    }
+  })
+}
+
+function OverviewTab({ run }: { run: BackendTrainingRun }) {
+  const metrics = metricRows(run.metrics)
+  const chartData = chartDataFromMetrics(run.metrics)
   return (
     <div className="flex flex-col gap-6">
       <Card>
         <CardHeader>
-          <CardTitle>Métricas em tempo real</CardTitle>
-          <span className="text-xs text-muted-foreground">Época 37 / 100</span>
+          <CardTitle>Métricas reportadas</CardTitle>
+          <span className="text-xs text-muted-foreground">{formatDateTimePt(run.updated_at)}</span>
         </CardHeader>
         <CardContent className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_300px]">
           <div>
             <div className="mb-3 flex flex-wrap gap-4">
-              {chartSeries.map((s) => (
+              {chartSeries.slice(0, 4).map((s) => (
                 <span key={s.key} className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <span className="size-2 rounded-full" style={{ backgroundColor: s.color }} />
                   {s.label}
                 </span>
               ))}
             </div>
-            <MetricLineChart data={trainingCurves} series={chartSeries} referenceX={37} />
+            <MetricLineChart data={chartData} series={chartSeries.slice(0, 4)} />
           </div>
           <div className="flex flex-col">
             <div className="grid grid-cols-[1fr_auto_auto] gap-x-3 border-b border-border pb-2 text-xs text-muted-foreground">
               <span>Métrica</span>
               <span className="text-right">Atual</span>
-              <span className="text-right">Melhor</span>
+              <span className="text-right">Origem</span>
             </div>
             <div className="divide-y divide-border">
-              {trainingMetrics.map((m) => (
+              {metrics.map((m) => (
                 <div key={m.key} className="grid grid-cols-[1fr_auto_auto] items-center gap-x-3 py-2.5 text-sm">
                   <span className="flex items-center gap-2">
                     <span className="size-2 rounded-full" style={{ backgroundColor: m.color }} />
                     {m.label}
                   </span>
-                  <span className="text-right tabular-nums text-foreground">{m.atual.toFixed(3)}</span>
-                  <span className="text-right tabular-nums">
-                    <span className="font-medium text-brand-green">{m.melhor.toFixed(3)}</span>
-                    <span className="ml-1 text-xs text-muted-foreground">ép. {m.epoca}</span>
-                  </span>
+                  <span className="text-right tabular-nums text-foreground">{m.value}</span>
+                  <span className="text-right text-xs text-muted-foreground">backend</span>
                 </div>
               ))}
-            </div>
-            <div className="mt-auto flex items-center justify-between border-t border-border pt-3 text-xs text-muted-foreground">
-              <span>Melhor época: <span className="font-medium text-foreground">33</span></span>
-              <span>Early stopping: desativado</span>
+              {metrics.length === 0 && (
+                <p className="py-3 text-sm text-muted-foreground">Nenhuma métrica reportada ainda.</p>
+              )}
             </div>
           </div>
         </CardContent>
@@ -348,13 +325,12 @@ function OverviewTab() {
             <CardTitle>Progresso do treinamento</CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            <Meter label="Época atual (37 / 100)" value={37} color="bg-brand-green" />
+            <Meter label="Progresso geral" value={Math.round(run.progress)} color="bg-brand-green" />
             <div className="divide-y divide-border">
-              <StatRow label="Iteração" value="11.840 / 31.900" />
-              <StatRow label="Tamanho do dataset" value="43.718 objetos (8.420 imgs)" />
-              <StatRow label="Tamanho do batch" value="16" />
-              <StatRow label="Taxa de aprendizado atual" value="0.000432" />
-              <StatRow label="Próximo ajuste de LR" value="Época 40" />
+              <StatRow label="Época" value={String(numberParam(run.metrics, "epoch", 0))} />
+              <StatRow label="Batch size" value={String(numberParam(run.config, "batch_size", 0) || "--")} />
+              <StatRow label="Taxa de aprendizado" value={metricText(numberValue(run.metrics.learning_rate))} />
+              <StatRow label="MLflow" value={run.mlflow_run_id ?? "--"} />
             </div>
           </CardContent>
         </Card>
@@ -364,67 +340,7 @@ function OverviewTab() {
             <CardTitle>Matriz de confusão (validação)</CardTitle>
           </CardHeader>
           <CardContent>
-            <ConfusionMatrix />
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <Card>
-          <CardHeader>
-            <CardTitle>mAP@0.5:0.95 (validação)</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <SparkLineChart data={trainingCurves} dataKey="map5095" color="var(--brand-blue)" height={140} highlightLast />
-            <p className="mt-2 text-center text-sm font-medium tabular-nums text-foreground">0.742</p>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Distribuição de tamanhos</CardTitle>
-          </CardHeader>
-          <CardContent className="flex items-center gap-4">
-            <div className="w-28 shrink-0">
-              <DonutChart data={sizeDist} height={120} />
-            </div>
-            <ul className="flex flex-col gap-2 text-xs">
-              {sizeDist.map((s) => (
-                <li key={s.label} className="flex items-center gap-2">
-                  <span className="size-2.5 rounded-full" style={{ backgroundColor: s.color }} />
-                  <span className="text-muted-foreground">{s.label}</span>
-                  <span className="ml-auto tabular-nums font-medium text-foreground">{s.value}%</span>
-                </li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Exemplos (época atual)</CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            <div className="grid grid-cols-3 gap-2">
-              {examples.map((ex) => (
-                <div key={ex.label} className="relative overflow-hidden rounded-lg border border-border">
-                  <Image
-                    src={ex.src || "/placeholder.svg"}
-                    alt={`Predição: ${ex.label}`}
-                    width={120}
-                    height={120}
-                    className="aspect-square w-full object-cover"
-                  />
-                  <span className="absolute left-1 top-1 rounded bg-brand-blue px-1 text-[10px] font-medium text-white">
-                    {ex.label} {ex.conf}
-                  </span>
-                </div>
-              ))}
-            </div>
-            <button className="flex items-center justify-center gap-1 text-xs font-medium text-brand-blue hover:underline">
-              Ver mais exemplos
-              <ChevronRight className="size-3.5" />
-            </button>
+            <p className="text-sm text-muted-foreground">Nenhuma matriz de confusão reportada pelo backend.</p>
           </CardContent>
         </Card>
       </div>
@@ -432,38 +348,29 @@ function OverviewTab() {
   )
 }
 
-function MetricsTab() {
+function MetricsTab({ run }: { run: BackendTrainingRun }) {
+  const metrics = metricRows(run.metrics)
   return (
     <div className="flex flex-col gap-6">
-      {chartSeries.map((s) => (
-        <Card key={s.key}>
-          <CardHeader>
-            <CardTitle>{s.label}</CardTitle>
-            <span className="text-xs text-muted-foreground">por época</span>
-          </CardHeader>
-          <CardContent>
-            <MetricLineChart
-              data={trainingCurves}
-              series={[s]}
-              height={200}
-              domain={s.key === "loss" ? [0, 1] : [0, 1]}
-              referenceX={37}
-            />
-          </CardContent>
-        </Card>
-      ))}
+      <Card className="p-0">
+        <div className="divide-y divide-border">
+          {metrics.map((metric) => (
+            <div key={metric.key} className="flex items-center justify-between px-5 py-3 text-sm">
+              <span className="text-muted-foreground">{metric.label}</span>
+              <span className="font-medium tabular-nums text-foreground">{metric.value}</span>
+            </div>
+          ))}
+          {metrics.length === 0 && (
+            <p className="px-5 py-6 text-sm text-muted-foreground">Nenhuma métrica reportada ainda.</p>
+          )}
+        </div>
+      </Card>
     </div>
   )
 }
 
-function PerClassTab() {
-  const perClass = classes.slice(0, 8).map((c, i) => ({
-    name: c.name,
-    map: (0.9 - i * 0.06).toFixed(3),
-    precision: (0.92 - i * 0.05).toFixed(3),
-    recall: (0.88 - i * 0.055).toFixed(3),
-    instances: c.count,
-  }))
+function PerClassTab({ run }: { run: BackendTrainingRun }) {
+  const perClass = perClassRows(run.metrics)
   return (
     <Card className="p-0">
       <div className="overflow-x-auto">
@@ -492,6 +399,13 @@ function PerClassTab() {
                 </td>
               </tr>
             ))}
+            {perClass.length === 0 && (
+              <tr>
+                <td colSpan={5} className="px-5 py-6 text-center text-sm text-muted-foreground">
+                  Nenhuma métrica por classe reportada.
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
@@ -499,62 +413,33 @@ function PerClassTab() {
   )
 }
 
-function ResourcesTab() {
+function ResourcesTab({ run }: { run: BackendTrainingRun }) {
   return (
     <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
-      {machineResources.gpus.map((gpu) => (
-        <Card key={gpu.name}>
-          <CardHeader>
-            <CardTitle>{gpu.name}</CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-3">
-            <Meter label="Utilização" value={gpu.util} color="bg-brand-blue" />
-            <div className="flex items-center justify-between text-sm text-muted-foreground">
-              <span>Memória</span>
-              <span className="tabular-nums text-foreground">{gpu.mem}</span>
-            </div>
-          </CardContent>
-        </Card>
-      ))}
       <Card>
         <CardHeader>
-          <CardTitle>CPU</CardTitle>
+          <CardTitle>Política de execução</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
-          <Meter label="Utilização" value={machineResources.cpu.util} color="bg-brand-lavender" />
-          <div className="flex items-center justify-between text-sm text-muted-foreground">
-            <span>Memória RAM</span>
-            <span className="tabular-nums text-foreground">{machineResources.cpu.mem}</span>
-          </div>
+          <StatRow label="Device" value={String(run.config.device ?? "auto")} />
+          <StatRow label="Workers" value={String(run.config.workers ?? "--")} />
+          <StatRow label="Batch size" value={String(run.config.batch_size ?? "--")} />
         </CardContent>
       </Card>
       <Card>
         <CardHeader>
-          <CardTitle>Disco (SSD)</CardTitle>
+          <CardTitle>Progresso reportado</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
-          <Meter label="Utilização" value={machineResources.disk.util} color="bg-brand-indigo" />
-          <div className="flex items-center justify-between text-sm text-muted-foreground">
-            <span>Espaço</span>
-            <span className="tabular-nums text-foreground">{machineResources.disk.label}</span>
-          </div>
+          <Meter label="Progresso" value={Math.round(run.progress)} color="bg-brand-indigo" />
         </CardContent>
       </Card>
     </div>
   )
 }
 
-const logLines = [
-  { t: "10:32:01", lvl: "INFO", msg: "Iniciando treinamento — YOLO11m, dataset release_014" },
-  { t: "10:32:03", lvl: "INFO", msg: "Dispositivos: 2x NVIDIA RTX 4090 (AMP FP16 habilitado)" },
-  { t: "10:32:08", lvl: "INFO", msg: "Dataset carregado: 8.420 imagens / 43.718 objetos" },
-  { t: "10:34:12", lvl: "INFO", msg: "Época 1/100 — loss 0.892 | mAP@0.5 0.421" },
-  { t: "10:41:55", lvl: "WARN", msg: "Classe 'traffic light' com baixa cobertura (45 instâncias)" },
-  { t: "10:50:33", lvl: "INFO", msg: "Época 33/100 — melhor mAP@0.5 0.925 (checkpoint salvo)" },
-  { t: "10:50:42", lvl: "INFO", msg: "Época 37/100 — loss 0.148 | mAP@0.5 0.912" },
-]
-
-function LogsTab() {
+function LogsTab({ run }: { run: BackendTrainingRun }) {
+  const logs = Array.isArray(run.metrics.logs) ? run.metrics.logs : []
   return (
     <Card className="p-0">
       <div className="flex items-center justify-between border-b border-border px-5 py-3">
@@ -565,33 +450,30 @@ function LogsTab() {
         </span>
       </div>
       <div className="max-h-[480px] overflow-auto p-4 font-mono text-xs leading-relaxed">
-        {logLines.map((l, i) => (
+        {logs.map((entry, i) => {
+          const row: Record<string, unknown> =
+            entry && typeof entry === "object" ? (entry as Record<string, unknown>) : { msg: entry }
+          return (
           <div key={i} className="flex gap-3 py-0.5">
-            <span className="shrink-0 text-muted-foreground">{l.t}</span>
+            <span className="shrink-0 text-muted-foreground">{String(row.t ?? row.time ?? "--")}</span>
             <span
               className={
-                l.lvl === "WARN"
+                row.lvl === "WARN"
                   ? "shrink-0 font-medium text-warning"
                   : "shrink-0 font-medium text-brand-blue"
               }
             >
-              {l.lvl}
+              {String(row.lvl ?? row.level ?? "INFO")}
             </span>
-            <span className="text-foreground/80">{l.msg}</span>
+            <span className="text-foreground/80">{String(row.msg ?? row.message ?? entry)}</span>
           </div>
-        ))}
+          )
+        })}
+        {logs.length === 0 && <p className="text-muted-foreground">Nenhum log reportado pelo backend.</p>}
       </div>
     </Card>
   )
 }
-
-const artifacts = [
-  { name: "best.pt", desc: "Melhor checkpoint (época 33)", size: "42.6 MB" },
-  { name: "last.pt", desc: "Último checkpoint (época 37)", size: "42.6 MB" },
-  { name: "results.csv", desc: "Métricas por época", size: "128 KB" },
-  { name: "confusion_matrix.png", desc: "Matriz de confusão", size: "312 KB" },
-  { name: "args.yaml", desc: "Configuração do treino", size: "4 KB" },
-]
 
 function artifactsFromRun(run: BackendTrainingRun) {
   return run.artifacts.map((artifact, index) => {
@@ -601,6 +483,7 @@ function artifactsFromRun(run: BackendTrainingRun) {
       name,
       desc: String(row.uri ?? row.path ?? "Artefato MLflow"),
       size: formatBytes(row.size_bytes),
+      uri: typeof row.uri === "string" ? row.uri : null,
     }
   })
 }
@@ -615,11 +498,14 @@ function formatBytes(value: unknown) {
 }
 
 function ArtifactsTab({ run }: { run: BackendTrainingRun | null }) {
-  const rows = run && run.artifacts.length > 0 ? artifactsFromRun(run) : artifacts
+  const rows = run && run.artifacts.length > 0 ? artifactsFromRun(run) : []
   return (
     <Card className="p-0">
       <div className="divide-y divide-border">
-        {rows.map((a) => (
+        {rows.map((a) => {
+          const uri = "uri" in a ? a.uri : null
+          const canDownload = typeof uri === "string" && uri.startsWith("s3://")
+          return (
           <div key={a.name} className="flex items-center gap-3 px-5 py-3.5">
             <div className="flex size-9 items-center justify-center rounded-lg bg-muted font-mono text-[10px] text-muted-foreground">
               {a.name.split(".").pop()}
@@ -629,16 +515,29 @@ function ArtifactsTab({ run }: { run: BackendTrainingRun | null }) {
               <p className="truncate text-xs text-muted-foreground">{a.desc}</p>
             </div>
             <span className="text-xs tabular-nums text-muted-foreground">{a.size}</span>
-            <Button variant="ghost" size="sm">Baixar</Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={!canDownload}
+              onClick={() => {
+                if (canDownload) void downloadBackendFile(artifactDownloadPathFromUri(uri), a.name)
+              }}
+            >
+              Baixar
+            </Button>
           </div>
-        ))}
+          )
+        })}
+        {rows.length === 0 && (
+          <p className="px-5 py-6 text-sm text-muted-foreground">Nenhum artefato reportado pelo backend.</p>
+        )}
       </div>
     </Card>
   )
 }
 
 function ConfigTab({ run }: { run: BackendTrainingRun | null }) {
-  const rows = run ? configFromRun(run) : config
+  const rows = run ? configFromRun(run) : []
   return (
     <Card>
       <CardHeader>
@@ -647,11 +546,6 @@ function ConfigTab({ run }: { run: BackendTrainingRun | null }) {
       <CardContent className="grid grid-cols-1 gap-x-8 sm:grid-cols-2">
         <div className="divide-y divide-border">
           {rows.map((c) => (
-            <StatRow key={c.label} label={c.label} value={c.value} />
-          ))}
-        </div>
-        <div className="divide-y divide-border">
-          {additionalInfo.map((c) => (
             <StatRow key={c.label} label={c.label} value={c.value} />
           ))}
         </div>

@@ -26,14 +26,9 @@ export type ModelInfo = {
   version: string
   task: "Detecção" | "Detecção rápida" | "Segmentação" | "Classificação"
   status: "Disponível" | "Carregando" | "Indisponível"
+  family: "detection" | "segmentation" | "classification" | "tracking"
+  baseModel: string
 }
-
-export const availableModels: ModelInfo[] = [
-  { id: "yolo11m", name: "YOLO11m", version: "v18", task: "Detecção", status: "Disponível" },
-  { id: "yolo11n", name: "YOLO11n", version: "v12", task: "Detecção rápida", status: "Disponível" },
-  { id: "yoloseg", name: "YOLO-Seg", version: "v9", task: "Segmentação", status: "Carregando" },
-  { id: "resnet50", name: "ResNet50", version: "v6", task: "Classificação", status: "Disponível" },
-]
 
 export type Suggestion = {
   id: number
@@ -194,6 +189,7 @@ function ModelRow({
 /* ---------- Main card ---------- */
 
 export function AutoAnnotationCard({
+  models,
   classNames,
   layers,
   onGenerate,
@@ -204,6 +200,7 @@ export function AutoAnnotationCard({
   imageIndex,
   totalImages,
 }: {
+  models: ModelInfo[]
   classNames: string[]
   layers: PredictionLayer[]
   /** Cria sugestões para os modelos informados. replaceModels indica quais devem substituir as sugestões existentes. */
@@ -227,7 +224,7 @@ export function AutoAnnotationCard({
   imageIndex: number
   totalImages: number
 }) {
-  const [mainModelId, setMainModelId] = useState(availableModels[0].id)
+  const [mainModelId, setMainModelId] = useState(models[0]?.id ?? "")
   const [auxModelIds, setAuxModelIds] = useState<string[]>([])
   const [auxPickerOpen, setAuxPickerOpen] = useState(false)
 
@@ -256,10 +253,17 @@ export function AutoAnnotationCard({
     if (liveTimer.current) clearTimeout(liveTimer.current)
   }, [])
 
-  const mainModel = availableModels.find((m) => m.id === mainModelId)!
-  const auxModels = auxModelIds.map((id) => availableModels.find((m) => m.id === id)!).filter(Boolean)
-  const selectedModels = [mainModel, ...auxModels]
-  const auxCandidates = availableModels.filter((m) => m.id !== mainModelId && !auxModelIds.includes(m.id))
+  useEffect(() => {
+    const ids = new Set(models.map((model) => model.id))
+    if (!mainModelId || !ids.has(mainModelId)) setMainModelId(models[0]?.id ?? "")
+    setAuxModelIds((current) => current.filter((id) => ids.has(id) && id !== mainModelId))
+  }, [mainModelId, models])
+
+  const mainModel = models.find((m) => m.id === mainModelId) ?? null
+  const auxModels = auxModelIds.map((id) => models.find((m) => m.id === id)).filter((m): m is ModelInfo => Boolean(m))
+  const selectedModels = mainModel ? [mainModel, ...auxModels] : []
+  const auxCandidates = models.filter((m) => m.id !== mainModelId && !auxModelIds.includes(m.id))
+  const hasModels = models.length > 0 && mainModel !== null
 
   const applyModes: { id: ApplyMode; label: string }[] = [
     { id: "sugestoes", label: "Criar como sugestões" },
@@ -288,45 +292,33 @@ export function AutoAnnotationCard({
   const rangeCount = rangeError ? 0 : endNum - startNum + 1
 
   const startRun = (replaceModels: string[]) => {
+    if (!hasModels) return
     setConflictPrompt(null)
-    const total = rangeCount
-    setRun({ phase: "running", processed: 0, total, detections: 0 })
-
-    let processed = 0
-    let detections = 0
-    runTimer.current = setInterval(() => {
-      processed += 1
-      detections += 2 + Math.floor(Math.random() * 4)
-      if (processed >= total) {
-        if (runTimer.current) clearInterval(runTimer.current)
-        runTimer.current = null
-        const summary = onGenerate({
-          models: selectedModels,
-          threshold,
-          nmsIou,
-          classes: selectedClasses,
-          scope: `intervalo ${startNum}–${endNum}`,
-          applyMode,
-          replaceModels,
-          frameStart: startNum - 1,
-          frameEnd: endNum - 1,
-        })
-        Promise.resolve(summary)
-          .then((result) => setRun({ phase: "done", ...result }))
-          .catch((err) =>
-            setRun({
-              phase: "failed",
-              message: err instanceof Error ? err.message : "Falha ao enfileirar inferencia.",
-            }),
-          )
-      } else {
-        setRun({ phase: "running", processed, total, detections })
-      }
-    }, Math.max(40, Math.min(400, 4000 / total)))
+    setRun({ phase: "running", processed: 0, total: rangeCount, detections: 0 })
+    Promise.resolve(
+      onGenerate({
+        models: selectedModels,
+        threshold,
+        nmsIou,
+        classes: selectedClasses,
+        scope: `intervalo ${startNum}-${endNum}`,
+        applyMode,
+        replaceModels,
+        frameStart: startNum - 1,
+        frameEnd: endNum - 1,
+      }),
+    )
+      .then((result) => setRun({ phase: "done", ...result }))
+      .catch((err) =>
+        setRun({
+          phase: "failed",
+          message: err instanceof Error ? err.message : "Falha ao enfileirar inferencia.",
+        }),
+      )
   }
 
   const handleGenerate = () => {
-    if (run.phase === "running" || rangeError) return
+    if (run.phase === "running" || rangeError || !hasModels) return
     // Se o modo não é "substituir" e já existem sugestões de algum modelo selecionado, perguntar.
     const conflicting = selectedModels.map((m) => m.id).filter((id) => suggestionModelIds.includes(id))
     if (applyMode !== "substituir" && conflicting.length > 0) {
@@ -344,6 +336,7 @@ export function AutoAnnotationCard({
 
   // ---- Modo contínuo: anota junto com o usuário ----
   const runLiveForCurrentImage = () => {
+    if (!hasModels) return
     setLiveAnnotating(true)
     if (liveTimer.current) clearTimeout(liveTimer.current)
     liveTimer.current = setTimeout(() => {
@@ -395,24 +388,32 @@ export function AutoAnnotationCard({
         {/* Modelos */}
         <CollapsibleSection title="Modelos">
           <div className="flex flex-col gap-2">
-            <label className="flex flex-col gap-1.5">
-              <span className="text-xs text-muted-foreground">Modelo principal</span>
-              <select
-                value={mainModelId}
-                onChange={(e) => {
-                  setMainModelId(e.target.value)
-                  setAuxModelIds((ids) => ids.filter((id) => id !== e.target.value))
-                }}
-                className="h-9 rounded-lg bg-muted px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring/50"
-              >
-                {availableModels.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name} {m.version} — {m.task}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <ModelRow model={mainModel} />
+            {hasModels ? (
+              <>
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-xs text-muted-foreground">Modelo principal</span>
+                  <select
+                    value={mainModelId}
+                    onChange={(e) => {
+                      setMainModelId(e.target.value)
+                      setAuxModelIds((ids) => ids.filter((id) => id !== e.target.value))
+                    }}
+                    className="h-9 rounded-lg bg-muted px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring/50"
+                  >
+                    {models.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.name} {m.version} - {m.task}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <ModelRow model={mainModel} />
+              </>
+            ) : (
+              <p className="rounded-lg bg-muted px-3 py-2 text-sm text-muted-foreground">
+                Nenhum modelo registrado para autoanotação.
+              </p>
+            )}
 
             {auxModels.map((m) => (
               <ModelRow
@@ -439,7 +440,7 @@ export function AutoAnnotationCard({
                 </option>
                 {auxCandidates.map((m) => (
                   <option key={m.id} value={m.id}>
-                    {m.name} {m.version} — {m.task}
+                    {m.name} {m.version} - {m.task}
                   </option>
                 ))}
               </select>
@@ -562,14 +563,14 @@ export function AutoAnnotationCard({
           <div className="flex flex-col gap-2 rounded-lg bg-surface-subtle p-3">
             <p className="flex items-center gap-2 text-sm font-medium text-foreground">
               <Loader2 className="size-4 animate-spin text-brand-blue" />
-              Gerando predições...
+              Enfileirando inferência...
             </p>
-            <ProgressBar value={(run.processed / run.total) * 100} />
+            <ProgressBar value={run.total > 0 ? (run.processed / run.total) * 100 : 0} />
             <div className="flex flex-col gap-0.5 text-xs tabular-nums text-muted-foreground">
               <span>
-                Processadas: {run.processed} / {run.total} {run.total === 1 ? "imagem" : "imagens"}
+                Intervalo: {rangeCount.toLocaleString("pt-BR")} {rangeCount === 1 ? "imagem" : "imagens"}
               </span>
-              <span>Detecções encontradas: {run.detections}</span>
+              <span>O progresso detalhado aparece na central de jobs.</span>
             </div>
             <Button size="sm" variant="outline" onClick={cancelRun} className="self-start">
               Cancelar
@@ -581,12 +582,10 @@ export function AutoAnnotationCard({
           <div className="flex flex-col gap-2 rounded-lg bg-surface-subtle p-3">
             <p className="flex items-center gap-2 text-sm font-medium text-brand-green">
               <CheckCircle2 className="size-4" />
-              Execução concluída
+              Job enfileirado
             </p>
             <ul className="flex flex-col gap-0.5 text-xs text-muted-foreground">
-              <li>{run.created} sugestões criadas</li>
-              <li>{run.ignored} abaixo do threshold ignoradas</li>
-              <li>{run.conflicts} conflitos detectados</li>
+              <li>As sugestões aparecerão quando o backend concluir a inferência.</li>
               {run.jobId && <li>Job backend: {run.jobId}</li>}
             </ul>
             <Button size="sm" variant="outline" className="self-start">
@@ -709,7 +708,7 @@ export function AutoAnnotationCard({
                 </div>
               )}
 
-              <Button onClick={toggleLive} variant={liveActive ? "outline" : "default"}>
+              <Button onClick={toggleLive} variant={liveActive ? "outline" : "default"} disabled={!hasModels}>
                 <Sparkles className="size-4" />
                 {liveActive ? "Pausar autoanotação" : "Ativar autoanotação"}
               </Button>
@@ -753,7 +752,7 @@ export function AutoAnnotationCard({
                   {totalImages.toLocaleString("pt-BR")} serão processadas.
                 </p>
               )}
-              <Button onClick={handleGenerate} disabled={run.phase === "running" || !!rangeError}>
+              <Button onClick={handleGenerate} disabled={run.phase === "running" || !!rangeError || !hasModels}>
                 <Sparkles className="size-4" />
                 Gerar anotações
               </Button>

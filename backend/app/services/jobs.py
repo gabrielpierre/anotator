@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -65,6 +66,7 @@ def mark_job_running(db: Session, job_id: str, detail: str | None = None) -> Job
     job.progress = max(job.progress, 1)
     job.detail = detail or job.detail
     job.started_at = job.started_at or utcnow()
+    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -87,6 +89,7 @@ def update_job_progress(
     job.detail = detail or job.detail
     if metrics:
         job.resource_metrics = {**(job.resource_metrics or {}), **metrics}
+    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -109,6 +112,7 @@ def succeed_job(
     job.finished_at = utcnow()
     if raw_update:
         job.raw = {**(job.raw or {}), **raw_update}
+    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
     db.add(job)
     db.add(
         AuditEvent(
@@ -138,6 +142,7 @@ def fail_job(
     job.finished_at = utcnow()
     if raw_update:
         job.raw = {**(job.raw or {}), **raw_update}
+    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
     db.add(job)
     db.add(
         AuditEvent(
@@ -171,6 +176,7 @@ def cancel_job(
     job.status = "canceled"
     job.detail = reason
     job.finished_at = utcnow()
+    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
     db.add(job)
     _cancel_linked_resource(db, job)
     db.add(
@@ -239,3 +245,30 @@ def _cancel_linked_resource(db: Session, job: JobRecord) -> None:
                     release.status = "canceled"
                     release.snapshot = {**(release.snapshot or {}), "error": "Pipeline job canceled"}
                     db.add(release)
+
+
+def _with_resource_snapshot(metrics: dict[str, Any]) -> dict[str, Any]:
+    snapshots = metrics.get("snapshots") if isinstance(metrics.get("snapshots"), list) else []
+    snapshot = {
+        "timestamp": utcnow().isoformat(),
+        "cpu_count": os.cpu_count() or 1,
+        "memory": _memory_snapshot(),
+        "gpu": {"available": False, "provider": None},
+    }
+    return {**metrics, "snapshots": [*snapshots[-99:], snapshot], "latest": snapshot}
+
+
+def _memory_snapshot() -> dict[str, int]:
+    try:
+        values: dict[str, int] = {}
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, value = line.partition(":")
+                amount = value.strip().split(" ")[0]
+                if key == "MemTotal":
+                    values["total_bytes"] = int(amount) * 1024
+                if key == "MemAvailable":
+                    values["available_bytes"] = int(amount) * 1024
+        return values
+    except OSError:
+        return {}

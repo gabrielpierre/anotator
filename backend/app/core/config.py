@@ -26,12 +26,16 @@ class Settings(BaseSettings):
     cvat_request_poll_interval_seconds: float = Field(default=1.0, alias="CVAT_REQUEST_POLL_INTERVAL_SECONDS")
 
     cors_origins_raw: str = Field(default="http://localhost:3000", alias="CORS_ORIGINS")
-    auto_create_tables: bool = Field(default=True, alias="AUTO_CREATE_TABLES")
+    auto_create_tables: bool = Field(default=False, alias="AUTO_CREATE_TABLES")
     internal_api_key: str | None = Field(default=None, alias="INTERNAL_API_KEY")
     auth_exempt_paths_raw: str = Field(
-        default="/api/v1/health,/docs,/redoc,/openapi.json",
+        default="/api/v1/health,/api/v1/auth/login,/docs,/redoc,/openapi.json",
         alias="AUTH_EXEMPT_PATHS",
     )
+    session_ttl_hours: int = Field(default=168, alias="SESSION_TTL_HOURS")
+    default_admin_email: str = Field(default="admin@cvat.plus", alias="DEFAULT_ADMIN_EMAIL")
+    default_admin_password: str = Field(default="admin123", alias="DEFAULT_ADMIN_PASSWORD")
+    default_admin_name: str = Field(default="Administrador", alias="DEFAULT_ADMIN_NAME")
 
     @property
     def cors_origins(self) -> list[str]:

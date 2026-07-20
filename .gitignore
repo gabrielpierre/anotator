@@ -5,15 +5,21 @@ __v0_jsx-dev-runtime.ts
 .snowflake/
 .v0-trash/
 .vercel/
+.local/
 
 # Environment variables
 .env*.local
 
 # Common ignores
 node_modules
+.pnpm-store/
 .next/
+.venv/
+backend/.venv/
 tsconfig.tsbuildinfo
 .DS_Store
 __pycache__/
 *.py[cod]
+.pytest_cache/
+backend/.pytest_cache/
 backend/anotator.db

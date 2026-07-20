@@ -1,14 +1,14 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Float, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def uuid_str() -> str:
@@ -22,6 +22,31 @@ class TimestampMixin:
     )
 
 
+class User(Base, TimestampMixin):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    name: Mapped[str] = mapped_column(String(255))
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    role: Mapped[str] = mapped_column(String(32), default="anotador", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    password_hash: Mapped[str] = mapped_column(Text)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class UserSession(Base, TimestampMixin):
+    __tablename__ = "user_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class Project(Base, TimestampMixin):
     __tablename__ = "projects"
 
@@ -29,6 +54,17 @@ class Project(Base, TimestampMixin):
     external_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
     status: Mapped[str] = mapped_column(String(64), default="active")
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class ProjectMember(Base, TimestampMixin):
+    __tablename__ = "project_members"
+    __table_args__ = (UniqueConstraint("project_id", "user_id", name="uq_project_members_project_user"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    user_id: Mapped[str] = mapped_column(String(36), index=True)
+    role: Mapped[str] = mapped_column(String(32), default="anotador", index=True)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
@@ -285,6 +321,20 @@ class DerivedAsset(Base, TimestampMixin):
     human_corrections: Mapped[dict] = mapped_column(JSON, default=dict)
     lineage: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(32), default="ready", index=True)
+
+
+class ArtifactRecord(Base, TimestampMixin):
+    __tablename__ = "artifact_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    uri: Mapped[str] = mapped_column(Text, unique=True)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    kind: Mapped[str] = mapped_column(String(64), default="artifact", index=True)
+    content_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    owner_type: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    owner_id: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
 class AuditEvent(Base, TimestampMixin):

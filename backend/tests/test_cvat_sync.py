@@ -2,7 +2,15 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.core.database import Base
-from app.models import AnnotationRecord, CvatLabel, JobRecord, Project, Task, TaskDataMeta, TaskPreview
+from app.models import (
+    AnnotationRecord,
+    CvatLabel,
+    JobRecord,
+    Project,
+    Task,
+    TaskDataMeta,
+    TaskPreview,
+)
 from app.services.sync import CvatSyncService
 
 

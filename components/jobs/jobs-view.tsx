@@ -7,19 +7,19 @@ import { ProgressBar, Meter, StatusBadge } from "@/components/app/primitives"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/snowui/card"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { Button } from "@/components/ui/button"
-import { activeJobs, machineResources, queuedJobs, recentJobs } from "@/lib/mock-data"
-import { cancelJob, fetchJobs, jobsEventsUrl, mockFallbackEnabled } from "@/lib/api/client"
+import { cancelJob, fetchJobCapacity, fetchJobs, jobsEventsUrl } from "@/lib/api/client"
 import { formatDateTimePt, toUiJobStatus } from "@/lib/api/status"
-import type { BackendJob } from "@/lib/api/types"
+import type { BackendJob, BackendJobCapacity } from "@/lib/api/types"
 
 export function JobsView() {
   const [backendJobs, setBackendJobs] = React.useState<BackendJob[] | null>(null)
+  const [capacity, setCapacity] = React.useState<BackendJobCapacity | null>(null)
   const [cancelingIds, setCancelingIds] = React.useState<Set<string>>(new Set())
-  const useMocks = mockFallbackEnabled()
 
   React.useEffect(() => {
     const controller = new AbortController()
     fetchJobs(controller.signal).then(setBackendJobs).catch(() => setBackendJobs(null))
+    fetchJobCapacity(controller.signal).then(setCapacity).catch(() => setCapacity(null))
     return () => controller.abort()
   }, [])
 
@@ -54,32 +54,24 @@ export function JobsView() {
     }
   }
 
-  const mappedJobs = backendJobs?.map(mapBackendJob)
+  const mappedJobs = backendJobs?.map(mapBackendJob) ?? []
   const activeItems = mappedJobs
-    ? mappedJobs.filter((job) => job.status === "executando" || job.status === "pausado")
-    : useMocks
-      ? activeJobs
-      : []
+    .filter((job) => job.status === "executando" || job.status === "pausado")
   const queuedItems = mappedJobs
-    ? mappedJobs
-        .filter((job) => job.status === "na-fila")
-        .map((job, index) => ({
-          id: job.id,
-          name: job.name,
-          type: job.type,
-          detail: job.detail,
-          position: `Posicao: ${index + 1}`,
-        }))
-    : useMocks
-      ? queuedJobs
-      : []
+    .filter((job) => job.status === "na-fila")
+    .map((job, index) => ({
+      id: job.id,
+      name: job.name,
+      type: job.type,
+      detail: job.detail,
+      position: `Posicao: ${index + 1}`,
+    }))
   const recentItems = mappedJobs
-    ? mappedJobs.filter((job) => ["concluido", "falhou", "cancelado"].includes(job.status))
-    : useMocks
-      ? recentJobs.map((job) => ({ ...job, progress: job.status === "falhou" ? 0 : 100 }))
-      : []
+    .filter((job) => ["concluido", "falhou", "cancelado"].includes(job.status))
   const runningCount = activeItems.filter((job) => job.status === "executando").length
   const queuedCount = queuedItems.length
+  const memory = memoryUsage(capacity)
+  const gpu = gpuSummary(capacity?.gpu)
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -94,7 +86,7 @@ export function JobsView() {
         <MetricCard label="Em execucao" value={String(runningCount)} hint="Backend + CVAT" tone="blue" />
         <MetricCard label="Na fila" value={String(queuedCount)} hint="Aguardando worker" tone="purple" />
         <MetricCard label="Finalizados" value={String(recentItems.length)} hint="Historico local" tone="mint" />
-        <MetricCard label="Uso de GPU" value="75%" hint="2x RTX 4090" tone="blue" />
+        <MetricCard label="GPU" value={gpu.value} hint={gpu.hint} tone="blue" />
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
@@ -204,28 +196,26 @@ export function JobsView() {
               <CardTitle>Recursos da maquina</CardTitle>
             </CardHeader>
             <CardContent className="flex flex-col gap-4">
-              {machineResources.gpus.map((gpu, i) => (
-                <div key={gpu.name} className="flex flex-col gap-2">
-                  <span className="flex items-center gap-2 text-xs font-medium text-foreground">
-                    <Cpu className="size-3.5 text-brand-blue" />
-                    GPU {i}
-                  </span>
-                  <Meter label="Utilizacao" value={gpu.util} color="bg-brand-blue" />
-                  <div className="flex items-center justify-between text-xs text-muted-foreground">
-                    <span>Memoria</span>
-                    <span className="tabular-nums text-foreground">{gpu.mem}</span>
-                  </div>
+              <div className="flex flex-col gap-2">
+                <span className="flex items-center gap-2 text-xs font-medium text-foreground">
+                  <Cpu className="size-3.5 text-brand-blue" />
+                  GPU
+                </span>
+                <Meter label="Utilizacao" value={gpu.utilization} color="bg-brand-blue" />
+                <div className="flex items-center justify-between text-xs text-muted-foreground">
+                  <span>Status</span>
+                  <span className="tabular-nums text-foreground">{gpu.hint}</span>
                 </div>
-              ))}
+              </div>
               <div className="flex flex-col gap-2 border-t border-border pt-3">
                 <span className="flex items-center gap-2 text-xs font-medium text-foreground">
                   <MemoryStick className="size-3.5 text-brand-lavender" />
                   CPU / RAM
                 </span>
-                <Meter label="CPU" value={machineResources.cpu.util} color="bg-brand-lavender" />
+                <Meter label="CPU" value={0} detail={`${capacity?.cpu_count ?? "--"} cores detectados`} color="bg-brand-lavender" />
                 <div className="flex items-center justify-between text-xs text-muted-foreground">
                   <span>RAM</span>
-                  <span className="tabular-nums text-foreground">{machineResources.cpu.mem}</span>
+                  <span className="tabular-nums text-foreground">{memory.label}</span>
                 </div>
               </div>
               <div className="flex flex-col gap-2 border-t border-border pt-3">
@@ -233,12 +223,7 @@ export function JobsView() {
                   <HardDrive className="size-3.5 text-brand-indigo" />
                   Disco
                 </span>
-                <Meter
-                  label="Uso"
-                  value={machineResources.disk.util}
-                  detail={machineResources.disk.label}
-                  color="bg-brand-indigo"
-                />
+                <Meter label="Uso" value={0} detail="Não reportado pelo backend" color="bg-brand-indigo" />
               </div>
             </CardContent>
           </Card>
@@ -270,4 +255,41 @@ function mapBackendJob(job: BackendJob) {
     eta: "--",
     gpu: Number(job.resource_metrics.gpu ?? 0),
   }
+}
+
+function memoryUsage(capacity: BackendJobCapacity | null) {
+  const total = capacity?.memory_total_bytes ?? null
+  const available = capacity?.memory_available_bytes ?? null
+  if (!total || available === null) return { value: 0, label: "--" }
+  const used = Math.max(0, total - available)
+  return {
+    value: Math.round((used / total) * 100),
+    label: `${formatBytes(used)} / ${formatBytes(total)}`,
+  }
+}
+
+function gpuSummary(gpu: Record<string, unknown> | undefined) {
+  const available = gpu?.available === true
+  const utilization = numberFromUnknown(gpu?.utilization_percent) ?? 0
+  return {
+    value: available ? `${utilization}%` : "--",
+    hint: available ? "reportada pelo backend" : "indisponível",
+    utilization,
+  }
+}
+
+function formatBytes(bytes: number) {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${bytes} B`
+}
+
+function numberFromUnknown(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
 }

@@ -6,7 +6,15 @@ from sqlalchemy.orm import sessionmaker
 from app.api.v1.training import create_training_run
 from app.core.config import Settings
 from app.core.database import Base
-from app.models import AnnotationRecord, AuditEvent, CvatLabel, DatasetRelease, JobRecord, Task, TrainingRun
+from app.models import (
+    AnnotationRecord,
+    AuditEvent,
+    CvatLabel,
+    DatasetRelease,
+    JobRecord,
+    Task,
+    TrainingRun,
+)
 from app.schemas import DatasetReleaseCreate, TrainingRunCreate
 from app.services.artifacts import ArtifactStore
 from app.services.cvat_client import CvatBinaryResponse

@@ -23,22 +23,21 @@ import {
 } from "lucide-react"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
-import { classes } from "@/lib/mock-data"
 import {
   apiAssetUrl,
   createInferenceRun,
   deleteInferenceSuggestions,
+  fetchModelVersions,
   fetchInferenceSuggestions,
   fetchTasks,
   jobsEventsUrl,
-  mockFallbackEnabled,
 } from "@/lib/api/client"
 import { labelsFromTasks } from "@/lib/api/status"
-import type { BackendInferenceSuggestion, BackendTask } from "@/lib/api/types"
+import { useCurrentUser } from "@/lib/auth/user-context"
+import type { BackendInferenceSuggestion, BackendModelVersion, BackendTask } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 import {
   AutoAnnotationCard,
-  availableModels,
   type ModelInfo,
   type PredictionLayer,
   type Suggestion,
@@ -57,7 +56,7 @@ const tools: { icon: typeof MousePointer2; label: string; tool: ToolKey; key: st
 
 type ClassItem = { name: string; color: string; parent?: string }
 
-const initialClassList: ClassItem[] = classes.slice(0, 9).map((c) => ({ name: c.name, color: c.color }))
+const initialClassList: ClassItem[] = []
 
 const newClassPalette = [
   "oklch(0.65 0.18 25)",
@@ -72,12 +71,7 @@ type Shape =
   | { id: number; type: "polygon"; cls: string; points: { x: number; y: number }[] }
   | { id: number; type: "point"; cls: string; x: number; y: number }
 
-const initialShapes: Shape[] = [
-  { id: 88213, type: "box", cls: "car", conf: 0.93, x: 0.14, y: 0.52, w: 0.2, h: 0.22 },
-  { id: 88214, type: "box", cls: "car", conf: 0.91, x: 0.33, y: 0.52, w: 0.15, h: 0.18 },
-  { id: 88215, type: "box", cls: "bus", conf: 0.88, x: 0.4, y: 0.34, w: 0.16, h: 0.3 },
-  { id: 88216, type: "box", cls: "truck", conf: 0.87, x: 0.56, y: 0.36, w: 0.14, h: 0.26 },
-]
+const initialShapes: Shape[] = []
 
 const clamp = (v: number, min = 0, max = 1) => Math.min(max, Math.max(min, v))
 const MIN_SCALE = 0.4
@@ -100,13 +94,17 @@ const handles: { id: Handle; cls: string; cursor: string }[] = [
 const POLY_CLOSE_DIST = 0.02
 
 export function AnnotateView() {
-  const useMocks = mockFallbackEnabled()
   const [tasks, setTasks] = useState<BackendTask[] | null>(null)
+  const [modelVersions, setModelVersions] = useState<BackendModelVersion[]>([])
+  const { currentUser } = useCurrentUser()
   const currentTask = tasks?.[0] ?? null
-  const totalImages = Math.max(1, currentTask?.size ?? (useMocks ? 1250 : 1))
-  const previewSrc = apiAssetUrl(currentTask?.preview_url) ?? (useMocks ? "/street-scene.png" : "/placeholder.svg")
+  const annotationModels = modelVersions
+    .filter((model) => model.status !== "archived")
+    .map(modelInfoFromBackend)
+  const totalImages = Math.max(1, currentTask?.size ?? 1)
+  const previewSrc = apiAssetUrl(currentTask?.preview_url) ?? "/placeholder.svg"
   const [tool, setTool] = useState<ToolKey>("box")
-  const [classList, setClassList] = useState<ClassItem[]>(() => (useMocks ? initialClassList : []))
+  const [classList, setClassList] = useState<ClassItem[]>(() => initialClassList)
   // Nenhuma classe ativa por padrão: o usuário desenha primeiro e escolhe a classe depois.
   const [activeClass, setActiveClass] = useState<string | null>(null)
   const colorFor = useCallback(
@@ -134,8 +132,8 @@ export function AnnotateView() {
   // Adição de classe/subclasse
   const [addingClass, setAddingClass] = useState<{ parent: string | null } | null>(null)
   const [newClassName, setNewClassName] = useState("")
-  const [shapes, setShapes] = useState<Shape[]>(() => (useMocks ? initialShapes : []))
-  const [selectedId, setSelectedId] = useState<number | null>(useMocks ? 88213 : null)
+  const [shapes, setShapes] = useState<Shape[]>(() => initialShapes)
+  const [selectedId, setSelectedId] = useState<number | null>(null)
   const selectedIdRef = useRef(selectedId)
   selectedIdRef.current = selectedId
   const [view, setView] = useState({ s: 1, tx: 0, ty: 0 })
@@ -148,11 +146,12 @@ export function AnnotateView() {
   const [saved, setSaved] = useState(false)
 
   // ---- Navegação de imagens ----
-  const [imageIndex, setImageIndex] = useState(useMocks ? 342 : 0)
+  const [imageIndex, setImageIndex] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
     fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
+    fetchModelVersions(controller.signal).then(setModelVersions).catch(() => setModelVersions([]))
     return () => controller.abort()
   }, [])
 
@@ -179,7 +178,7 @@ export function AnnotateView() {
   const layerUnit = (m: ModelInfo) =>
     m.task === "Segmentação" ? "máscaras" : m.task === "Classificação" ? "labels" : "sugestões"
 
-  const predictionLayers: PredictionLayer[] = availableModels
+  const predictionLayers: PredictionLayer[] = annotationModels
     .map((m) => ({
       modelId: m.id,
       label: `${m.name} ${m.version}`,
@@ -255,7 +254,7 @@ export function AnnotateView() {
           classes: params.classes,
           apply_mode: params.replaceModels.includes(model.id) || params.applyMode === "substituir" ? "replace" : "append",
           confirm_replace: params.replaceModels.includes(model.id) || params.applyMode === "substituir",
-          user_id: "local-user",
+          user_id: currentUser.email || currentUser.id,
           write_to_cvat: params.applyMode === "aceitas",
         }),
       ),
@@ -271,7 +270,7 @@ export function AnnotateView() {
   }
 
   const modelLabelFor = (modelId: string, version: string) => {
-    const m = availableModels.find((x) => x.id === modelId)
+    const m = annotationModels.find((x) => x.id === modelId)
     return m ? `${m.name} ${version}` : modelId
   }
 
@@ -1389,6 +1388,7 @@ export function AnnotateView() {
         </Card>
 
         <AutoAnnotationCard
+          models={annotationModels}
           classNames={classList.map((c) => c.name)}
           imageIndex={imageIndex}
           totalImages={totalImages}
@@ -1426,16 +1426,41 @@ export function AnnotateView() {
 }
 
 function modelFamilyFor(model: ModelInfo): "detection" | "segmentation" | "classification" | "tracking" {
-  if (model.task.includes("Segment")) return "segmentation"
-  if (model.task.includes("Class")) return "classification"
-  return "detection"
+  return model.family
 }
 
 function baseModelFor(model: ModelInfo) {
-  if (model.id === "yolo11m") return "yolo11m.pt"
-  if (model.id === "yoloseg") return "yolo11n-seg.pt"
-  if (model.id === "resnet50") return "resnet50.pt"
-  return "yolo11n.pt"
+  return model.baseModel
+}
+
+function modelInfoFromBackend(model: BackendModelVersion): ModelInfo {
+  return {
+    id: model.id,
+    name: model.name,
+    version: model.version,
+    task: modelTaskLabel(model.family),
+    status: modelStatusLabel(model.status),
+    family: modelFamilyValue(model.family),
+    baseModel: model.base_model,
+  }
+}
+
+function modelTaskLabel(family: string): ModelInfo["task"] {
+  if (family === "segmentation") return "Segmentação"
+  if (family === "classification") return "Classificação"
+  if (family === "tracking") return "Detecção"
+  return "Detecção"
+}
+
+function modelStatusLabel(status: string): ModelInfo["status"] {
+  if (status === "archived") return "Indisponível"
+  if (["training", "building", "importing"].includes(status)) return "Carregando"
+  return "Disponível"
+}
+
+function modelFamilyValue(family: string): ModelInfo["family"] {
+  if (family === "segmentation" || family === "classification" || family === "tracking") return family
+  return "detection"
 }
 
 function mapBackendSuggestion(suggestion: BackendInferenceSuggestion): Suggestion {

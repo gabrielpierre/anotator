@@ -1,7 +1,8 @@
-import type { JobStatus } from "@/lib/mock-data"
 import type { BackendJobStatus, BackendTask } from "@/lib/api/types"
 
-export function toUiJobStatus(status: BackendJobStatus): JobStatus {
+export type UiJobStatus = "executando" | "na-fila" | "pausado" | "concluido" | "falhou" | "cancelado"
+
+export function toUiJobStatus(status: BackendJobStatus): UiJobStatus {
   switch (status) {
     case "running":
       return "executando"

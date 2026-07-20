@@ -202,6 +202,7 @@ function PasswordCard() {
   const [show, setShow] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [saved, setSaved] = React.useState(false)
+  const [saving, setSaving] = React.useState(false)
 
   function reset() {
     setCurrent("")
@@ -209,21 +210,26 @@ function PasswordCard() {
     setConfirm("")
   }
 
-  function handleSubmit(event: React.FormEvent) {
+  async function handleSubmit(event: React.FormEvent) {
     event.preventDefault()
     setError(null)
     if (next !== confirm) {
       setError("A confirmação não corresponde à nova senha.")
       return
     }
-    const result = changePassword(current, next)
-    if (!result.ok) {
-      setError(result.error)
-      return
+    setSaving(true)
+    try {
+      const result = await changePassword(current, next)
+      if (!result.ok) {
+        setError(result.error)
+        return
+      }
+      reset()
+      setSaved(true)
+      window.setTimeout(() => setSaved(false), 2500)
+    } finally {
+      setSaving(false)
     }
-    reset()
-    setSaved(true)
-    window.setTimeout(() => setSaved(false), 2500)
   }
 
   const canSubmit = current.length > 0 && next.length > 0 && confirm.length > 0
@@ -285,8 +291,8 @@ function PasswordCard() {
         {error && <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
 
         <div className="flex justify-end">
-          <Button type="submit" disabled={!canSubmit}>
-            Atualizar senha
+          <Button type="submit" disabled={!canSubmit || saving}>
+            {saving ? "Atualizando..." : "Atualizar senha"}
           </Button>
         </div>
       </form>

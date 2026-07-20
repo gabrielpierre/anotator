@@ -37,7 +37,7 @@ Marcos 1, 2, 3, 4, 5, 6, 7 e 8 implementados no repositorio:
 - `DerivedAsset` com linhagem de imagem/anotação/track, padding, classe, score, modelo, split e correções humanas.
 - Materialização de dataset derivado de classificação com manifesto JSON, previews SVG, split estável por track e `DatasetRelease` próprio.
 - Endpoints de pipeline definitions, pipeline runs e derived assets, com a tela Dados podendo enfileirar o pipeline derivado e listar crops recentes.
-- Fallback operacional de mocks desligado por padrao via `NEXT_PUBLIC_ENABLE_MOCK_FALLBACK=false`; fixtures ficam disponiveis apenas para demo explicita.
+- Fallback operacional de mocks removido do frontend; estados vazios e erros de API substituem qualquer fixture visual.
 - Autenticacao interna opcional por `INTERNAL_API_KEY`, com suporte a header, bearer token e query param para SSE/imagens.
 - Guia operacional em `docs/setup-operacional-local.md`, cobrindo setup, variaveis, troubleshooting, backup local e limites conhecidos.
 - Criacao de projeto local com pasta planejada e quota de storage por projeto, persistida em `Project.raw.storage`.
@@ -48,7 +48,7 @@ Crop pixel-real a partir dos frames originais permanece como limite conhecido de
 
 - O CVAT permanece como fonte operacional para projetos, tasks, jobs, midia, labels, shapes, tracks, revisao e QA.
 - O backend proprio passa a orquestrar sincronizacao, decisoes de revisao, auditoria, releases, jobs, training runs e pipeline runs.
-- O frontend Next.js deixa de depender operacionalmente de `lib/mock-data.ts` e passa a consumir `NEXT_PUBLIC_API_BASE_URL`; fixtures so aparecem quando `NEXT_PUBLIC_ENABLE_MOCK_FALLBACK=true`.
+- O frontend Next.js passa a consumir `NEXT_PUBLIC_API_BASE_URL`; nao ha fallback de fixtures para mascarar falta de dados reais.
 - O ambiente local alvo usa Docker Desktop/WSL com CVAT local separado e stack propria em `infra/docker-compose.dev.yml`.
 
 ## Arquitetura

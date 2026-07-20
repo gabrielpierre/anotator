@@ -5,27 +5,28 @@ services:
     image: node:22-bookworm
     working_dir: /app
     command: >
-      sh -lc "corepack prepare pnpm@9.15.3 --activate &&
+      sh -lc "corepack enable &&
+      corepack prepare pnpm@9.15.3 --activate &&
       pnpm install --frozen-lockfile &&
       pnpm dev --hostname 0.0.0.0"
     environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+      NEXT_PUBLIC_API_BASE_URL: http://localhost:8020/api/v1
       NEXT_PUBLIC_INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
-      NEXT_PUBLIC_ENABLE_MOCK_FALLBACK: ${NEXT_PUBLIC_ENABLE_MOCK_FALLBACK:-false}
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:3000"
     volumes:
       - ..:/app
       - frontend_node_modules:/app/node_modules
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
   backend:
     build:
       context: ..
       dockerfile: backend/Dockerfile
     working_dir: /app/backend
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: sh -lc "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     environment:
       ENVIRONMENT: development
       DATABASE_URL: postgresql+psycopg://anotator:anotator@postgres:5432/anotator
@@ -33,17 +34,31 @@ services:
       CVAT_BASE_URL: http://host.docker.internal:8080
       CVAT_ACCESS_TOKEN: ${CVAT_ACCESS_TOKEN:-}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL:-admin@cvat.plus}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
+      DEFAULT_ADMIN_NAME: ${DEFAULT_ADMIN_NAME:-Administrador}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: anotator-artifacts
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
       CORS_ORIGINS: http://localhost:3000
-      AUTO_CREATE_TABLES: "true"
+      AUTO_CREATE_TABLES: "false"
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8020}:8000"
     volumes:
       - ../backend:/app/backend
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,7 +72,7 @@ services:
       context: ..
       dockerfile: backend/Dockerfile
     working_dir: /app/backend
-    command: celery -A app.core.celery_app.celery_app worker --loglevel=INFO
+    command: sh -lc "alembic upgrade head && celery -A app.core.celery_app.celery_app worker --loglevel=INFO"
     environment:
       ENVIRONMENT: development
       DATABASE_URL: postgresql+psycopg://anotator:anotator@postgres:5432/anotator
@@ -65,18 +80,23 @@ services:
       CVAT_BASE_URL: http://host.docker.internal:8080
       CVAT_ACCESS_TOKEN: ${CVAT_ACCESS_TOKEN:-}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL:-admin@cvat.plus}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
+      DEFAULT_ADMIN_NAME: ${DEFAULT_ADMIN_NAME:-Administrador}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: anotator-artifacts
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
-      AUTO_CREATE_TABLES: "true"
+      AUTO_CREATE_TABLES: "false"
     volumes:
       - ../backend:/app/backend
       - worker_artifacts:/artifacts
     depends_on:
-      - backend
-      - redis
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_started
 
   postgres:
     image: postgres:16-alpine
@@ -85,7 +105,7 @@ services:
       POSTGRES_USER: anotator
       POSTGRES_PASSWORD: anotator
     ports:
-      - "5433:5432"
+      - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -97,7 +117,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6380:6379"
+      - "${REDIS_PORT:-6380}:6379"
     volumes:
       - redis_data:/data
 
@@ -108,8 +128,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio_data:/data
 
@@ -119,7 +139,9 @@ services:
       - minio
     entrypoint: >
       /bin/sh -c "
-      /usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin;
+      until /usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin; do
+        sleep 2;
+      done;
       /usr/bin/mc mb --ignore-existing local/anotator-artifacts;
       exit 0;
       "
@@ -137,7 +159,7 @@ services:
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin
     ports:
-      - "5000:5000"
+      - "${MLFLOW_PORT:-5000}:5000"
     volumes:
       - mlflow_data:/mlflow
     depends_on:

@@ -1,5 +1,5 @@
 param(
-  [string]$BackendUrl = "http://localhost:8000/openapi.json",
+  [string]$BackendUrl = "http://localhost:8020/openapi.json",
   [string]$OutputJson = "backend\openapi.json",
   [string]$OutputTypes = "lib\api\openapi-types.ts"
 )

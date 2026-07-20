@@ -3,11 +3,10 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { Menu, Bell, HelpCircle, ChevronDown, Activity, Check, ShieldCheck, UserCog, LogOut } from "lucide-react"
+import { Menu, Bell, HelpCircle, ChevronDown, Activity, UserCog, LogOut } from "lucide-react"
 import { ThemeToggle } from "@/components/snowui/theme-toggle"
 import { Avatar } from "@/components/snowui/avatar"
-import { activeJobs } from "@/lib/mock-data"
-import { fetchJobs, mockFallbackEnabled } from "@/lib/api/client"
+import { fetchJobs } from "@/lib/api/client"
 import { useCurrentUser, roleLabels } from "@/lib/auth/user-context"
 import { cn } from "@/lib/utils"
 
@@ -20,9 +19,8 @@ export function AppTopbar({
   breadcrumb: Crumb[]
   onMenuClick?: () => void
 }) {
-  const useMocks = mockFallbackEnabled()
-  const [activeJobCount, setActiveJobCount] = React.useState(useMocks ? activeJobs.length : 0)
-  const { currentUser, users, switchUser, logout } = useCurrentUser()
+  const [activeJobCount, setActiveJobCount] = React.useState(0)
+  const { currentUser, logout } = useCurrentUser()
   const router = useRouter()
   const [menuOpen, setMenuOpen] = React.useState(false)
   const menuRef = React.useRef<HTMLDivElement>(null)
@@ -42,9 +40,9 @@ export function AppTopbar({
       .then((jobs) =>
         setActiveJobCount(jobs.filter((job) => job.status === "running" || job.status === "queued").length),
       )
-      .catch(() => setActiveJobCount(useMocks ? activeJobs.length : 0))
+      .catch(() => setActiveJobCount(0))
     return () => controller.abort()
-  }, [useMocks])
+  }, [])
 
   return (
     <header className="sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-border bg-background/80 px-4 backdrop-blur md:px-6">
@@ -112,9 +110,6 @@ export function AppTopbar({
           className="relative inline-flex size-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
         >
           <Bell className="size-4.5" />
-          <span className="absolute right-1.5 top-1.5 flex size-4 items-center justify-center rounded-full bg-destructive text-[10px] font-medium text-destructive-foreground">
-            2
-          </span>
         </button>
 
         <div className="relative ml-1" ref={menuRef}>
@@ -157,45 +152,13 @@ export function AppTopbar({
                   Meu perfil
                 </Link>
               </div>
-              <div className="p-1.5">
-                <p className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-muted-foreground">
-                  <ShieldCheck className="size-3.5" />
-                  Trocar de perfil
-                </p>
-                {users.map((user) => {
-                  const active = user.id === currentUser.id
-                  return (
-                    <button
-                      key={user.id}
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={active}
-                      onClick={() => {
-                        switchUser(user.id)
-                        setMenuOpen(false)
-                      }}
-                      className={cn(
-                        "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm transition-colors hover:bg-muted",
-                        active && "bg-muted",
-                      )}
-                    >
-                      <Avatar name={user.name} src={user.avatar} size="sm" />
-                      <span className="flex min-w-0 flex-1 flex-col leading-tight">
-                        <span className="truncate font-medium text-foreground">{user.name}</span>
-                        <span className="truncate text-xs text-muted-foreground">{roleLabels[user.role]}</span>
-                      </span>
-                      {active && <Check className="size-4 text-brand-blue" />}
-                    </button>
-                  )
-                })}
-              </div>
               <div className="border-t border-border p-1.5">
                 <button
                   type="button"
                   role="menuitem"
                   onClick={() => {
                     setMenuOpen(false)
-                    logout()
+                    void logout()
                     router.replace("/login")
                   }}
                   className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-destructive transition-colors hover:bg-destructive/10"

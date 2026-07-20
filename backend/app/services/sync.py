@@ -4,7 +4,16 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import AuditEvent, CvatLabel, JobRecord, Project, Task, TaskDataMeta, TaskPreview, utcnow
+from app.models import (
+    AuditEvent,
+    CvatLabel,
+    JobRecord,
+    Project,
+    Task,
+    TaskDataMeta,
+    TaskPreview,
+    utcnow,
+)
 from app.schemas import SyncError, SyncResult
 from app.services.annotations import sync_job_annotations
 from app.services.cvat_client import CvatClient

@@ -10,8 +10,8 @@ export default async function TrainingDetailPage({
   return (
     <AppShell
       breadcrumb={[
-        { label: "Projetos", href: "/" },
-        { label: "Veículos - Cityscapes", href: "/" },
+        { label: "Projetos", href: "/projetos" },
+        { label: "Projeto atual", href: "/" },
         { label: "Treinamentos", href: "/treinar" },
         { label: `Treinamento #${id}` },
       ]}

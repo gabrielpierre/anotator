@@ -39,3 +39,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+ignore = [
+  "B008",  # FastAPI uses Depends/File/Form/Query calls in function defaults.
+  "E501",  # The project keeps long FastAPI signatures and test fixtures readable.
+]

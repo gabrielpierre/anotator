@@ -9,17 +9,15 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/snowui/input"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { StatusBadge, ProgressBar } from "@/components/app/primitives"
-import { fetchDatasetReleases, fetchTrainingRuns, mockFallbackEnabled } from "@/lib/api/client"
-import { formatDateTimePt, toUiJobStatus } from "@/lib/api/status"
+import { fetchDatasetReleases, fetchTrainingRuns } from "@/lib/api/client"
+import { formatDateTimePt, toUiJobStatus, type UiJobStatus } from "@/lib/api/status"
 import type { BackendDatasetRelease, BackendTrainingRun } from "@/lib/api/types"
-import { trainings, releases as mockReleases, type JobStatus } from "@/lib/mock-data"
 import { cn } from "@/lib/utils"
 
 export function TrainingList() {
   const [pickerOpen, setPickerOpen] = React.useState(false)
   const [backendRuns, setBackendRuns] = React.useState<BackendTrainingRun[] | null>(null)
   const [backendReleases, setBackendReleases] = React.useState<BackendDatasetRelease[] | null>(null)
-  const useMocks = mockFallbackEnabled()
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -35,10 +33,7 @@ export function TrainingList() {
     return () => controller.abort()
   }, [])
 
-  const items = React.useMemo(
-    () => (backendRuns?.length ? backendRuns.map(toTrainingListItem) : useMocks ? trainings.map(toMockTrainingListItem) : []),
-    [backendRuns, useMocks],
-  )
+  const items = React.useMemo(() => (backendRuns?.length ? backendRuns.map(toTrainingListItem) : []), [backendRuns])
   const running = items.filter((item) => item.status === "executando" || item.status === "na-fila").length
   const completed = items.filter((item) => item.status === "concluido").length
   const bestMap = items.reduce((best, item) => Math.max(best, item.bestMapValue ?? 0), 0)
@@ -62,14 +57,13 @@ export function TrainingList() {
         open={pickerOpen}
         onClose={() => setPickerOpen(false)}
         backendReleases={backendReleases}
-        useMocks={useMocks}
       />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <MetricCard label="Em execução" value={String(running)} hint="fila local" />
         <MetricCard label="Concluídos" value={String(completed)} hint="histórico local" />
         <MetricCard label="Melhor mAP50-95" value={bestMap ? bestMap.toFixed(3) : "--"} hint="MLflow + banco" />
-        <MetricCard label="Tempo médio" value="1h 12m" hint="por treinamento" />
+        <MetricCard label="Tempo médio" value="--" hint="não reportado" />
       </div>
 
       <Card>
@@ -146,7 +140,7 @@ type TrainingListItem = {
   id: string
   href: string
   name: string
-  status: JobStatus
+  status: UiJobStatus
   model: string
   dataset: string
   startedAt: string
@@ -157,25 +151,6 @@ type TrainingListItem = {
   elapsed: string
   device: string
   progress: number
-}
-
-function toMockTrainingListItem(training: (typeof trainings)[number]): TrainingListItem {
-  return {
-    id: training.id,
-    href: `/treinar/${training.slug}`,
-    name: training.name,
-    status: training.status,
-    model: training.model,
-    dataset: training.dataset,
-    startedAt: training.startedAt,
-    epoch: String(training.epoch),
-    epochs: String(training.epochs),
-    bestMap: String(training.bestMap),
-    bestMapValue: metricNumber(training.bestMap),
-    elapsed: training.elapsed,
-    device: training.device,
-    progress: training.progress,
-  }
 }
 
 function toTrainingListItem(run: BackendTrainingRun): TrainingListItem {
@@ -265,32 +240,17 @@ function ReleasePicker({
   open,
   onClose,
   backendReleases,
-  useMocks,
 }: {
   open: boolean
   onClose: () => void
   backendReleases: BackendDatasetRelease[] | null
-  useMocks: boolean
 }) {
   const router = useRouter()
   const releaseOptions = React.useMemo(() => {
-    if (backendReleases) {
-      return backendReleases
-        .filter((release) => release.status === "ready" && release.immutable && release.artifact_uri)
-        .map(toReleaseOption)
-    }
-    return useMocks
-      ? mockReleases.map((release) => ({
-      id: release.id,
-      name: release.id,
-      status: release.status,
-      images: release.images,
-      objects: release.objects,
-      size: release.size,
-      date: release.date,
-        }))
-      : []
-  }, [backendReleases, useMocks])
+    return (backendReleases ?? [])
+      .filter((release) => release.status === "ready" && release.immutable && release.artifact_uri)
+      .map(toReleaseOption)
+  }, [backendReleases])
   const [selected, setSelected] = React.useState("")
 
   React.useEffect(() => {

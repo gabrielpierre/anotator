@@ -49,9 +49,14 @@ export function ProjectsView() {
     // O contexto é a fonte única — sincroniza a lista compartilhada com a aba Usuários.
     const record = projectRecordFromBackend(project, annotatorIds)
     if (mode === "edit") {
-      updateProject(project.id, { name: record.name, quotaGb: record.quotaGb, annotatorIds })
+      void updateProject(project.id, {
+        name: record.name,
+        storagePath: record.storagePath,
+        quotaGb: record.quotaGb,
+        annotatorIds,
+      })
     } else {
-      addProject({ ...record, annotatorIds })
+      void addProject({ ...record, annotatorIds })
     }
   }
 
@@ -60,7 +65,7 @@ export function ProjectsView() {
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <PageHeader
         title="Projetos"
-        subtitle="Gerencie os projetos de anotação, o storage reservado e crie novos datasets."
+        subtitle="Gerencie os projetos de anotação, o storage reservado e os acessos da equipe."
         actions={
           <Button size="lg" onClick={openCreate}>
             <Plus className="size-4" />
@@ -70,7 +75,7 @@ export function ProjectsView() {
       />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <MetricCard label="Projetos" value={String(items.length)} hint="datasets ativos" tone="blue" />
+        <MetricCard label="Projetos" value={String(items.length)} hint="projetos ativos" tone="blue" />
         <MetricCard
           label="Memória reservada"
           value={`${Math.round(totalQuota)} GB`}
@@ -114,88 +119,102 @@ export function ProjectsView() {
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {items.map((item) => (
-            <Card key={item.id} className="flex flex-col gap-4">
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
-                    <FolderKanban className="size-5" />
-                  </span>
-                  <div className="min-w-0">
-                    <h2 className="truncate text-base font-semibold tracking-tight text-foreground">{item.name}</h2>
-                    <p className="text-xs text-muted-foreground">Criado em {item.createdAt}</p>
+            <Link
+              key={item.id}
+              href="/"
+              className="group block rounded-2xl outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              aria-label={`Abrir visão geral de ${item.name}`}
+            >
+              <Card className="flex flex-col gap-4 transition-colors group-hover:bg-muted/30">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
+                      <FolderKanban className="size-5" />
+                    </span>
+                    <div className="min-w-0">
+                      <h2 className="truncate text-base font-semibold tracking-tight text-foreground">{item.name}</h2>
+                      <p className="text-xs text-muted-foreground">Criado em {item.createdAt}</p>
+                    </div>
                   </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={(event) => {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      openEdit(item)
+                    }}
+                    aria-label={`Editar ${item.name}`}
+                  >
+                    <Pencil className="size-4" />
+                    Editar
+                  </Button>
                 </div>
-                <Button variant="outline" size="sm" onClick={() => openEdit(item)} aria-label={`Editar ${item.name}`}>
-                  <Pencil className="size-4" />
-                  Editar
+
+                <div className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+                  <FolderOpen className="size-4 shrink-0" />
+                  <span className="truncate" title={item.storagePath}>
+                    {item.storagePath}
+                  </span>
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="flex items-center gap-1.5 text-muted-foreground">
+                      <HardDrive className="size-3.5" />
+                      Memória
+                    </span>
+                    <span className="font-medium tabular-nums text-foreground">
+                      {item.usedGb.toFixed(1)} / {item.quotaGb} GB
+                    </span>
+                  </div>
+                  <ProgressBar
+                    value={item.percent}
+                    color={item.percent >= 85 ? "bg-warning" : "bg-brand-blue"}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between gap-2 border-t border-border pt-3">
+                  <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <Users className="size-3.5" />
+                    Anotadores
+                  </span>
+                  {item.annotatorIds.length === 0 ? (
+                    <span className="text-xs text-muted-foreground">Nenhum</span>
+                  ) : (
+                    <div className="flex items-center -space-x-2">
+                      {item.annotatorIds.slice(0, 4).map((id) => {
+                        const user = usersById.get(id)
+                        if (!user) return null
+                        return (
+                          <Avatar
+                            key={id}
+                            name={user.name}
+                            src={user.avatar}
+                            size="sm"
+                            className="ring-2 ring-card"
+                            title={user.name}
+                          />
+                        )
+                      })}
+                      {item.annotatorIds.length > 4 && (
+                        <span className="flex size-6 items-center justify-center rounded-full bg-muted text-[10px] font-medium text-muted-foreground ring-2 ring-card">
+                          +{item.annotatorIds.length - 4}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <Button
+                  variant="ghost"
+                  className="pointer-events-none justify-between"
+                >
+                  Abrir visão geral
+                  <ArrowRight className="size-4" />
                 </Button>
-              </div>
-
-              <div className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
-                <FolderOpen className="size-4 shrink-0" />
-                <span className="truncate" title={item.storagePath}>
-                  {item.storagePath}
-                </span>
-              </div>
-
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="flex items-center gap-1.5 text-muted-foreground">
-                    <HardDrive className="size-3.5" />
-                    Memória
-                  </span>
-                  <span className="font-medium tabular-nums text-foreground">
-                    {item.usedGb.toFixed(1)} / {item.quotaGb} GB
-                  </span>
-                </div>
-                <ProgressBar
-                  value={item.percent}
-                  color={item.percent >= 85 ? "bg-warning" : "bg-brand-blue"}
-                />
-              </div>
-
-              <div className="flex items-center justify-between gap-2 border-t border-border pt-3">
-                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                  <Users className="size-3.5" />
-                  Anotadores
-                </span>
-                {item.annotatorIds.length === 0 ? (
-                  <span className="text-xs text-muted-foreground">Nenhum</span>
-                ) : (
-                  <div className="flex items-center -space-x-2">
-                    {item.annotatorIds.slice(0, 4).map((id) => {
-                      const user = usersById.get(id)
-                      if (!user) return null
-                      return (
-                        <Avatar
-                          key={id}
-                          name={user.name}
-                          src={user.avatar}
-                          size="sm"
-                          className="ring-2 ring-card"
-                          title={user.name}
-                        />
-                      )
-                    })}
-                    {item.annotatorIds.length > 4 && (
-                      <span className="flex size-6 items-center justify-center rounded-full bg-muted text-[10px] font-medium text-muted-foreground ring-2 ring-card">
-                        +{item.annotatorIds.length - 4}
-                      </span>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              <Button
-                variant="ghost"
-                className="justify-between"
-                nativeButton={false}
-                render={<Link href="/" />}
-              >
-                Abrir visão geral
-                <ArrowRight className="size-4" />
-              </Button>
-            </Card>
+              </Card>
+            </Link>
           ))}
         </div>
       )}

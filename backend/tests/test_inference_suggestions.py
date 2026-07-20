@@ -2,11 +2,11 @@ import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
-from app.services import inference as inference_service
 from app.core.config import Settings
 from app.core.database import Base
 from app.models import CvatLabel, InferenceSuggestion, Task
 from app.schemas import InferenceRunCreate
+from app.services import inference as inference_service
 from app.services.inference import ModelPrediction, run_inference
 
 

@@ -22,9 +22,9 @@ import {
   ArrowUp,
   ArrowDown,
 } from "lucide-react"
-import { reviewAnnotations, classes } from "@/lib/mock-data"
-import { apiAssetUrl, createReviewDecision, fetchReviewQueue, fetchTasks, mockFallbackEnabled } from "@/lib/api/client"
+import { apiAssetUrl, createReviewDecision, fetchReviewQueue, fetchTasks } from "@/lib/api/client"
 import { labelsFromTasks, type ApiClassItem } from "@/lib/api/status"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendReviewQueueItem, BackendTask } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
@@ -48,16 +48,10 @@ type ReviewAnnotation = {
   previewUrl?: string
   taskName?: string
   cvatJobId?: string | null
+  raw?: Record<string, unknown>
 }
 
-const initialBoxes: Record<number, Box> = {
-  88213: { x: 7, y: 50, w: 22, h: 26 },
-  88214: { x: 34, y: 48, w: 17, h: 20 },
-  88215: { x: 54, y: 38, w: 24, h: 32 },
-  88216: { x: 73, y: 42, w: 20, h: 26 },
-  88217: { x: 26, y: 66, w: 10, h: 13 },
-  88218: { x: 1, y: 58, w: 11, h: 16 },
-}
+const initialBoxes: Record<number, Box> = {}
 
 const clampPct = (v: number, min = 0, max = 100) => Math.max(min, Math.min(max, v))
 
@@ -94,13 +88,12 @@ const sizeOptions: { label: string; value: "all" | "small" | "medium" | "large" 
 ]
 
 function clsColor(name: string) {
-  return classes.find((c) => c.name === name)?.color ?? "var(--muted-foreground)"
+  return colorForName(name)
 }
 
-function alternatives(cls: string, conf: number) {
-  const pool = ["car", "truck", "bus", "motorcycle", "van", "bicycle", "person", "others"].filter((c) => c !== cls)
-  const vals = [0.21, 0.12, 0.05, 0.03, 0.02]
-  return [{ cls, v: conf }, ...pool.slice(0, 5).map((c, i) => ({ cls: c, v: vals[i] }))]
+function alternatives(cls: string, conf: number, classCatalog: ApiClassItem[]) {
+  const pool = classCatalog.map((c) => c.name).filter((name) => name !== cls)
+  return [{ cls, v: conf }, ...pool.slice(0, 5).map((name) => ({ cls: name, v: 0 }))]
 }
 
 function queueItemToAnnotation(item: BackendReviewQueueItem, index: number, classCatalog: ApiClassItem[]): ReviewAnnotation {
@@ -122,22 +115,61 @@ function queueItemToAnnotation(item: BackendReviewQueueItem, index: number, clas
     previewUrl: apiAssetUrl(item.preview_url) ?? undefined,
     taskName: item.task_name ?? undefined,
     cvatJobId: item.cvat_job_id,
+    raw: objectRecord(item.payload.raw),
   }
 }
 
 function generatedBoxesFor(items: ReviewAnnotation[]): Record<number, Box> {
   const boxes: Record<number, Box> = {}
-  items.forEach((item, index) => {
-    const col = index % 3
-    const row = Math.floor(index / 3) % 3
-    boxes[item.id] = {
-      x: 8 + col * 27,
-      y: 18 + row * 20,
-      w: 18,
-      h: 16,
-    }
+  items.forEach((item) => {
+    const box = boxFromAnnotation(item)
+    if (box) boxes[item.id] = box
   })
   return boxes
+}
+
+function objectRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function boxFromAnnotation(item: ReviewAnnotation): Box | null {
+  const rawBox = objectRecord(item.raw?.bbox_norm)
+  const normalizedBox = boxFromNormalizedRecord(rawBox)
+  if (normalizedBox) return normalizedBox
+
+  const rawShape = objectRecord(item.raw?.shape)
+  const shapeBox = boxFromNormalizedRecord(objectRecord(rawShape.bbox_norm))
+  if (shapeBox) return shapeBox
+
+  const points = item.points?.map(Number).filter(Number.isFinite) ?? []
+  if (points.length < 4 || points.some((value) => value < 0 || value > 1)) return null
+
+  const xs = points.filter((_, index) => index % 2 === 0)
+  const ys = points.filter((_, index) => index % 2 === 1)
+  const minX = Math.min(...xs)
+  const minY = Math.min(...ys)
+  const maxX = Math.max(...xs)
+  const maxY = Math.max(...ys)
+  return {
+    x: clampPct(minX * 100),
+    y: clampPct(minY * 100),
+    w: clampPct((maxX - minX) * 100, 0, 100),
+    h: clampPct((maxY - minY) * 100, 0, 100),
+  }
+}
+
+function boxFromNormalizedRecord(value: Record<string, unknown>): Box | null {
+  const x = Number(value.x)
+  const y = Number(value.y)
+  const w = Number(value.w)
+  const h = Number(value.h)
+  if (![x, y, w, h].every((number) => Number.isFinite(number) && number >= 0 && number <= 1)) return null
+  return {
+    x: clampPct(x * 100),
+    y: clampPct(y * 100),
+    w: clampPct(w * 100, 0, 100),
+    h: clampPct(h * 100, 0, 100),
+  }
 }
 
 function stableNumericId(value: string) {
@@ -146,6 +178,20 @@ function stableNumericId(value: string) {
     hash = (hash * 31 + value.charCodeAt(i)) >>> 0
   }
   return 100000 + (hash % 800000)
+}
+
+function colorForName(name: string) {
+  const palette = [
+    "var(--brand-blue)",
+    "var(--brand-green)",
+    "var(--brand-lavender)",
+    "var(--warning)",
+    "var(--brand-indigo)",
+    "var(--brand-sky)",
+  ]
+  let hash = 0
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0
+  return palette[hash % palette.length] ?? "var(--muted-foreground)"
 }
 
 function decisionToBackend(decision: Decision) {
@@ -167,30 +213,26 @@ const emptyAnnotation: ReviewAnnotation = {
 export function ReviewWorkspace() {
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [reviewQueue, setReviewQueue] = React.useState<BackendReviewQueueItem[] | null>(null)
-  const useMocks = mockFallbackEnabled()
+  const { currentUser } = useCurrentUser()
   const classCatalog = React.useMemo<ApiClassItem[]>(() => {
     const cvatClasses = labelsFromTasks(tasks)
-    return cvatClasses.length > 0 ? cvatClasses : useMocks ? classes : []
-  }, [tasks, useMocks])
+    return cvatClasses.length > 0 ? cvatClasses : []
+  }, [tasks])
   const reviewItems = React.useMemo(
     () =>
       reviewQueue && reviewQueue.length > 0
         ? reviewQueue.map((item, index) => queueItemToAnnotation(item, index, classCatalog))
-        : useMocks
-          ? (reviewAnnotations as ReviewAnnotation[])
-          : [],
-    [classCatalog, reviewQueue, useMocks],
+        : [],
+    [classCatalog, reviewQueue],
   )
-  const [selectedId, setSelectedId] = React.useState<number>(useMocks ? reviewAnnotations[0].id : 0)
+  const [selectedId, setSelectedId] = React.useState<number>(0)
   const [decisions, setDecisions] = React.useState<Record<number, Decision>>({})
   const [syncState, setSyncState] = React.useState<Record<number, { synced: boolean; error?: string | null }>>({})
   const [log, setLog] = React.useState<{ id: number; decision: Decision }[]>([])
   const [autoAdvance, setAutoAdvance] = React.useState(true)
   const [scale, setScale] = React.useState(1)
   const [tab, setTab] = React.useState<"anotacoes" | "tracks" | "tags" | "comentarios">("anotacoes")
-  const [checkedClasses, setCheckedClasses] = React.useState<Set<string>>(() =>
-    new Set((useMocks ? classes : []).map((c) => c.name)),
-  )
+  const [checkedClasses, setCheckedClasses] = React.useState<Set<string>>(() => new Set())
   const [boxState, setBoxState] = React.useState<Record<number, Box>>(initialBoxes)
   const [onlyUnreviewed, setOnlyUnreviewed] = React.useState(false)
   const [onlyThisClass, setOnlyThisClass] = React.useState(false)
@@ -209,8 +251,7 @@ export function ReviewWorkspace() {
   const clsColor = React.useCallback(
     (name: string) =>
       classCatalog.find((c) => c.name === name)?.color ??
-      classes.find((c) => c.name === name)?.color ??
-      "var(--muted-foreground)",
+      colorForName(name),
     [classCatalog],
   )
 
@@ -222,10 +263,6 @@ export function ReviewWorkspace() {
   }, [])
 
   React.useEffect(() => {
-    setCheckedClasses(new Set(classCatalog.map((c) => c.name)))
-  }, [classCatalog])
-
-  React.useEffect(() => {
     if (classCatalog.length > 0) {
       setCheckedClasses(new Set(classCatalog.map((c) => c.name)))
     }
@@ -234,7 +271,11 @@ export function ReviewWorkspace() {
   React.useEffect(() => {
     if (!reviewQueue?.length) return
     const nextBoxes = generatedBoxesFor(reviewItems)
-    setBoxState((prev) => ({ ...nextBoxes, ...prev }))
+    const ids = new Set(reviewItems.map((item) => item.id))
+    setBoxState((prev) => {
+      const kept = Object.fromEntries(Object.entries(prev).filter(([id]) => ids.has(Number(id))))
+      return { ...nextBoxes, ...kept }
+    })
     if (!reviewItems.some((item) => item.id === selectedId)) {
       setSelectedId(reviewItems[0]?.id ?? selectedId)
     }
@@ -292,10 +333,11 @@ export function ReviewWorkspace() {
   const current =
     visibleAnnotations.find((a) => a.id === selectedId) ?? visibleAnnotations[0] ?? reviewItems[0] ?? emptyAnnotation
   const reviewedCount = Object.keys(decisions).length
-  const queueTotal = Math.max(reviewItems.length, 1)
-  const queuePos = Math.min(queueTotal, reviewedCount + 1)
-  const queuePct = Math.round((reviewedCount / queueTotal) * 100)
-  const currentPreviewSrc = current.previewUrl ?? (useMocks ? "/street-scene.png" : "/placeholder.svg")
+  const queueTotal = reviewItems.length
+  const currentQueueIndex = reviewItems.findIndex((item) => item.id === current.id)
+  const queuePos = queueTotal === 0 ? 0 : Math.max(1, currentQueueIndex + 1)
+  const queuePct = queueTotal === 0 ? 0 : Math.round((reviewedCount / queueTotal) * 100)
+  const currentPreviewSrc = current.previewUrl ?? "/placeholder.svg"
 
   const selectNext = React.useCallback(() => {
     const i = visibleAnnotations.findIndex((a) => a.id === selectedId)
@@ -382,6 +424,7 @@ export function ReviewWorkspace() {
             annotation_type: selected.annotationType,
             cvat_job_id: selected.cvatJobId,
             corrected_label: correctedLabel ?? null,
+            actor: currentUser.email || currentUser.id,
             patch_cvat: true,
             payload: {
               confidence: selected.conf,
@@ -406,7 +449,7 @@ export function ReviewWorkspace() {
       }
       if (autoAdvance) selectNext()
     },
-    [autoAdvance, boxState, current, selectNext],
+    [autoAdvance, boxState, current, currentUser.email, currentUser.id, selectNext],
   )
 
   // Aplica a classe escolhida no autocomplete e registra a decisão "corrigido".
@@ -480,7 +523,7 @@ export function ReviewWorkspace() {
     }
   }, [visibleAnnotations, selectedId])
 
-  const alts = alternatives(current.cls, current.conf)
+  const alts = alternatives(current.cls, current.conf, classCatalog)
 
   return (
     <div className="flex h-[calc(100svh-4rem)] flex-col bg-background">
@@ -609,7 +652,9 @@ export function ReviewWorkspace() {
                 <Icon className="size-4" />
               </button>
             ))}
-            <span className="ml-1 text-sm font-medium tabular-nums">12 / 45</span>
+            <span className="ml-1 text-sm font-medium tabular-nums">
+              {queuePos.toLocaleString("pt-BR")} / {queueTotal.toLocaleString("pt-BR")}
+            </span>
             <label className="ml-3 flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
               <input
                 type="checkbox"
@@ -775,37 +820,18 @@ export function ReviewWorkspace() {
                 {current.taskName ?? `Item #${current.id}`} <span className="text-white/60">CVAT</span>
               </p>
               <p className="mt-0.5 text-xs text-white/70">Gerada por: {current.origem}</p>
-              <p className="text-xs text-white/70">Job: {current.cvatJobId ?? "local"}</p>
+              <p className="text-xs text-white/70">Job: {current.cvatJobId ?? "--"}</p>
               <p className="text-xs text-white/70">Confiança: {current.conf.toFixed(2)}</p>
             </div>
           </div>
 
-          {/* filmstrip */}
-          <div className="flex items-center gap-2 border-t border-border px-3 py-2">
-            <button className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground">
-              <ChevronsLeft className="size-4" />
-            </button>
-            <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
-              {Array.from({ length: 10 }, (_, i) => i + 7).map((n) => {
-                const currentFrame = n === 12
-                return (
-                  <button
-                    key={n}
-                    className={cn(
-                      "relative aspect-video h-12 shrink-0 overflow-hidden rounded-md border-2 transition-colors",
-                      currentFrame ? "border-brand-blue" : "border-transparent hover:border-border",
-                    )}
-                  >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={currentPreviewSrc} alt={`Frame ${n}`} className="size-full object-cover" />
-                    <span className="absolute bottom-0 right-0 bg-black/60 px-1 text-[9px] text-white">{n}</span>
-                  </button>
-                )
-              })}
-            </div>
-            <button className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground">
-              <ChevronsRight className="size-4" />
-            </button>
+          <div className="flex items-center gap-3 border-t border-border px-3 py-2 text-xs text-muted-foreground">
+            <span className="tabular-nums">
+              Frame: {current.frame == null ? "--" : current.frame.toLocaleString("pt-BR")}
+            </span>
+            <span className="truncate">
+              {current.previewUrl ? "Preview sincronizado pelo backend" : "Sem preview sincronizado"}
+            </span>
           </div>
 
           {/* tabs + table */}
@@ -935,7 +961,7 @@ export function ReviewWorkspace() {
 
           <dl className="mt-3 flex flex-col gap-1 px-4 text-xs text-muted-foreground">
             <div>Origem: {current.origem}</div>
-            <div>Job: {current.cvatJobId ?? "local"}</div>
+            <div>Job: {current.cvatJobId ?? "--"}</div>
             <div>Gerada em: {current.criada}</div>
             {syncState[current.id] && (
               <div className={syncState[current.id].error ? "text-destructive" : "text-brand-green"}>
@@ -1035,7 +1061,7 @@ export function ReviewWorkspace() {
           </span>
         </span>
         <span className="hidden text-muted-foreground lg:block">
-          Tempo estimado <span className="text-foreground">2h 18min restantes</span>
+          Tempo estimado <span className="text-foreground">--</span>
         </span>
         <button className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1.5 font-medium hover:bg-muted">
           <BarChart3 className="size-3.5" /> Ver estatísticas da fila

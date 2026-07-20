@@ -6,7 +6,15 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.models import AnnotationRecord, AuditEvent, CvatLabel, DatasetRelease, JobRecord, Project, Task
+from app.models import (
+    AnnotationRecord,
+    AuditEvent,
+    CvatLabel,
+    DatasetRelease,
+    JobRecord,
+    Project,
+    Task,
+)
 from app.schemas import DatasetReleaseCreate
 from app.services.artifacts import ArtifactStore
 from app.services.cvat_client import CvatClient

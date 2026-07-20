@@ -8,6 +8,7 @@ ReviewDecisionValue = Literal["accepted", "rejected", "corrected", "uncertain", 
 AnnotationType = Literal["shape", "track", "tag"]
 InferenceModelFamily = Literal["detection", "segmentation", "classification", "tracking"]
 InferenceApplyMode = Literal["append", "replace"]
+UserRole = Literal["admin", "anotador"]
 
 
 class OrmModel(BaseModel):
@@ -20,6 +21,17 @@ class HealthRead(BaseModel):
     service: str = "anotator-backend"
 
 
+class DirectoryEntryRead(BaseModel):
+    name: str
+    path: str
+
+
+class DirectoryListingRead(BaseModel):
+    path: str
+    parent: str | None = None
+    entries: list[DirectoryEntryRead] = Field(default_factory=list)
+
+
 class CvatStatusRead(BaseModel):
     configured: bool
     reachable: bool
@@ -27,6 +39,61 @@ class CvatStatusRead(BaseModel):
     authenticated: bool
     version: str | None = None
     error: str | None = None
+
+
+class UserRead(OrmModel):
+    id: str
+    name: str
+    email: str
+    role: str
+    status: str
+    avatar_url: str | None = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class UserCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=6, max_length=255)
+    role: UserRole = "anotador"
+    avatar_url: str | None = None
+
+
+class UserUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    email: str | None = Field(default=None, min_length=3, max_length=255)
+    password: str | None = Field(default=None, min_length=6, max_length=255)
+    current_password: str | None = Field(default=None, min_length=1, max_length=255)
+    role: UserRole | None = None
+    status: Literal["active", "inactive"] | None = None
+    avatar_url: str | None = None
+
+
+class AuthLogin(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=255)
+
+
+class AuthSessionRead(BaseModel):
+    token: str
+    expires_at: datetime
+    user: UserRead
+
+
+class ProjectMemberRead(OrmModel):
+    id: str
+    project_id: str
+    user_id: str
+    role: str
+    raw: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectMembersPut(BaseModel):
+    user_ids: list[str] = Field(default_factory=list)
 
 
 class ProjectRead(OrmModel):
@@ -49,6 +116,7 @@ class ProjectCreate(BaseModel):
 
 class ProjectUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
+    storage_path: str | None = Field(default=None, min_length=1, max_length=1024)
     storage_quota_gb: int | None = Field(default=None, ge=1, le=100_000)
     warn_at_percent: int | None = Field(default=None, ge=1, le=100)
 
@@ -120,6 +188,26 @@ class JobRead(OrmModel):
     finished_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class JobCapacityRead(BaseModel):
+    queued: int
+    running: int
+    active: int
+    cpu_count: int
+    memory_total_bytes: int | None = None
+    memory_available_bytes: int | None = None
+    gpu: dict[str, Any] = Field(default_factory=dict)
+
+
+class JobPriorityUpdate(BaseModel):
+    priority: int = Field(ge=0, le=1000)
+
+
+class JobMetricsRead(BaseModel):
+    job_id: str
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    snapshots: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AnnotationRecordRead(OrmModel):
@@ -328,6 +416,32 @@ class DatasetReleaseRead(OrmModel):
     updated_at: datetime
 
 
+class ArtifactRead(BaseModel):
+    id: str
+    name: str
+    kind: str = "artifact"
+    content_type: str | None = None
+    size_bytes: int | None = None
+    download_url: str
+    owner_type: str | None = None
+    owner_id: str | None = None
+
+
+class ArtifactPresignRead(BaseModel):
+    url: str
+    expires_in_seconds: int
+    method: str = "GET"
+
+
+class PreparedDatasetRead(BaseModel):
+    release_id: str
+    status: str
+    artifact_uri: str | None = None
+    download_url: str | None = None
+    data_yaml: dict[str, Any] | None = None
+    manifest: dict[str, Any] | None = None
+
+
 class TrainingRunCreate(BaseModel):
     dataset_release_id: str
     base_model: str
@@ -372,6 +486,35 @@ class ModelVersionRead(OrmModel):
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+class ModelVersionCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    version: str = Field(min_length=1, max_length=128)
+    family: str = Field(default="detection", max_length=64)
+    base_model: str = Field(default="manual", max_length=255)
+    dataset_release_id: str | None = None
+    artifact_uri: str | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
+    status: str = "registered"
+
+
+class ModelVersionUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    version: str | None = Field(default=None, min_length=1, max_length=128)
+    family: str | None = Field(default=None, max_length=64)
+    base_model: str | None = Field(default=None, max_length=255)
+    dataset_release_id: str | None = None
+    artifact_uri: str | None = None
+    metrics: dict[str, Any] | None = None
+    params: dict[str, Any] | None = None
+    status: str | None = None
+
+
+class ModelImportRead(BaseModel):
+    model: ModelVersionRead
+    artifact: ArtifactRead
 
 
 class PipelineDefinitionCreate(BaseModel):
@@ -438,3 +581,60 @@ class DerivedAssetRead(OrmModel):
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+class DerivedAssetUpdate(BaseModel):
+    label_name: str | None = None
+    split: Literal["train", "val", "test"] | None = None
+    status: str | None = None
+    human_corrections: dict[str, Any] | None = None
+
+
+class DerivedAssetReviewDecision(BaseModel):
+    decision: ReviewDecisionValue
+    actor: str = "local-user"
+    reason: str | None = None
+    corrected_label: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AuditEventRead(OrmModel):
+    id: str
+    actor: str
+    action: str
+    target: str
+    reason: str | None = None
+    confidence: float | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
+
+
+class AuditEventPage(BaseModel):
+    items: list[AuditEventRead]
+    total: int
+    limit: int
+    offset: int
+
+
+class ImportTaskCreate(BaseModel):
+    project_id: str | None = None
+    name: str = Field(min_length=1, max_length=255)
+    labels: list[dict[str, Any]] = Field(default_factory=list)
+    source_path: str | None = Field(default=None, max_length=2048)
+    estimated_bytes: int | None = Field(default=None, ge=0)
+    sync_after_import: bool = True
+
+
+class ImportJobRead(BaseModel):
+    job: JobRead
+
+
+class TrackActionPayload(BaseModel):
+    actor: str = "local-user"
+    reason: str | None = None
+    frame: int | None = Field(default=None, ge=0)
+    label_id: int | None = None
+    label_name: str | None = None
+    points: list[Any] = Field(default_factory=list)
+    payload: dict[str, Any] = Field(default_factory=dict)

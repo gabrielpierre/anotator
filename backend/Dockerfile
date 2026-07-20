@@ -7,7 +7,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app/backend
 
 COPY backend/pyproject.toml ./pyproject.toml
-RUN pip install --upgrade pip && pip install -e .
+RUN pip install --upgrade pip \
+    && pip install \
+        --index-url https://download.pytorch.org/whl/cpu \
+        "torch==2.13.0+cpu" \
+        "torchvision==0.28.0+cpu" \
+    && pip install -e .
 
 COPY backend/ .
 

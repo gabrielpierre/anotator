@@ -1,9 +1,9 @@
 import * as React from "react"
 import { cn } from "@/lib/utils"
-import type { JobStatus } from "@/lib/mock-data"
+import type { UiJobStatus } from "@/lib/api/status"
 
 const statusMap: Record<
-  JobStatus | "aprovado" | "em-construcao" | "publicado" | "arquivado",
+  UiJobStatus | "aprovado" | "em-construcao" | "publicado" | "arquivado",
   { label: string; dot: string; text: string; bg: string }
 > = {
   executando: { label: "Executando", dot: "bg-brand-green", text: "text-brand-green", bg: "bg-brand-green/12" },

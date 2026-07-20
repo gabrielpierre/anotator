@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings
 from app.models import AuditEvent, CvatLabel, InferenceSuggestion, Task, utcnow
 from app.schemas import InferenceRunCreate
-from app.services.cvat_client import CvatBinaryResponse, CvatClient
+from app.services.cvat_client import CvatClient
 
 
 @dataclass
