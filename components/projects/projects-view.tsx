@@ -2,14 +2,17 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Plus, FolderKanban, HardDrive, Pencil, ArrowRight, FolderOpen } from "lucide-react"
+import { Plus, FolderKanban, HardDrive, Pencil, ArrowRight, FolderOpen, Users } from "lucide-react"
 import { Card, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
+import { Avatar } from "@/components/snowui/avatar"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, ProgressBar } from "@/components/app/primitives"
+import { AdminOnly } from "@/components/app/admin-only"
 import { ProjectDialog, type ProjectDialogTarget } from "@/components/projects/project-dialog"
 import { fetchProjects, mockFallbackEnabled } from "@/lib/api/client"
 import { formatDateTimePt } from "@/lib/api/status"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendProject } from "@/lib/api/types"
 
 type ProjectItem = {
@@ -21,6 +24,7 @@ type ProjectItem = {
   usedGb: number
   percent: number
   createdAt: string
+  annotatorIds: string[]
 }
 
 const mockProjects: ProjectItem[] = [
@@ -33,6 +37,7 @@ const mockProjects: ProjectItem[] = [
     usedGb: 128.6,
     percent: 64,
     createdAt: "01/06/2024 09:12",
+    annotatorIds: ["u-mariana", "u-rafael"],
   },
   {
     id: "rodovia-2026",
@@ -43,6 +48,7 @@ const mockProjects: ProjectItem[] = [
     usedGb: 42.3,
     percent: 42,
     createdAt: "28/06/2024 15:40",
+    annotatorIds: ["u-mariana"],
   },
   {
     id: "pedestres-noturno",
@@ -53,6 +59,7 @@ const mockProjects: ProjectItem[] = [
     usedGb: 12.8,
     percent: 21,
     createdAt: "10/07/2024 11:05",
+    annotatorIds: [],
   },
 ]
 
@@ -70,6 +77,7 @@ function toProjectItem(project: BackendProject): ProjectItem {
   const quotaGb = numberFromUnknown(storage.quota_gb) ?? 0
   const usedBytes = numberFromUnknown(storage.used_bytes) ?? 0
   const usedGb = usedBytes / 1024 ** 3
+  const rawAnnotators = (project.raw?.annotator_ids ?? []) as unknown
   return {
     id: project.id,
     name: project.name,
@@ -79,15 +87,19 @@ function toProjectItem(project: BackendProject): ProjectItem {
     usedGb,
     percent: quotaGb > 0 ? Math.min(100, Math.round((usedGb / quotaGb) * 100)) : 0,
     createdAt: formatDateTimePt(project.created_at),
+    annotatorIds: Array.isArray(rawAnnotators) ? rawAnnotators.map(String) : [],
   }
 }
 
 export function ProjectsView() {
   const useMocks = mockFallbackEnabled()
+  const { users } = useCurrentUser()
   const [projects, setProjects] = React.useState<ProjectItem[] | null>(null)
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [dialogMode, setDialogMode] = React.useState<"create" | "edit">("create")
   const [editTarget, setEditTarget] = React.useState<ProjectDialogTarget | null>(null)
+
+  const usersById = React.useMemo(() => new Map(users.map((user) => [user.id, user])), [users])
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -111,12 +123,18 @@ export function ProjectsView() {
 
   function openEdit(item: ProjectItem) {
     setDialogMode("edit")
-    setEditTarget({ id: item.id, name: item.name, storagePath: item.storagePath, quotaGb: item.quotaGb })
+    setEditTarget({
+      id: item.id,
+      name: item.name,
+      storagePath: item.storagePath,
+      quotaGb: item.quotaGb,
+      annotatorIds: item.annotatorIds,
+    })
     setDialogOpen(true)
   }
 
-  function handleSaved(project: BackendProject, mode: "create" | "edit") {
-    const next = toProjectItem(project)
+  function handleSaved(project: BackendProject, mode: "create" | "edit", annotatorIds: string[]) {
+    const next = { ...toProjectItem(project), annotatorIds }
     setProjects((current) => {
       const base = current ?? (useMocks ? mockProjects : [])
       if (mode === "edit") {
@@ -127,6 +145,7 @@ export function ProjectsView() {
   }
 
   return (
+    <AdminOnly>
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <PageHeader
         title="Projetos"
@@ -224,6 +243,38 @@ export function ProjectsView() {
                 />
               </div>
 
+              <div className="flex items-center justify-between gap-2 border-t border-border pt-3">
+                <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <Users className="size-3.5" />
+                  Anotadores
+                </span>
+                {item.annotatorIds.length === 0 ? (
+                  <span className="text-xs text-muted-foreground">Nenhum</span>
+                ) : (
+                  <div className="flex items-center -space-x-2">
+                    {item.annotatorIds.slice(0, 4).map((id) => {
+                      const user = usersById.get(id)
+                      if (!user) return null
+                      return (
+                        <Avatar
+                          key={id}
+                          name={user.name}
+                          src={user.avatar}
+                          size="sm"
+                          className="ring-2 ring-card"
+                          title={user.name}
+                        />
+                      )
+                    })}
+                    {item.annotatorIds.length > 4 && (
+                      <span className="flex size-6 items-center justify-center rounded-full bg-muted text-[10px] font-medium text-muted-foreground ring-2 ring-card">
+                        +{item.annotatorIds.length - 4}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <Button
                 variant="ghost"
                 className="justify-between"
@@ -238,5 +289,6 @@ export function ProjectsView() {
         </div>
       )}
     </div>
+    </AdminOnly>
   )
 }

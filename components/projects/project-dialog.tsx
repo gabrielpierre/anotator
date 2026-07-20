@@ -1,9 +1,11 @@
 "use client"
 
 import * as React from "react"
-import { X, FolderOpen } from "lucide-react"
+import { X, FolderOpen, Check, Users } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { Avatar } from "@/components/snowui/avatar"
 import { createProject, updateProject, mockFallbackEnabled } from "@/lib/api/client"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendProject } from "@/lib/api/types"
 
 const quotaPresets = [30, 40, 60, 100]
@@ -17,6 +19,7 @@ export type ProjectDialogTarget = {
   name: string
   storagePath: string
   quotaGb: number
+  annotatorIds?: string[]
 }
 
 export function ProjectDialog({
@@ -30,13 +33,15 @@ export function ProjectDialog({
   mode: "create" | "edit"
   project?: ProjectDialogTarget | null
   onClose: () => void
-  onSaved: (project: BackendProject, mode: "create" | "edit") => void
+  onSaved: (project: BackendProject, mode: "create" | "edit", annotatorIds: string[]) => void
 }) {
   const isEdit = mode === "edit"
+  const { annotators } = useCurrentUser()
   const [name, setName] = React.useState("")
   const [storagePath, setStoragePath] = React.useState("")
   const [quotaGb, setQuotaGb] = React.useState(40)
   const [customQuota, setCustomQuota] = React.useState("")
+  const [annotatorIds, setAnnotatorIds] = React.useState<string[]>([])
   const [saving, setSaving] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
 
@@ -49,14 +54,22 @@ export function ProjectDialog({
       const preset = quotaPresets.includes(project.quotaGb)
       setQuotaGb(preset ? project.quotaGb : 40)
       setCustomQuota(preset ? "" : String(project.quotaGb))
+      setAnnotatorIds(project.annotatorIds ?? [])
     } else {
       setName("")
       setStoragePath("")
       setQuotaGb(40)
       setCustomQuota("")
+      setAnnotatorIds([])
     }
     setError(null)
   }, [open, isEdit, project])
+
+  function toggleAnnotator(id: string) {
+    setAnnotatorIds((current) =>
+      current.includes(id) ? current.filter((value) => value !== id) : [...current, id],
+    )
+  }
 
   React.useEffect(() => {
     if (!open) return
@@ -99,11 +112,11 @@ export function ProjectDialog({
             name: name.trim(),
             storage_quota_gb: Math.round(resolvedQuota),
           })
-          onSaved(updated, "edit")
+          onSaved(updated, "edit", annotatorIds)
         } catch (err) {
           // Sem backend disponível: aplica a edição localmente no modo demonstração.
           if (!mockFallbackEnabled()) throw err
-          onSaved(synthesizeProject(project, name.trim(), Math.round(resolvedQuota)), "edit")
+          onSaved(synthesizeProject(project, name.trim(), Math.round(resolvedQuota)), "edit", annotatorIds)
         }
       } else {
         const created = await createProject({
@@ -112,7 +125,7 @@ export function ProjectDialog({
           storage_quota_gb: Math.round(resolvedQuota),
           warn_at_percent: 85,
         })
-        onSaved(created, "create")
+        onSaved(created, "create", annotatorIds)
       }
       onClose()
     } catch (err) {
@@ -214,6 +227,49 @@ export function ProjectDialog({
               />
               <span className="text-sm text-muted-foreground">GB</span>
             </label>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <span className="flex items-center gap-1.5 text-sm font-medium text-foreground">
+              <Users className="size-4" />
+              Anotadores
+            </span>
+            {annotators.length === 0 ? (
+              <p className="rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+                Nenhum anotador cadastrado ainda. Crie usuários na página Usuários.
+              </p>
+            ) : (
+              <div className="flex flex-col gap-1.5">
+                {annotators.map((annotator) => {
+                  const selected = annotatorIds.includes(annotator.id)
+                  return (
+                    <button
+                      key={annotator.id}
+                      type="button"
+                      role="checkbox"
+                      aria-checked={selected}
+                      onClick={() => toggleAnnotator(annotator.id)}
+                      className={`flex items-center gap-3 rounded-lg border px-3 py-2 text-left transition-colors ${
+                        selected ? "border-brand-blue bg-surface-blue" : "border-border hover:bg-muted"
+                      }`}
+                    >
+                      <Avatar name={annotator.name} src={annotator.avatar} size="sm" />
+                      <span className="flex min-w-0 flex-1 flex-col leading-tight">
+                        <span className="truncate text-sm font-medium text-foreground">{annotator.name}</span>
+                        <span className="truncate text-xs text-muted-foreground">{annotator.email}</span>
+                      </span>
+                      <span
+                        className={`flex size-5 items-center justify-center rounded-md border ${
+                          selected ? "border-brand-blue bg-brand-blue text-white" : "border-border"
+                        }`}
+                      >
+                        {selected && <Check className="size-3.5" />}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
           </div>
 
           {error && <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}

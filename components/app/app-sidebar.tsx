@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation"
 import { PanelLeftClose, PanelLeft } from "lucide-react"
 import { Brand } from "@/components/app/brand"
 import { navEntries } from "@/components/app/nav-config"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import { cn } from "@/lib/utils"
 
 export function AppSidebar({
@@ -16,7 +17,9 @@ export function AppSidebar({
   onClose?: () => void
 }) {
   const pathname = usePathname()
+  const { isAdmin } = useCurrentUser()
   const [collapsed, setCollapsed] = React.useState(false)
+  const entries = navEntries.filter((item) => !item.adminOnly || isAdmin)
 
   return (
     <>
@@ -101,7 +104,7 @@ export function AppSidebar({
           >
             NAVEGAÇÃO
           </p>
-          {navEntries.map((item) => {
+          {entries.map((item) => {
             const active =
               item.href === "/" ? pathname === "/" : pathname.startsWith(item.href)
             const Icon = item.icon

@@ -30,6 +30,7 @@ import { ProjectDialog } from "@/components/projects/project-dialog"
 import { classes, modelEvolution, project } from "@/lib/mock-data"
 import { fetchDashboard, fetchTasks, mockFallbackEnabled } from "@/lib/api/client"
 import { formatPtNumber, labelsFromTasks } from "@/lib/api/status"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendDashboard, BackendProject, BackendTask } from "@/lib/api/types"
 
 const kpis = [
@@ -59,6 +60,7 @@ export function ProjectOverview() {
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [projectModalOpen, setProjectModalOpen] = React.useState(false)
   const useMocks = mockFallbackEnabled()
+  const { isAdmin } = useCurrentUser()
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -132,16 +134,18 @@ export function ProjectOverview() {
             Resumo do estado atual e próximos passos recomendados.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="lg">
-            <Sliders className="size-4" />
-            Personalizar
-          </Button>
-          <Button size="lg" onClick={() => setProjectModalOpen(true)}>
-            <Plus className="size-4" />
-            Novo projeto
-          </Button>
-        </div>
+        {isAdmin && (
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="lg">
+              <Sliders className="size-4" />
+              Personalizar
+            </Button>
+            <Button size="lg" onClick={() => setProjectModalOpen(true)}>
+              <Plus className="size-4" />
+              Novo projeto
+            </Button>
+          </div>
+        )}
       </div>
       <ProjectDialog
         open={projectModalOpen}
