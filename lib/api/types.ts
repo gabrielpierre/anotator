@@ -18,6 +18,12 @@ export type BackendProjectCreate = {
   warn_at_percent?: number
 }
 
+export type BackendProjectUpdate = {
+  name?: string
+  storage_quota_gb?: number
+  warn_at_percent?: number
+}
+
 export type BackendTask = {
   id: string
   external_id: string

@@ -1,4 +1,5 @@
 import re
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import desc, func, select
@@ -6,7 +7,14 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
 from app.models import AuditEvent, CvatLabel, DatasetRelease, JobRecord, Project, ReviewDecision, Task, TrainingRun
-from app.schemas import ClassDistribution, DashboardStats, ProjectCreate, ProjectDashboardRead, ProjectRead
+from app.schemas import (
+    ClassDistribution,
+    DashboardStats,
+    ProjectCreate,
+    ProjectDashboardRead,
+    ProjectRead,
+    ProjectUpdate,
+)
 
 router = APIRouter()
 
@@ -55,6 +63,47 @@ def create_project(payload: ProjectCreate, db: Session = Depends(db_session)) ->
             },
         )
     )
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+@router.patch("/{project_id}", response_model=ProjectRead)
+def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depends(db_session)) -> Project:
+    project = db.get(Project, project_id) or db.scalar(
+        select(Project).where(Project.external_id == project_id)
+    )
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    changes: dict[str, Any] = {}
+
+    if payload.name is not None and payload.name.strip():
+        project.name = payload.name.strip()
+        changes["name"] = project.name
+
+    raw = dict(project.raw or {})
+    storage = dict(raw.get("storage") or {})
+    if payload.storage_quota_gb is not None:
+        storage["quota_gb"] = payload.storage_quota_gb
+        storage["quota_bytes"] = payload.storage_quota_gb * 1024**3
+        changes["storage_quota_gb"] = payload.storage_quota_gb
+    if payload.warn_at_percent is not None:
+        storage["warn_at_percent"] = payload.warn_at_percent
+        changes["warn_at_percent"] = payload.warn_at_percent
+    if storage:
+        raw["storage"] = storage
+        project.raw = raw
+
+    if changes:
+        db.add(
+            AuditEvent(
+                actor="system",
+                action="project_updated",
+                target=project.id,
+                payload={"project_id": project.id, "external_id": project.external_id, **changes},
+            )
+        )
     db.commit()
     db.refresh(project)
     return project

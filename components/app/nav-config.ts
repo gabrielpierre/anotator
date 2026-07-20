@@ -1,5 +1,6 @@
 import {
   LayoutGrid,
+  FolderKanban,
   Database,
   PenLine,
   CheckSquare,
@@ -18,6 +19,7 @@ export type NavEntry = {
 
 export const navEntries: NavEntry[] = [
   { label: "Visão geral", href: "/", icon: LayoutGrid },
+  { label: "Projetos", href: "/projetos", icon: FolderKanban },
   { label: "Dados", href: "/dados", icon: Database },
   { label: "Anotar", href: "/anotar", icon: PenLine },
   { label: "Revisar", href: "/revisar", icon: CheckSquare, badge: 93 },
