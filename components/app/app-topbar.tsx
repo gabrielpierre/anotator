@@ -2,7 +2,8 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Menu, Bell, HelpCircle, ChevronDown, Activity, Check, ShieldCheck } from "lucide-react"
+import { useRouter } from "next/navigation"
+import { Menu, Bell, HelpCircle, ChevronDown, Activity, Check, ShieldCheck, UserCog, LogOut } from "lucide-react"
 import { ThemeToggle } from "@/components/snowui/theme-toggle"
 import { Avatar } from "@/components/snowui/avatar"
 import { activeJobs } from "@/lib/mock-data"
@@ -21,7 +22,8 @@ export function AppTopbar({
 }) {
   const useMocks = mockFallbackEnabled()
   const [activeJobCount, setActiveJobCount] = React.useState(useMocks ? activeJobs.length : 0)
-  const { currentUser, users, switchUser } = useCurrentUser()
+  const { currentUser, users, switchUser, logout } = useCurrentUser()
+  const router = useRouter()
   const [menuOpen, setMenuOpen] = React.useState(false)
   const menuRef = React.useRef<HTMLDivElement>(null)
 
@@ -144,6 +146,17 @@ export function AppTopbar({
                   <p className="truncate text-xs text-muted-foreground">{currentUser.email}</p>
                 </div>
               </div>
+              <div className="border-b border-border p-1.5">
+                <Link
+                  href="/perfil"
+                  role="menuitem"
+                  onClick={() => setMenuOpen(false)}
+                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-foreground transition-colors hover:bg-muted"
+                >
+                  <UserCog className="size-4 text-muted-foreground" />
+                  Meu perfil
+                </Link>
+              </div>
               <div className="p-1.5">
                 <p className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-muted-foreground">
                   <ShieldCheck className="size-3.5" />
@@ -175,6 +188,21 @@ export function AppTopbar({
                     </button>
                   )
                 })}
+              </div>
+              <div className="border-t border-border p-1.5">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuOpen(false)
+                    logout()
+                    router.replace("/login")
+                  }}
+                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm text-destructive transition-colors hover:bg-destructive/10"
+                >
+                  <LogOut className="size-4" />
+                  Sair
+                </button>
               </div>
             </div>
           )}

@@ -130,13 +130,33 @@ export type NewUserInput = {
   name: string
   email: string
   role: UserRole
+  password?: string
 }
+
+export type ProfileUpdate = {
+  name?: string
+  email?: string
+  avatar?: string
+}
+
+export type LoginResult = { ok: true } | { ok: false; error: string }
+
+// Senha padrão atribuída a novos usuários (camada de simulação no frontend).
+export const DEFAULT_PASSWORD = "cvat123"
+
+// Chave da sessão na aba do navegador (não é persistência de dados de negócio).
+const SESSION_KEY = "cvat.session"
 
 type UserContextValue = {
   currentUser: AppUser
+  isAuthenticated: boolean
   isAdmin: boolean
   users: AppUser[]
   annotators: AppUser[]
+  login: (email: string, password: string) => LoginResult
+  logout: () => void
+  updateProfile: (patch: ProfileUpdate) => void
+  changePassword: (currentPassword: string, newPassword: string) => LoginResult
   addUser: (input: NewUserInput) => AppUser
   removeUser: (userId: string) => void
   switchUser: (userId: string) => void
@@ -157,10 +177,32 @@ function nowPt() {
   return new Date().toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" })
 }
 
+// Senhas iniciais (camada de simulação no frontend — sem autenticação real ainda).
+const seedPasswords: Record<string, string> = {
+  "u-gabriel": "admin123",
+  "u-mariana": "anotar123",
+  "u-rafael": "anotar123",
+}
+
 export function UserProvider({ children }: { children: React.ReactNode }) {
   const [users, setUsers] = React.useState<AppUser[]>(seedUsers)
-  const [currentUserId, setCurrentUserId] = React.useState<string>(seedUsers[0].id)
+  const [passwords, setPasswords] = React.useState<Record<string, string>>(seedPasswords)
+  // Sessão começa deslogada — o usuário precisa entrar pela tela de login.
+  const [sessionUserId, setSessionUserId] = React.useState<string | null>(null)
   const [projects, setProjects] = React.useState<ProjectRecord[]>(mockProjects)
+
+  // Reidrata a sessão a partir do sessionStorage (escopo da aba) para que um
+  // recarregamento não desconecte o usuário. Feito em efeito para evitar
+  // divergência de hidratação entre servidor e cliente.
+  React.useEffect(() => {
+    const stored = window.sessionStorage.getItem(SESSION_KEY)
+    if (stored) setSessionUserId(stored)
+  }, [])
+
+  React.useEffect(() => {
+    if (sessionUserId) window.sessionStorage.setItem(SESSION_KEY, sessionUserId)
+    else window.sessionStorage.removeItem(SESSION_KEY)
+  }, [sessionUserId])
 
   // Enriquece a lista com os projetos do backend quando ele retorna dados,
   // preservando as associações de anotadores já existentes por id.
@@ -181,9 +223,64 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     return () => controller.abort()
   }, [])
 
+  // Sem sessão ativa, usa o primeiro usuário como fallback seguro para evitar
+  // travamentos durante o breve render antes do redirecionamento para /login.
   const currentUser = React.useMemo(
-    () => users.find((user) => user.id === currentUserId) ?? users[0],
-    [users, currentUserId],
+    () => users.find((user) => user.id === sessionUserId) ?? users[0],
+    [users, sessionUserId],
+  )
+
+  const login = React.useCallback<UserContextValue["login"]>(
+    (email, password) => {
+      const normalized = email.trim().toLowerCase()
+      const user = users.find((item) => item.email.toLowerCase() === normalized)
+      if (!user) {
+        return { ok: false, error: "E-mail não encontrado." }
+      }
+      if (passwords[user.id] !== password) {
+        return { ok: false, error: "Senha incorreta." }
+      }
+      setSessionUserId(user.id)
+      return { ok: true }
+    },
+    [users, passwords],
+  )
+
+  const logout = React.useCallback(() => {
+    setSessionUserId(null)
+  }, [])
+
+  const updateProfile = React.useCallback<UserContextValue["updateProfile"]>(
+    (patch) => {
+      setUsers((current) =>
+        current.map((user) =>
+          user.id === sessionUserId
+            ? {
+                ...user,
+                name: patch.name?.trim() || user.name,
+                email: patch.email?.trim() || user.email,
+                avatar: patch.avatar !== undefined ? patch.avatar : user.avatar,
+              }
+            : user,
+        ),
+      )
+    },
+    [sessionUserId],
+  )
+
+  const changePassword = React.useCallback<UserContextValue["changePassword"]>(
+    (currentPassword, newPassword) => {
+      if (!sessionUserId) return { ok: false, error: "Sessão expirada." }
+      if (passwords[sessionUserId] !== currentPassword) {
+        return { ok: false, error: "A senha atual está incorreta." }
+      }
+      if (newPassword.length < 6) {
+        return { ok: false, error: "A nova senha deve ter ao menos 6 caracteres." }
+      }
+      setPasswords((current) => ({ ...current, [sessionUserId]: newPassword }))
+      return { ok: true }
+    },
+    [sessionUserId, passwords],
   )
 
   const addUser = React.useCallback((input: NewUserInput) => {
@@ -195,6 +292,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
       createdAt: nowPt(),
     }
     setUsers((current) => [user, ...current])
+    setPasswords((current) => ({ ...current, [user.id]: input.password?.trim() || DEFAULT_PASSWORD }))
     return user
   }, [])
 
@@ -210,7 +308,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   }, [])
 
   const switchUser = React.useCallback((userId: string) => {
-    setCurrentUserId(userId)
+    setSessionUserId(userId)
   }, [])
 
   const addProject = React.useCallback((project: ProjectRecord) => {
@@ -262,9 +360,14 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   const value = React.useMemo<UserContextValue>(
     () => ({
       currentUser,
+      isAuthenticated: sessionUserId !== null,
       isAdmin: currentUser.role === "admin",
       users,
       annotators: users.filter((user) => user.role === "anotador"),
+      login,
+      logout,
+      updateProfile,
+      changePassword,
       addUser,
       removeUser,
       switchUser,
@@ -276,7 +379,12 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     }),
     [
       currentUser,
+      sessionUserId,
       users,
+      login,
+      logout,
+      updateProfile,
+      changePassword,
       addUser,
       removeUser,
       switchUser,
