@@ -14,15 +14,16 @@ export function AppShell({
   children: React.ReactNode
 }) {
   const [navOpen, setNavOpen] = React.useState(false)
-  const { isAuthenticated } = useCurrentUser()
+  const { isAuthenticated, authReady } = useCurrentUser()
   const router = useRouter()
 
   // Rotas do painel exigem sessão ativa — redireciona para o login caso contrário.
+  // Aguarda a reidratação da sessão para não redirecionar prematuramente.
   React.useEffect(() => {
-    if (!isAuthenticated) router.replace("/login")
-  }, [isAuthenticated, router])
+    if (authReady && !isAuthenticated) router.replace("/login")
+  }, [authReady, isAuthenticated, router])
 
-  if (!isAuthenticated) {
+  if (!authReady || !isAuthenticated) {
     return (
       <div className="flex min-h-svh items-center justify-center bg-background">
         <span className="sr-only">Redirecionando para o login</span>

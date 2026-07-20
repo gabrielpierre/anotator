@@ -150,6 +150,8 @@ const SESSION_KEY = "cvat.session"
 type UserContextValue = {
   currentUser: AppUser
   isAuthenticated: boolean
+  // Indica que a reidratação da sessão terminou (evita redirect prematuro).
+  authReady: boolean
   isAdmin: boolean
   users: AppUser[]
   annotators: AppUser[]
@@ -189,6 +191,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   const [passwords, setPasswords] = React.useState<Record<string, string>>(seedPasswords)
   // Sessão começa deslogada — o usuário precisa entrar pela tela de login.
   const [sessionUserId, setSessionUserId] = React.useState<string | null>(null)
+  const [authReady, setAuthReady] = React.useState(false)
   const [projects, setProjects] = React.useState<ProjectRecord[]>(mockProjects)
 
   // Reidrata a sessão a partir do sessionStorage (escopo da aba) para que um
@@ -197,12 +200,15 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     const stored = window.sessionStorage.getItem(SESSION_KEY)
     if (stored) setSessionUserId(stored)
+    setAuthReady(true)
   }, [])
 
+  // Só persiste depois da reidratação, para não apagar a sessão salva no mount.
   React.useEffect(() => {
+    if (!authReady) return
     if (sessionUserId) window.sessionStorage.setItem(SESSION_KEY, sessionUserId)
     else window.sessionStorage.removeItem(SESSION_KEY)
-  }, [sessionUserId])
+  }, [authReady, sessionUserId])
 
   // Enriquece a lista com os projetos do backend quando ele retorna dados,
   // preservando as associações de anotadores já existentes por id.
@@ -361,6 +367,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     () => ({
       currentUser,
       isAuthenticated: sessionUserId !== null,
+      authReady,
       isAdmin: currentUser.role === "admin",
       users,
       annotators: users.filter((user) => user.role === "anotador"),
@@ -380,6 +387,7 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     [
       currentUser,
       sessionUserId,
+      authReady,
       users,
       login,
       logout,
