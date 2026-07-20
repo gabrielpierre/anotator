@@ -10,106 +10,18 @@ import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, ProgressBar } from "@/components/app/primitives"
 import { AdminOnly } from "@/components/app/admin-only"
 import { ProjectDialog, type ProjectDialogTarget } from "@/components/projects/project-dialog"
-import { fetchProjects, mockFallbackEnabled } from "@/lib/api/client"
-import { formatDateTimePt } from "@/lib/api/status"
-import { useCurrentUser } from "@/lib/auth/user-context"
+import { useCurrentUser, projectRecordFromBackend, type ProjectRecord } from "@/lib/auth/user-context"
 import type { BackendProject } from "@/lib/api/types"
 
-type ProjectItem = {
-  id: string
-  name: string
-  status: string
-  storagePath: string
-  quotaGb: number
-  usedGb: number
-  percent: number
-  createdAt: string
-  annotatorIds: string[]
-}
-
-const mockProjects: ProjectItem[] = [
-  {
-    id: "veiculos-cityscapes",
-    name: "Veículos - Cityscapes",
-    status: "active",
-    storagePath: "D:\\datasets\\cityscapes",
-    quotaGb: 200,
-    usedGb: 128.6,
-    percent: 64,
-    createdAt: "01/06/2024 09:12",
-    annotatorIds: ["u-mariana", "u-rafael"],
-  },
-  {
-    id: "rodovia-2026",
-    name: "Rodovia - Tráfego 2026",
-    status: "active",
-    storagePath: "D:\\datasets\\rodovia-2026",
-    quotaGb: 100,
-    usedGb: 42.3,
-    percent: 42,
-    createdAt: "28/06/2024 15:40",
-    annotatorIds: ["u-mariana"],
-  },
-  {
-    id: "pedestres-noturno",
-    name: "Pedestres - Cenas Noturnas",
-    status: "active",
-    storagePath: "D:\\datasets\\pedestres-noturno",
-    quotaGb: 60,
-    usedGb: 12.8,
-    percent: 21,
-    createdAt: "10/07/2024 11:05",
-    annotatorIds: [],
-  },
-]
-
-function numberFromUnknown(value: unknown) {
-  if (typeof value === "number" && Number.isFinite(value)) return value
-  if (typeof value === "string") {
-    const parsed = Number(value)
-    return Number.isFinite(parsed) ? parsed : null
-  }
-  return null
-}
-
-function toProjectItem(project: BackendProject): ProjectItem {
-  const storage = (project.raw?.storage ?? {}) as Record<string, unknown>
-  const quotaGb = numberFromUnknown(storage.quota_gb) ?? 0
-  const usedBytes = numberFromUnknown(storage.used_bytes) ?? 0
-  const usedGb = usedBytes / 1024 ** 3
-  const rawAnnotators = (project.raw?.annotator_ids ?? []) as unknown
-  return {
-    id: project.id,
-    name: project.name,
-    status: project.status,
-    storagePath: String(storage.path ?? "--"),
-    quotaGb,
-    usedGb,
-    percent: quotaGb > 0 ? Math.min(100, Math.round((usedGb / quotaGb) * 100)) : 0,
-    createdAt: formatDateTimePt(project.created_at),
-    annotatorIds: Array.isArray(rawAnnotators) ? rawAnnotators.map(String) : [],
-  }
-}
-
 export function ProjectsView() {
-  const useMocks = mockFallbackEnabled()
-  const { users } = useCurrentUser()
-  const [projects, setProjects] = React.useState<ProjectItem[] | null>(null)
+  const { users, projects, addProject, updateProject } = useCurrentUser()
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [dialogMode, setDialogMode] = React.useState<"create" | "edit">("create")
   const [editTarget, setEditTarget] = React.useState<ProjectDialogTarget | null>(null)
 
   const usersById = React.useMemo(() => new Map(users.map((user) => [user.id, user])), [users])
 
-  React.useEffect(() => {
-    const controller = new AbortController()
-    fetchProjects(controller.signal)
-      .then((data) => setProjects(data.map(toProjectItem)))
-      .catch(() => setProjects(null))
-    return () => controller.abort()
-  }, [])
-
-  const items = projects && projects.length > 0 ? projects : useMocks ? mockProjects : []
+  const items = projects
 
   const totalQuota = items.reduce((total, item) => total + item.quotaGb, 0)
   const totalUsed = items.reduce((total, item) => total + item.usedGb, 0)
@@ -121,7 +33,7 @@ export function ProjectsView() {
     setDialogOpen(true)
   }
 
-  function openEdit(item: ProjectItem) {
+  function openEdit(item: ProjectRecord) {
     setDialogMode("edit")
     setEditTarget({
       id: item.id,
@@ -134,14 +46,13 @@ export function ProjectsView() {
   }
 
   function handleSaved(project: BackendProject, mode: "create" | "edit", annotatorIds: string[]) {
-    const next = { ...toProjectItem(project), annotatorIds }
-    setProjects((current) => {
-      const base = current ?? (useMocks ? mockProjects : [])
-      if (mode === "edit") {
-        return base.map((item) => (item.id === next.id ? { ...item, ...next } : item))
-      }
-      return [next, ...base]
-    })
+    // O contexto é a fonte única — sincroniza a lista compartilhada com a aba Usuários.
+    const record = projectRecordFromBackend(project, annotatorIds)
+    if (mode === "edit") {
+      updateProject(project.id, { name: record.name, quotaGb: record.quotaGb, annotatorIds })
+    } else {
+      addProject({ ...record, annotatorIds })
+    }
   }
 
   return (
