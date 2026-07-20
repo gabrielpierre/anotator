@@ -5,9 +5,7 @@ import Link from "next/link"
 import {
   Sliders,
   Plus,
-  FolderOpen,
   HardDrive,
-  X,
   ImageIcon,
   PenLine,
   Box,
@@ -28,9 +26,11 @@ import { Badge } from "@/components/snowui/badge"
 import { DonutChart } from "@/components/snowui/charts"
 import { MetricLineChart, SparkLineChart } from "@/components/app/charts"
 import { StatusBadge, ProgressBar } from "@/components/app/primitives"
+import { ProjectDialog } from "@/components/projects/project-dialog"
 import { classes, modelEvolution, project } from "@/lib/mock-data"
-import { createProject, fetchDashboard, fetchTasks, mockFallbackEnabled } from "@/lib/api/client"
+import { fetchDashboard, fetchTasks, mockFallbackEnabled } from "@/lib/api/client"
 import { formatPtNumber, labelsFromTasks } from "@/lib/api/status"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendDashboard, BackendProject, BackendTask } from "@/lib/api/types"
 
 const kpis = [
@@ -55,17 +55,12 @@ const attentions = [
   { icon: Info, tone: "bg-surface-mint text-brand-mint", title: "Backup recomendado", desc: "Último backup há 3 dias", href: "/dados" },
 ]
 
-const quotaPresets = [30, 40, 60, 100]
-
-type DirectoryPickerWindow = Window & {
-  showDirectoryPicker?: () => Promise<{ name: string }>
-}
-
 export function ProjectOverview() {
   const [dashboard, setDashboard] = React.useState<BackendDashboard | null>(null)
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [projectModalOpen, setProjectModalOpen] = React.useState(false)
   const useMocks = mockFallbackEnabled()
+  const { isAdmin } = useCurrentUser()
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -139,21 +134,24 @@ export function ProjectOverview() {
             Resumo do estado atual e próximos passos recomendados.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <Button variant="outline" size="lg">
-            <Sliders className="size-4" />
-            Personalizar
-          </Button>
-          <Button size="lg" onClick={() => setProjectModalOpen(true)}>
-            <Plus className="size-4" />
-            Novo projeto
-          </Button>
-        </div>
+        {isAdmin && (
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="lg">
+              <Sliders className="size-4" />
+              Personalizar
+            </Button>
+            <Button size="lg" onClick={() => setProjectModalOpen(true)}>
+              <Plus className="size-4" />
+              Novo projeto
+            </Button>
+          </div>
+        )}
       </div>
-      <NewProjectDialog
+      <ProjectDialog
         open={projectModalOpen}
+        mode="create"
         onClose={() => setProjectModalOpen(false)}
-        onCreated={(project) => {
+        onSaved={(project) => {
           setDashboard((current) =>
             current
               ? {
@@ -412,164 +410,6 @@ export function ProjectOverview() {
           )}
         </CardContent>
       </Card>
-    </div>
-  )
-}
-
-function NewProjectDialog({
-  open,
-  onClose,
-  onCreated,
-}: {
-  open: boolean
-  onClose: () => void
-  onCreated: (project: BackendProject) => void
-}) {
-  const [name, setName] = React.useState("")
-  const [storagePath, setStoragePath] = React.useState("")
-  const [quotaGb, setQuotaGb] = React.useState(40)
-  const [customQuota, setCustomQuota] = React.useState("")
-  const [creating, setCreating] = React.useState(false)
-  const [error, setError] = React.useState<string | null>(null)
-
-  React.useEffect(() => {
-    if (!open) return
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose()
-    }
-    document.addEventListener("keydown", onKey)
-    return () => document.removeEventListener("keydown", onKey)
-  }, [open, onClose])
-
-  if (!open) return null
-
-  async function chooseFolder() {
-    const picker = (window as DirectoryPickerWindow).showDirectoryPicker
-    if (picker) {
-      const handle = await picker()
-      setStoragePath((current) => current || handle.name)
-      return
-    }
-    setError("Seu navegador nao expoe o caminho da pasta. Informe o caminho manualmente.")
-  }
-
-  async function submit(event: React.FormEvent) {
-    event.preventDefault()
-    const resolvedQuota = Number(customQuota || quotaGb)
-    if (!name.trim() || !storagePath.trim() || !Number.isFinite(resolvedQuota) || resolvedQuota <= 0) {
-      setError("Preencha nome, pasta e limite de storage.")
-      return
-    }
-    setCreating(true)
-    setError(null)
-    try {
-      const project = await createProject({
-        name: name.trim(),
-        storage_path: storagePath.trim(),
-        storage_quota_gb: Math.round(resolvedQuota),
-        warn_at_percent: 85,
-      })
-      onCreated(project)
-      setName("")
-      setStoragePath("")
-      setQuotaGb(40)
-      setCustomQuota("")
-      onClose()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Erro ao criar projeto.")
-    } finally {
-      setCreating(false)
-    }
-  }
-
-  return (
-    <div role="dialog" aria-modal="true" aria-label="Novo projeto" className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <button type="button" aria-label="Fechar" onClick={onClose} className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <form onSubmit={submit} className="relative z-10 flex w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-xl">
-        <div className="flex items-start justify-between gap-4 border-b border-border p-5">
-          <div>
-            <h2 className="text-lg font-semibold text-foreground">Novo projeto</h2>
-            <p className="mt-0.5 text-sm text-muted-foreground">
-              Defina onde o dataset sera armazenado e o limite maximo de crescimento.
-            </p>
-          </div>
-          <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
-            <X className="size-4" />
-          </button>
-        </div>
-
-        <div className="flex flex-col gap-4 p-5">
-          <label className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium text-foreground">Nome</span>
-            <input
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-              placeholder="Ex.: Veiculos - Rodovia 2026"
-              className="h-10 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue"
-            />
-          </label>
-
-          <label className="flex flex-col gap-1.5">
-            <span className="text-sm font-medium text-foreground">Pasta do projeto</span>
-            <div className="flex gap-2">
-              <input
-                value={storagePath}
-                onChange={(event) => setStoragePath(event.target.value)}
-                placeholder="Ex.: D:\\datasets\\rodovia-2026"
-                className="h-10 min-w-0 flex-1 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue"
-              />
-              <Button type="button" variant="outline" onClick={() => void chooseFolder()}>
-                <FolderOpen className="size-4" />
-                Escolher
-              </Button>
-            </div>
-          </label>
-
-          <div className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-foreground">Limite de storage</span>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              {quotaPresets.map((value) => (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => {
-                    setQuotaGb(value)
-                    setCustomQuota("")
-                  }}
-                  className={`rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
-                    !customQuota && quotaGb === value
-                      ? "border-brand-blue bg-surface-blue text-brand-blue"
-                      : "border-border hover:bg-muted"
-                  }`}
-                >
-                  {value} GB
-                </button>
-              ))}
-            </div>
-            <label className="flex items-center gap-2">
-              <input
-                value={customQuota}
-                onChange={(event) => setCustomQuota(event.target.value)}
-                inputMode="numeric"
-                placeholder="Outro valor"
-                className="h-10 w-36 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue"
-              />
-              <span className="text-sm text-muted-foreground">GB</span>
-            </label>
-          </div>
-
-          {error && <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
-        </div>
-
-        <div className="flex items-center justify-end gap-2 border-t border-border p-4">
-          <Button type="button" variant="outline" onClick={onClose}>
-            Cancelar
-          </Button>
-          <Button type="submit" disabled={creating}>
-            {creating ? "Criando..." : "Criar projeto"}
-          </Button>
-        </div>
-      </form>
     </div>
   )
 }

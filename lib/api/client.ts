@@ -15,6 +15,7 @@ import type {
   BackendPipelineRunCreate,
   BackendProject,
   BackendProjectCreate,
+  BackendProjectUpdate,
   BackendReviewDecision,
   BackendReviewDecisionCreate,
   BackendReviewQueueItem,
@@ -85,6 +86,20 @@ async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): P
   return response.json() as Promise<T>
 }
 
+async function patchJson<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(`${apiBaseUrl()}${path}`, {
+    method: "PATCH",
+    headers: apiHeaders({ Accept: "application/json", "Content-Type": "application/json" }),
+    cache: "no-store",
+    signal,
+    body: JSON.stringify(body),
+  })
+  if (!response.ok) {
+    throw new Error(`Backend request failed: ${response.status} ${response.statusText}`)
+  }
+  return response.json() as Promise<T>
+}
+
 async function deleteJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(`${apiBaseUrl()}${path}`, {
     method: "DELETE",
@@ -108,6 +123,10 @@ export function fetchProjects(signal?: AbortSignal) {
 
 export function createProject(payload: BackendProjectCreate, signal?: AbortSignal) {
   return postJson<BackendProject>("/projects", payload, signal)
+}
+
+export function updateProject(projectId: string, payload: BackendProjectUpdate, signal?: AbortSignal) {
+  return patchJson<BackendProject>(`/projects/${encodeURIComponent(projectId)}`, payload, signal)
 }
 
 export function fetchDashboard(projectId = "default", signal?: AbortSignal) {

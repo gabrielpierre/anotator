@@ -47,6 +47,12 @@ class ProjectCreate(BaseModel):
     warn_at_percent: int = Field(default=85, ge=1, le=100)
 
 
+class ProjectUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    storage_quota_gb: int | None = Field(default=None, ge=1, le=100_000)
+    warn_at_percent: int | None = Field(default=None, ge=1, le=100)
+
+
 class TaskRead(OrmModel):
     id: str
     external_id: str
