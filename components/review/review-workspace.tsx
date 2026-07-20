@@ -23,12 +23,32 @@ import {
   ArrowDown,
 } from "lucide-react"
 import { reviewAnnotations, classes } from "@/lib/mock-data"
+import { apiAssetUrl, createReviewDecision, fetchReviewQueue, fetchTasks, mockFallbackEnabled } from "@/lib/api/client"
+import { labelsFromTasks, type ApiClassItem } from "@/lib/api/status"
+import type { BackendReviewQueueItem, BackendTask } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
 type Decision = "aceito" | "rejeitado" | "corrigido" | "incerto"
 
 type Box = { x: number; y: number; w: number; h: number }
 type Handle = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
+type ReviewAnnotation = {
+  id: number
+  cls: string
+  conf: number
+  origem: string
+  criada: string
+  color: string
+  externalAnnotationId?: string | null
+  annotationType?: "shape" | "track" | "tag" | null
+  labelId?: number | null
+  frame?: number | null
+  points?: unknown[]
+  shapeType?: string | null
+  previewUrl?: string
+  taskName?: string
+  cvatJobId?: string | null
+}
 
 const initialBoxes: Record<number, Box> = {
   88213: { x: 7, y: 50, w: 22, h: 26 },
@@ -83,14 +103,94 @@ function alternatives(cls: string, conf: number) {
   return [{ cls, v: conf }, ...pool.slice(0, 5).map((c, i) => ({ cls: c, v: vals[i] }))]
 }
 
+function queueItemToAnnotation(item: BackendReviewQueueItem, index: number, classCatalog: ApiClassItem[]): ReviewAnnotation {
+  const fallbackClass = classCatalog[0]?.name ?? "unknown"
+  const cls = item.label ?? fallbackClass
+  return {
+    id: stableNumericId(item.cvat_job_id ?? item.task_external_id ?? `queue-${index}`),
+    cls,
+    conf: item.confidence ?? 1,
+    origem: item.origin ?? "CVAT",
+    criada: "sync CVAT",
+    color: classCatalog.find((c) => c.name === cls)?.color ?? clsColor(cls),
+    externalAnnotationId: item.external_annotation_id,
+    annotationType: item.annotation_type,
+    labelId: item.label_id,
+    frame: item.frame,
+    points: item.points,
+    shapeType: item.shape_type,
+    previewUrl: apiAssetUrl(item.preview_url) ?? undefined,
+    taskName: item.task_name ?? undefined,
+    cvatJobId: item.cvat_job_id,
+  }
+}
+
+function generatedBoxesFor(items: ReviewAnnotation[]): Record<number, Box> {
+  const boxes: Record<number, Box> = {}
+  items.forEach((item, index) => {
+    const col = index % 3
+    const row = Math.floor(index / 3) % 3
+    boxes[item.id] = {
+      x: 8 + col * 27,
+      y: 18 + row * 20,
+      w: 18,
+      h: 16,
+    }
+  })
+  return boxes
+}
+
+function stableNumericId(value: string) {
+  let hash = 0
+  for (let i = 0; i < value.length; i++) {
+    hash = (hash * 31 + value.charCodeAt(i)) >>> 0
+  }
+  return 100000 + (hash % 800000)
+}
+
+function decisionToBackend(decision: Decision) {
+  if (decision === "aceito") return "accepted"
+  if (decision === "rejeitado") return "rejected"
+  if (decision === "corrigido") return "corrected"
+  return "uncertain"
+}
+
+const emptyAnnotation: ReviewAnnotation = {
+  id: 0,
+  cls: "unknown",
+  conf: 0,
+  origem: "backend",
+  criada: "--",
+  color: "var(--muted-foreground)",
+}
+
 export function ReviewWorkspace() {
-  const [selectedId, setSelectedId] = React.useState<number>(reviewAnnotations[0].id)
+  const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
+  const [reviewQueue, setReviewQueue] = React.useState<BackendReviewQueueItem[] | null>(null)
+  const useMocks = mockFallbackEnabled()
+  const classCatalog = React.useMemo<ApiClassItem[]>(() => {
+    const cvatClasses = labelsFromTasks(tasks)
+    return cvatClasses.length > 0 ? cvatClasses : useMocks ? classes : []
+  }, [tasks, useMocks])
+  const reviewItems = React.useMemo(
+    () =>
+      reviewQueue && reviewQueue.length > 0
+        ? reviewQueue.map((item, index) => queueItemToAnnotation(item, index, classCatalog))
+        : useMocks
+          ? (reviewAnnotations as ReviewAnnotation[])
+          : [],
+    [classCatalog, reviewQueue, useMocks],
+  )
+  const [selectedId, setSelectedId] = React.useState<number>(useMocks ? reviewAnnotations[0].id : 0)
   const [decisions, setDecisions] = React.useState<Record<number, Decision>>({})
+  const [syncState, setSyncState] = React.useState<Record<number, { synced: boolean; error?: string | null }>>({})
   const [log, setLog] = React.useState<{ id: number; decision: Decision }[]>([])
   const [autoAdvance, setAutoAdvance] = React.useState(true)
   const [scale, setScale] = React.useState(1)
   const [tab, setTab] = React.useState<"anotacoes" | "tracks" | "tags" | "comentarios">("anotacoes")
-  const [checkedClasses, setCheckedClasses] = React.useState<Set<string>>(() => new Set(classes.map((c) => c.name)))
+  const [checkedClasses, setCheckedClasses] = React.useState<Set<string>>(() =>
+    new Set((useMocks ? classes : []).map((c) => c.name)),
+  )
   const [boxState, setBoxState] = React.useState<Record<number, Box>>(initialBoxes)
   const [onlyUnreviewed, setOnlyUnreviewed] = React.useState(false)
   const [onlyThisClass, setOnlyThisClass] = React.useState(false)
@@ -106,6 +206,39 @@ export function ReviewWorkspace() {
   const [correcting, setCorrecting] = React.useState(false)
   const [classQuery, setClassQuery] = React.useState("")
   const correctInputRef = React.useRef<HTMLInputElement>(null)
+  const clsColor = React.useCallback(
+    (name: string) =>
+      classCatalog.find((c) => c.name === name)?.color ??
+      classes.find((c) => c.name === name)?.color ??
+      "var(--muted-foreground)",
+    [classCatalog],
+  )
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
+    fetchReviewQueue(controller.signal).then(setReviewQueue).catch(() => setReviewQueue(null))
+    return () => controller.abort()
+  }, [])
+
+  React.useEffect(() => {
+    setCheckedClasses(new Set(classCatalog.map((c) => c.name)))
+  }, [classCatalog])
+
+  React.useEffect(() => {
+    if (classCatalog.length > 0) {
+      setCheckedClasses(new Set(classCatalog.map((c) => c.name)))
+    }
+  }, [classCatalog])
+
+  React.useEffect(() => {
+    if (!reviewQueue?.length) return
+    const nextBoxes = generatedBoxesFor(reviewItems)
+    setBoxState((prev) => ({ ...nextBoxes, ...prev }))
+    if (!reviewItems.some((item) => item.id === selectedId)) {
+      setSelectedId(reviewItems[0]?.id ?? selectedId)
+    }
+  }, [reviewItems, reviewQueue?.length, selectedId])
 
   const clsOf = React.useCallback(
     (a: { id: number; cls: string }) => clsOverride[a.id] ?? a.cls,
@@ -122,12 +255,12 @@ export function ReviewWorkspace() {
 
   const classSuggestions = React.useMemo(() => {
     const q = classQuery.trim().toLowerCase()
-    const names = classes.map((c) => c.name)
+    const names = classCatalog.map((c) => c.name)
     if (!q) return names.slice(0, 6)
     return names.filter((n) => n.toLowerCase().includes(q)).slice(0, 6)
-  }, [classQuery])
+  }, [classCatalog, classQuery])
 
-  const selectedCls = reviewAnnotations.find((a) => a.id === selectedId)?.cls
+  const selectedCls = reviewItems.find((a) => a.id === selectedId)?.cls
 
   const toggleClass = React.useCallback((name: string) => {
     setCheckedClasses((prev) => {
@@ -140,7 +273,7 @@ export function ReviewWorkspace() {
 
   const visibleAnnotations = React.useMemo(
     () =>
-      reviewAnnotations.filter((a) => {
+      reviewItems.filter((a) => {
         const b = boxState[a.id]
         if (!b || !checkedClasses.has(a.cls)) return false
         if (onlyUnreviewed && decisions[a.id]) return false
@@ -153,14 +286,16 @@ export function ReviewWorkspace() {
         }
         return true
       }),
-    [boxState, checkedClasses, onlyUnreviewed, onlyThisClass, selectedCls, minConf, sizeFilter, decisions],
+    [boxState, checkedClasses, onlyUnreviewed, onlyThisClass, selectedCls, minConf, sizeFilter, decisions, reviewItems],
   )
   const total = visibleAnnotations.length
   const current =
-    visibleAnnotations.find((a) => a.id === selectedId) ?? visibleAnnotations[0] ?? reviewAnnotations[0]
+    visibleAnnotations.find((a) => a.id === selectedId) ?? visibleAnnotations[0] ?? reviewItems[0] ?? emptyAnnotation
   const reviewedCount = Object.keys(decisions).length
-  const queuePos = 342 + reviewedCount
-  const queuePct = Math.round((queuePos / 1250) * 100)
+  const queueTotal = Math.max(reviewItems.length, 1)
+  const queuePos = Math.min(queueTotal, reviewedCount + 1)
+  const queuePct = Math.round((reviewedCount / queueTotal) * 100)
+  const currentPreviewSrc = current.previewUrl ?? (useMocks ? "/street-scene.png" : "/placeholder.svg")
 
   const selectNext = React.useCallback(() => {
     const i = visibleAnnotations.findIndex((a) => a.id === selectedId)
@@ -234,12 +369,44 @@ export function ReviewWorkspace() {
   )
 
   const decide = React.useCallback(
-    (decision: Decision) => {
-      setDecisions((d) => ({ ...d, [selectedId]: decision }))
-      setLog((l) => [{ id: selectedId, decision }, ...l].slice(0, 20))
+    async (decision: Decision, correctedLabel?: string) => {
+      const selected = current
+      setDecisions((d) => ({ ...d, [selected.id]: decision }))
+      setSyncState((state) => ({ ...state, [selected.id]: { synced: false, error: null } }))
+      setLog((l) => [{ id: selected.id, decision }, ...l].slice(0, 20))
+      if (selected.externalAnnotationId) {
+        try {
+          const response = await createReviewDecision({
+            external_annotation_id: selected.externalAnnotationId,
+            decision: decisionToBackend(decision),
+            annotation_type: selected.annotationType,
+            cvat_job_id: selected.cvatJobId,
+            corrected_label: correctedLabel ?? null,
+            patch_cvat: true,
+            payload: {
+              confidence: selected.conf,
+              frame: selected.frame,
+              previous_label: selected.cls,
+              local_box: boxState[selected.id],
+            },
+          })
+          setSyncState((state) => ({
+            ...state,
+            [selected.id]: { synced: response.cvat_synced, error: response.cvat_error },
+          }))
+        } catch (error) {
+          setSyncState((state) => ({
+            ...state,
+            [selected.id]: {
+              synced: false,
+              error: error instanceof Error ? error.message : "Erro ao registrar decisao",
+            },
+          }))
+        }
+      }
       if (autoAdvance) selectNext()
     },
-    [selectedId, autoAdvance, selectNext],
+    [autoAdvance, boxState, current, selectNext],
   )
 
   // Aplica a classe escolhida no autocomplete e registra a decisão "corrigido".
@@ -248,7 +415,7 @@ export function ReviewWorkspace() {
       setClsOverride((prev) => ({ ...prev, [selectedId]: name }))
       setCorrecting(false)
       setClassQuery("")
-      decide("corrigido")
+      void decide("corrigido", name)
     },
     [selectedId, decide],
   )
@@ -283,18 +450,18 @@ export function ReviewWorkspace() {
       }
       if (e.key === "ArrowRight") {
         e.preventDefault()
-        decide("aceito")
+        void decide("aceito")
       } else if (e.key === "ArrowLeft") {
         e.preventDefault()
-        decide("rejeitado")
+        void decide("rejeitado")
       } else if (e.key === "ArrowUp") {
         e.preventDefault()
         openCorrection()
       } else if (e.key === "ArrowDown") {
         e.preventDefault()
-        decide("incerto")
+        void decide("incerto")
       } else if (/^[1-5]$/.test(e.key)) {
-        decide("corrigido")
+        void decide("corrigido")
       }
     }
     window.addEventListener("keydown", onKey)
@@ -322,22 +489,23 @@ export function ReviewWorkspace() {
         <aside className="hidden w-60 shrink-0 flex-col overflow-y-auto border-r border-border bg-sidebar lg:flex">
           <div className="flex items-center justify-between px-4 pb-2 pt-4">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              Classes revisadas ({checkedClasses.size}/{classes.length})
+              Classes revisadas ({checkedClasses.size}/{classCatalog.length})
             </p>
             <button
               onClick={() =>
                 setCheckedClasses((prev) =>
-                  prev.size === classes.length ? new Set() : new Set(classes.map((c) => c.name)),
+                  prev.size === classCatalog.length ? new Set() : new Set(classCatalog.map((c) => c.name)),
                 )
               }
               className="text-[11px] font-medium text-brand-blue hover:underline"
             >
-              {checkedClasses.size === classes.length ? "Limpar" : "Todas"}
+              {checkedClasses.size === classCatalog.length ? "Limpar" : "Todas"}
             </button>
           </div>
           <ul className="flex flex-col gap-0.5 px-2">
-            {classes.map((c) => {
+            {classCatalog.map((c) => {
               const checked = checkedClasses.has(c.name)
+              const count = c.count ?? reviewItems.filter((item) => item.cls === c.name).length
               return (
                 <li key={c.name}>
                   <label className="flex cursor-pointer items-center justify-between gap-2 rounded-lg px-3 py-1.5 text-sm text-foreground transition-colors hover:bg-muted">
@@ -352,7 +520,7 @@ export function ReviewWorkspace() {
                       <span className={cn("truncate", !checked && "text-muted-foreground")}>{c.name}</span>
                     </span>
                     <span className="shrink-0 tabular-nums text-xs text-muted-foreground">
-                      {c.count.toLocaleString("pt-BR")}
+                      {count.toLocaleString("pt-BR")}
                     </span>
                   </label>
                 </li>
@@ -490,7 +658,7 @@ export function ReviewWorkspace() {
             >
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
-                src="/street-scene.png"
+                src={currentPreviewSrc}
                 alt="Imagem em revisão"
                 draggable={false}
                 className="size-full select-none object-contain"
@@ -604,11 +772,11 @@ export function ReviewWorkspace() {
             {/* info overlay */}
             <div className="pointer-events-none absolute left-0 top-0 max-w-xs bg-gradient-to-br from-black/70 to-transparent p-3 text-white">
               <p className="text-sm font-medium">
-                Imagem 000342.jpg <span className="text-white/60">1280 × 720</span>
+                {current.taskName ?? `Item #${current.id}`} <span className="text-white/60">CVAT</span>
               </p>
               <p className="mt-0.5 text-xs text-white/70">Gerada por: {current.origem}</p>
-              <p className="text-xs text-white/70">Pipeline: detecção_veículos_v3</p>
-              <p className="text-xs text-white/70">Confiança média: 0.42</p>
+              <p className="text-xs text-white/70">Job: {current.cvatJobId ?? "local"}</p>
+              <p className="text-xs text-white/70">Confiança: {current.conf.toFixed(2)}</p>
             </div>
           </div>
 
@@ -629,7 +797,7 @@ export function ReviewWorkspace() {
                     )}
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src="/street-scene.png" alt={`Frame ${n}`} className="size-full object-cover" />
+                    <img src={currentPreviewSrc} alt={`Frame ${n}`} className="size-full object-cover" />
                     <span className="absolute bottom-0 right-0 bg-black/60 px-1 text-[9px] text-white">{n}</span>
                   </button>
                 )
@@ -761,14 +929,19 @@ export function ReviewWorkspace() {
             </div>
             <div className="size-16 shrink-0 overflow-hidden rounded-lg border border-border">
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src="/street-scene.png" alt="Recorte da anotação" className="size-full object-cover" />
+              <img src={currentPreviewSrc} alt="Recorte da anotação" className="size-full object-cover" />
             </div>
           </div>
 
           <dl className="mt-3 flex flex-col gap-1 px-4 text-xs text-muted-foreground">
             <div>Origem: {current.origem}</div>
-            <div>Pipeline: detecção_veículos_v3</div>
+            <div>Job: {current.cvatJobId ?? "local"}</div>
             <div>Gerada em: {current.criada}</div>
+            {syncState[current.id] && (
+              <div className={syncState[current.id].error ? "text-destructive" : "text-brand-green"}>
+                CVAT: {syncState[current.id].error ?? (syncState[current.id].synced ? "sincronizado" : "registrado localmente")}
+              </div>
+            )}
           </dl>
 
           {/* top alternativas */}
@@ -794,12 +967,12 @@ export function ReviewWorkspace() {
           <div className="mt-5 px-4">
             <p className="mb-2 text-sm font-medium">Ações rápidas</p>
             <div className="flex flex-col gap-2">
-              <DecisionButton onClick={() => decide("aceito")} className="bg-brand-green text-white hover:brightness-110">
+              <DecisionButton onClick={() => void decide("aceito")} className="bg-brand-green text-white hover:brightness-110">
                 <ArrowRight className="size-4" /> <span className="flex-1 text-center">Aceitar</span>{" "}
                 <ArrowRight className="size-4" />
               </DecisionButton>
               <DecisionButton
-                onClick={() => decide("rejeitado")}
+                onClick={() => void decide("rejeitado")}
                 className="bg-destructive text-destructive-foreground hover:brightness-110"
               >
                 <ArrowLeft className="size-4" /> <span className="flex-1 text-center">Rejeitar</span>{" "}
@@ -813,7 +986,7 @@ export function ReviewWorkspace() {
                 <ArrowUp className="size-4" />
               </DecisionButton>
               <DecisionButton
-                onClick={() => decide("incerto")}
+                onClick={() => void decide("incerto")}
                 className="border border-brand-blue/40 bg-brand-blue/15 text-brand-blue hover:bg-brand-blue/25"
               >
                 <ArrowDown className="size-4" /> <span className="flex-1 text-center">Incerto</span>{" "}
@@ -858,7 +1031,7 @@ export function ReviewWorkspace() {
             <span className="block h-full rounded-full bg-brand-green" style={{ width: `${queuePct}%` }} />
           </span>
           <span className="tabular-nums text-foreground">
-            {queuePos.toLocaleString("pt-BR")} / 1.250 ({queuePct}%)
+            {queuePos.toLocaleString("pt-BR")} / {queueTotal.toLocaleString("pt-BR")} ({queuePct}%)
           </span>
         </span>
         <span className="hidden text-muted-foreground lg:block">

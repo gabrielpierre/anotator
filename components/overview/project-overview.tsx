@@ -1,9 +1,13 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
 import {
   Sliders,
   Plus,
+  FolderOpen,
+  HardDrive,
+  X,
   ImageIcon,
   PenLine,
   Box,
@@ -24,7 +28,10 @@ import { Badge } from "@/components/snowui/badge"
 import { DonutChart } from "@/components/snowui/charts"
 import { MetricLineChart, SparkLineChart } from "@/components/app/charts"
 import { StatusBadge, ProgressBar } from "@/components/app/primitives"
-import { classes, modelEvolution } from "@/lib/mock-data"
+import { classes, modelEvolution, project } from "@/lib/mock-data"
+import { createProject, fetchDashboard, fetchTasks, mockFallbackEnabled } from "@/lib/api/client"
+import { formatPtNumber, labelsFromTasks } from "@/lib/api/status"
+import type { BackendDashboard, BackendProject, BackendTask } from "@/lib/api/types"
 
 const kpis = [
   { label: "Imagens importadas", value: "10.250", sub: "+320 esta semana", subTone: "text-brand-green", icon: ImageIcon, tone: "bg-surface-blue text-brand-blue" },
@@ -48,7 +55,81 @@ const attentions = [
   { icon: Info, tone: "bg-surface-mint text-brand-mint", title: "Backup recomendado", desc: "Último backup há 3 dias", href: "/dados" },
 ]
 
+const quotaPresets = [30, 40, 60, 100]
+
+type DirectoryPickerWindow = Window & {
+  showDirectoryPicker?: () => Promise<{ name: string }>
+}
+
 export function ProjectOverview() {
+  const [dashboard, setDashboard] = React.useState<BackendDashboard | null>(null)
+  const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
+  const [projectModalOpen, setProjectModalOpen] = React.useState(false)
+  const useMocks = mockFallbackEnabled()
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    fetchDashboard("default", controller.signal).then(setDashboard).catch(() => setDashboard(null))
+    fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
+    return () => controller.abort()
+  }, [])
+
+  const overviewKpis = dashboard
+    ? [
+        {
+          ...kpis[0],
+          value: formatPtNumber(dashboard.stats.images),
+          sub: `${dashboard.stats.tasks} tasks sincronizadas`,
+        },
+        {
+          ...kpis[1],
+          value: formatPtNumber(dashboard.stats.images || (useMocks ? project.imagesAnnotated : 0)),
+          sub: "Sincronizado do CVAT",
+          bar: dashboard.stats.images > 0 ? 100 : useMocks ? kpis[1].bar : 0,
+        },
+        {
+          ...kpis[2],
+          value: formatPtNumber(
+            dashboard.class_distribution.reduce((total, item) => total + item.count, 0) ||
+              (useMocks ? project.objectsAnnotated : 0),
+          ),
+          sub: "Labels/classes conhecidas",
+        },
+        {
+          ...kpis[3],
+          value: formatPtNumber(dashboard.stats.pending_review),
+          sub: `${dashboard.stats.jobs_running} jobs ativos`,
+        },
+      ]
+    : useMocks
+      ? kpis
+      : kpis.map((kpi) => ({ ...kpi, value: "0", sub: "Aguardando backend", bar: 0 }))
+
+  const taskClasses = labelsFromTasks(tasks)
+  const classItems =
+    dashboard?.class_distribution && dashboard.class_distribution.length > 0
+      ? dashboard.class_distribution.map((item, index) => ({
+          name: item.name,
+          count: item.count,
+          share: item.share,
+          color: classes[index % classes.length]?.color ?? "var(--brand-blue)",
+        }))
+      : taskClasses.length > 0
+        ? taskClasses.map((item) => ({
+            name: item.name,
+            count: item.count ?? 1,
+            share: Math.round((100 / taskClasses.length) * 100) / 100,
+            color: item.color,
+          }))
+      : useMocks
+        ? classes
+        : []
+
+  const activityItems = useMocks ? activities : []
+  const attentionItems = useMocks ? attentions : []
+  const modelEvolutionItems = useMocks ? modelEvolution : []
+  const currentProjectStorage = storageFromProject(dashboard?.project ?? null)
+
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -63,12 +144,40 @@ export function ProjectOverview() {
             <Sliders className="size-4" />
             Personalizar
           </Button>
-          <Button size="lg">
+          <Button size="lg" onClick={() => setProjectModalOpen(true)}>
             <Plus className="size-4" />
             Novo projeto
           </Button>
         </div>
       </div>
+      <NewProjectDialog
+        open={projectModalOpen}
+        onClose={() => setProjectModalOpen(false)}
+        onCreated={(project) => {
+          setDashboard((current) =>
+            current
+              ? {
+                  ...current,
+                  project,
+                  stats: { ...current.stats, projects: current.stats.projects + 1 },
+                }
+              : {
+                  project,
+                  stats: {
+                    projects: 1,
+                    tasks: 0,
+                    images: 0,
+                    jobs_running: 0,
+                    pending_review: 0,
+                    dataset_releases: 0,
+                    training_runs: 0,
+                  },
+                  class_distribution: [],
+                  recent_jobs: [],
+                },
+          )
+        }}
+      />
 
       {/* Recommended action + KPIs */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-6">
@@ -93,7 +202,7 @@ export function ProjectOverview() {
           </div>
         </Card>
 
-        {kpis.map((kpi) => (
+        {overviewKpis.map((kpi) => (
           <Card key={kpi.label} className="flex flex-col gap-3 xl:col-span-1">
             <div className="flex items-start justify-between">
               <span className="text-xs font-medium text-muted-foreground text-pretty">{kpi.label}</span>
@@ -109,6 +218,30 @@ export function ProjectOverview() {
           </Card>
         ))}
       </div>
+      {currentProjectStorage && (
+        <Card>
+          <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-3">
+              <span className="flex size-10 items-center justify-center rounded-lg bg-surface-blue text-brand-blue">
+                <HardDrive className="size-5" />
+              </span>
+              <div>
+                <p className="text-sm font-medium text-foreground">Storage do projeto</p>
+                <p className="text-xs text-muted-foreground">{currentProjectStorage.path}</p>
+              </div>
+            </div>
+            <div className="flex min-w-48 flex-col gap-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-muted-foreground">Uso</span>
+                <span className="font-medium tabular-nums text-foreground">
+                  {currentProjectStorage.usedGb.toFixed(1)} / {currentProjectStorage.quotaGb} GB
+                </span>
+              </div>
+              <ProgressBar value={currentProjectStorage.percent} color="bg-brand-blue" />
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Model / trainings / release */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -126,7 +259,7 @@ export function ProjectOverview() {
               <p className="text-3xl font-semibold tabular-nums">0,83</p>
             </div>
             <div className="-mx-2">
-              <SparkLineChart data={modelEvolution} dataKey="map" color="var(--brand-blue)" highlightLast />
+              <SparkLineChart data={modelEvolutionItems} dataKey="map" color="var(--brand-blue)" highlightLast />
             </div>
             <div className="flex items-center justify-between text-xs text-muted-foreground">
               <span>Dataset: release_014</span>
@@ -195,7 +328,7 @@ export function ProjectOverview() {
           </CardHeader>
           <CardContent className="min-w-0">
             <MetricLineChart
-              data={modelEvolution}
+              data={modelEvolutionItems}
               xKey="version"
               height={220}
               series={[{ key: "map", label: "mAP50-95", color: "var(--brand-blue)" }]}
@@ -209,14 +342,16 @@ export function ProjectOverview() {
           </CardHeader>
           <CardContent className="flex flex-col items-center gap-4">
             <div className="relative w-44 max-w-full">
-              <DonutChart data={classes.map((c) => ({ label: c.name, value: c.count, color: c.color }))} />
+              <DonutChart data={classItems.map((c) => ({ label: c.name, value: c.count, color: c.color }))} />
               <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-                <span className="text-lg font-semibold tabular-nums">43.718</span>
+                <span className="text-lg font-semibold tabular-nums">
+                  {formatPtNumber(classItems.reduce((total, item) => total + item.count, 0))}
+                </span>
                 <span className="text-xs text-muted-foreground">objetos</span>
               </div>
             </div>
             <ul className="flex w-full flex-wrap items-center justify-center gap-x-4 gap-y-2 text-sm">
-              {classes.slice(0, 6).map((c) => (
+              {classItems.slice(0, 6).map((c) => (
                 <li key={c.name} className="flex items-center gap-2 whitespace-nowrap">
                   <span className="flex items-center gap-2 text-foreground">
                     <span className="size-2 rounded-full" style={{ background: c.color }} />
@@ -234,7 +369,7 @@ export function ProjectOverview() {
             <CardTitle>Atividades recentes</CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-1">
-            {activities.map((a) => (
+            {activityItems.map((a) => (
               <div key={a.title} className="flex items-center gap-3 rounded-lg py-2">
                 <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground [&_svg]:size-4">
                   <a.icon />
@@ -243,6 +378,9 @@ export function ProjectOverview() {
                 <span className="shrink-0 text-xs text-muted-foreground">{a.time}</span>
               </div>
             ))}
+            {activityItems.length === 0 && (
+              <p className="text-sm text-muted-foreground">Nenhuma atividade recente sincronizada.</p>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -253,7 +391,7 @@ export function ProjectOverview() {
           <CardTitle>Atenções requeridas</CardTitle>
         </CardHeader>
         <CardContent className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
-          {attentions.map((a) => (
+          {attentionItems.map((a) => (
             <Link
               key={a.title}
               href={a.href}
@@ -269,8 +407,194 @@ export function ProjectOverview() {
               <ChevronRight className="size-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
             </Link>
           ))}
+          {attentionItems.length === 0 && (
+            <p className="text-sm text-muted-foreground">Nenhum alerta operacional sincronizado.</p>
+          )}
         </CardContent>
       </Card>
     </div>
   )
+}
+
+function NewProjectDialog({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean
+  onClose: () => void
+  onCreated: (project: BackendProject) => void
+}) {
+  const [name, setName] = React.useState("")
+  const [storagePath, setStoragePath] = React.useState("")
+  const [quotaGb, setQuotaGb] = React.useState(40)
+  const [customQuota, setCustomQuota] = React.useState("")
+  const [creating, setCreating] = React.useState(false)
+  const [error, setError] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    if (!open) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose()
+    }
+    document.addEventListener("keydown", onKey)
+    return () => document.removeEventListener("keydown", onKey)
+  }, [open, onClose])
+
+  if (!open) return null
+
+  async function chooseFolder() {
+    const picker = (window as DirectoryPickerWindow).showDirectoryPicker
+    if (picker) {
+      const handle = await picker()
+      setStoragePath((current) => current || handle.name)
+      return
+    }
+    setError("Seu navegador nao expoe o caminho da pasta. Informe o caminho manualmente.")
+  }
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault()
+    const resolvedQuota = Number(customQuota || quotaGb)
+    if (!name.trim() || !storagePath.trim() || !Number.isFinite(resolvedQuota) || resolvedQuota <= 0) {
+      setError("Preencha nome, pasta e limite de storage.")
+      return
+    }
+    setCreating(true)
+    setError(null)
+    try {
+      const project = await createProject({
+        name: name.trim(),
+        storage_path: storagePath.trim(),
+        storage_quota_gb: Math.round(resolvedQuota),
+        warn_at_percent: 85,
+      })
+      onCreated(project)
+      setName("")
+      setStoragePath("")
+      setQuotaGb(40)
+      setCustomQuota("")
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Erro ao criar projeto.")
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  return (
+    <div role="dialog" aria-modal="true" aria-label="Novo projeto" className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <button type="button" aria-label="Fechar" onClick={onClose} className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+      <form onSubmit={submit} className="relative z-10 flex w-full max-w-xl flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-xl">
+        <div className="flex items-start justify-between gap-4 border-b border-border p-5">
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">Novo projeto</h2>
+            <p className="mt-0.5 text-sm text-muted-foreground">
+              Defina onde o dataset sera armazenado e o limite maximo de crescimento.
+            </p>
+          </div>
+          <button type="button" onClick={onClose} className="rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+            <X className="size-4" />
+          </button>
+        </div>
+
+        <div className="flex flex-col gap-4 p-5">
+          <label className="flex flex-col gap-1.5">
+            <span className="text-sm font-medium text-foreground">Nome</span>
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="Ex.: Veiculos - Rodovia 2026"
+              className="h-10 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue"
+            />
+          </label>
+
+          <label className="flex flex-col gap-1.5">
+            <span className="text-sm font-medium text-foreground">Pasta do projeto</span>
+            <div className="flex gap-2">
+              <input
+                value={storagePath}
+                onChange={(event) => setStoragePath(event.target.value)}
+                placeholder="Ex.: D:\\datasets\\rodovia-2026"
+                className="h-10 min-w-0 flex-1 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue"
+              />
+              <Button type="button" variant="outline" onClick={() => void chooseFolder()}>
+                <FolderOpen className="size-4" />
+                Escolher
+              </Button>
+            </div>
+          </label>
+
+          <div className="flex flex-col gap-2">
+            <span className="text-sm font-medium text-foreground">Limite de storage</span>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {quotaPresets.map((value) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => {
+                    setQuotaGb(value)
+                    setCustomQuota("")
+                  }}
+                  className={`rounded-lg border px-3 py-2 text-sm font-medium transition-colors ${
+                    !customQuota && quotaGb === value
+                      ? "border-brand-blue bg-surface-blue text-brand-blue"
+                      : "border-border hover:bg-muted"
+                  }`}
+                >
+                  {value} GB
+                </button>
+              ))}
+            </div>
+            <label className="flex items-center gap-2">
+              <input
+                value={customQuota}
+                onChange={(event) => setCustomQuota(event.target.value)}
+                inputMode="numeric"
+                placeholder="Outro valor"
+                className="h-10 w-36 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue"
+              />
+              <span className="text-sm text-muted-foreground">GB</span>
+            </label>
+          </div>
+
+          {error && <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-border p-4">
+          <Button type="button" variant="outline" onClick={onClose}>
+            Cancelar
+          </Button>
+          <Button type="submit" disabled={creating}>
+            {creating ? "Criando..." : "Criar projeto"}
+          </Button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+function storageFromProject(project: BackendProject | null) {
+  const storage = project?.raw?.storage
+  if (!storage || typeof storage !== "object") return null
+  const data = storage as Record<string, unknown>
+  const quotaGb = numberFromUnknown(data.quota_gb)
+  if (!quotaGb) return null
+  const usedBytes = numberFromUnknown(data.used_bytes) ?? 0
+  const usedGb = usedBytes / 1024 ** 3
+  return {
+    path: String(data.path ?? "--"),
+    quotaGb,
+    usedGb,
+    percent: Math.min(100, Math.round((usedGb / quotaGb) * 100)),
+  }
+}
+
+function numberFromUnknown(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
 }

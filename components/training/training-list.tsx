@@ -9,11 +9,40 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/snowui/input"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { StatusBadge, ProgressBar } from "@/components/app/primitives"
-import { trainings, releases } from "@/lib/mock-data"
+import { fetchDatasetReleases, fetchTrainingRuns, mockFallbackEnabled } from "@/lib/api/client"
+import { formatDateTimePt, toUiJobStatus } from "@/lib/api/status"
+import type { BackendDatasetRelease, BackendTrainingRun } from "@/lib/api/types"
+import { trainings, releases as mockReleases, type JobStatus } from "@/lib/mock-data"
 import { cn } from "@/lib/utils"
 
 export function TrainingList() {
   const [pickerOpen, setPickerOpen] = React.useState(false)
+  const [backendRuns, setBackendRuns] = React.useState<BackendTrainingRun[] | null>(null)
+  const [backendReleases, setBackendReleases] = React.useState<BackendDatasetRelease[] | null>(null)
+  const useMocks = mockFallbackEnabled()
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    Promise.all([fetchTrainingRuns(controller.signal), fetchDatasetReleases(controller.signal)])
+      .then(([runs, datasetReleases]) => {
+        setBackendRuns(runs)
+        setBackendReleases(datasetReleases)
+      })
+      .catch(() => {
+        setBackendRuns(null)
+        setBackendReleases(null)
+      })
+    return () => controller.abort()
+  }, [])
+
+  const items = React.useMemo(
+    () => (backendRuns?.length ? backendRuns.map(toTrainingListItem) : useMocks ? trainings.map(toMockTrainingListItem) : []),
+    [backendRuns, useMocks],
+  )
+  const running = items.filter((item) => item.status === "executando" || item.status === "na-fila").length
+  const completed = items.filter((item) => item.status === "concluido").length
+  const bestMap = items.reduce((best, item) => Math.max(best, item.bestMapValue ?? 0), 0)
+
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -29,12 +58,17 @@ export function TrainingList() {
         </Button>
       </div>
 
-      <ReleasePicker open={pickerOpen} onClose={() => setPickerOpen(false)} />
+      <ReleasePicker
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        backendReleases={backendReleases}
+        useMocks={useMocks}
+      />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <MetricCard label="Em execução" value="1" hint="Treinamento #18" />
-        <MetricCard label="Concluídos" value="16" hint="últimos 30 dias" />
-        <MetricCard label="Melhor mAP50-95" value="0.83" hint="YOLO11m v18" />
+        <MetricCard label="Em execução" value={String(running)} hint="fila local" />
+        <MetricCard label="Concluídos" value={String(completed)} hint="histórico local" />
+        <MetricCard label="Melhor mAP50-95" value={bestMap ? bestMap.toFixed(3) : "--"} hint="MLflow + banco" />
         <MetricCard label="Tempo médio" value="1h 12m" hint="por treinamento" />
       </div>
 
@@ -51,10 +85,10 @@ export function TrainingList() {
         </CardHeader>
         <CardContent className="p-0">
           <div className="divide-y divide-border">
-            {trainings.map((t) => (
+            {items.map((t) => (
               <Link
                 key={t.id}
-                href={`/treinar/${t.slug}`}
+                href={t.href}
                 className="flex flex-col gap-4 px-5 py-4 transition-colors hover:bg-muted/40 sm:flex-row sm:items-center"
               >
                 <div className="flex min-w-0 flex-1 items-center gap-3">
@@ -98,6 +132,9 @@ export function TrainingList() {
                 </div>
               </Link>
             ))}
+            {items.length === 0 && (
+              <p className="px-5 py-6 text-center text-sm text-muted-foreground">Nenhum treinamento registrado.</p>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -105,15 +142,161 @@ export function TrainingList() {
   )
 }
 
+type TrainingListItem = {
+  id: string
+  href: string
+  name: string
+  status: JobStatus
+  model: string
+  dataset: string
+  startedAt: string
+  epoch: string
+  epochs: string
+  bestMap: string
+  bestMapValue: number | null
+  elapsed: string
+  device: string
+  progress: number
+}
+
+function toMockTrainingListItem(training: (typeof trainings)[number]): TrainingListItem {
+  return {
+    id: training.id,
+    href: `/treinar/${training.slug}`,
+    name: training.name,
+    status: training.status,
+    model: training.model,
+    dataset: training.dataset,
+    startedAt: training.startedAt,
+    epoch: String(training.epoch),
+    epochs: String(training.epochs),
+    bestMap: String(training.bestMap),
+    bestMapValue: metricNumber(training.bestMap),
+    elapsed: training.elapsed,
+    device: training.device,
+    progress: training.progress,
+  }
+}
+
+function toTrainingListItem(run: BackendTrainingRun): TrainingListItem {
+  const epochs = numberFromRecord(run.config, "epochs", 100)
+  const epoch = numberFromRecord(run.metrics, "epoch", Math.round((run.progress / 100) * epochs))
+  const bestMapValue = bestMapFromMetrics(run.metrics)
+  const model = run.base_model.replace(/\.pt$/i, "")
+  return {
+    id: run.id,
+    href: `/treinar/${run.id}`,
+    name: String(run.config.model_name ?? `Training ${model}`),
+    status: toUiJobStatus(run.status),
+    model,
+    dataset: run.dataset_release_id.slice(0, 8),
+    startedAt: formatDateTimePt(run.created_at),
+    epoch: String(epoch),
+    epochs: String(epochs),
+    bestMap: bestMapValue === null ? "--" : bestMapValue.toFixed(3),
+    bestMapValue,
+    elapsed: run.mlflow_run_id ? `MLflow ${run.mlflow_run_id.slice(0, 8)}` : "--",
+    device: String(run.config.device ?? "auto"),
+    progress: Math.round(run.progress),
+  }
+}
+
+function numberFromRecord(record: Record<string, unknown>, key: string, fallback: number) {
+  return metricNumber(record[key]) ?? fallback
+}
+
+function bestMapFromMetrics(metrics: Record<string, unknown>) {
+  const keys = ["metrics/mAP50-95(B)", "map5095", "box_map", "box.map", "mAP50-95"]
+  for (const key of keys) {
+    const value = metricNumber(metrics[key])
+    if (value !== null) return value
+  }
+  return null
+}
+
+function metricNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function toReleaseOption(release: BackendDatasetRelease) {
+  const counts = release.snapshot.counts
+  const countMap = counts && typeof counts === "object" ? (counts as Record<string, unknown>) : {}
+  const artifactSize = artifactSizeFromSnapshot(release.snapshot)
+  return {
+    id: release.id,
+    name: release.name,
+    status: release.status,
+    images: metricNumber(countMap.images) ?? 0,
+    objects: metricNumber(countMap.annotations) ?? metricNumber(countMap.objects) ?? 0,
+    size: artifactSize,
+    date: formatDateTimePt(release.created_at),
+  }
+}
+
+function artifactSizeFromSnapshot(snapshot: Record<string, unknown>) {
+  const artifacts = Array.isArray(snapshot.artifacts) ? snapshot.artifacts : []
+  const bytes = artifacts.reduce((total, artifact) => {
+    if (!artifact || typeof artifact !== "object") return total
+    return total + (metricNumber((artifact as Record<string, unknown>).size_bytes) ?? 0)
+  }, 0)
+  if (!bytes) return "--"
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${bytes} B`
+}
+
 const statusLabels: Record<string, { label: string; className: string }> = {
   "em-construcao": { label: "Em construção", className: "bg-warning/15 text-warning" },
   publicado: { label: "Publicado", className: "bg-brand-green/15 text-brand-green" },
   arquivado: { label: "Arquivado", className: "bg-muted text-muted-foreground" },
+  building: { label: "Em construção", className: "bg-warning/15 text-warning" },
+  ready: { label: "Pronto", className: "bg-brand-green/15 text-brand-green" },
+  failed: { label: "Falhou", className: "bg-destructive/15 text-destructive" },
+  canceled: { label: "Cancelado", className: "bg-muted text-muted-foreground" },
 }
 
-function ReleasePicker({ open, onClose }: { open: boolean; onClose: () => void }) {
+function ReleasePicker({
+  open,
+  onClose,
+  backendReleases,
+  useMocks,
+}: {
+  open: boolean
+  onClose: () => void
+  backendReleases: BackendDatasetRelease[] | null
+  useMocks: boolean
+}) {
   const router = useRouter()
-  const [selected, setSelected] = React.useState(releases[0]?.id ?? "")
+  const releaseOptions = React.useMemo(() => {
+    if (backendReleases) {
+      return backendReleases
+        .filter((release) => release.status === "ready" && release.immutable && release.artifact_uri)
+        .map(toReleaseOption)
+    }
+    return useMocks
+      ? mockReleases.map((release) => ({
+      id: release.id,
+      name: release.id,
+      status: release.status,
+      images: release.images,
+      objects: release.objects,
+      size: release.size,
+      date: release.date,
+        }))
+      : []
+  }, [backendReleases, useMocks])
+  const [selected, setSelected] = React.useState("")
+
+  React.useEffect(() => {
+    if (!open) return
+    setSelected((current) => (releaseOptions.some((release) => release.id === current) ? current : releaseOptions[0]?.id ?? ""))
+  }, [open, releaseOptions])
 
   React.useEffect(() => {
     if (!open) return
@@ -159,7 +342,12 @@ function ReleasePicker({ open, onClose }: { open: boolean; onClose: () => void }
         </div>
 
         <div className="flex max-h-[50vh] flex-col gap-2 overflow-y-auto p-4">
-          {releases.map((r, i) => {
+          {releaseOptions.length === 0 && (
+            <div className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
+              Nenhum DatasetRelease pronto e imutável foi encontrado.
+            </div>
+          )}
+          {releaseOptions.map((r, i) => {
             const active = selected === r.id
             const s = statusLabels[r.status] ?? statusLabels.arquivado
             return (
@@ -177,7 +365,7 @@ function ReleasePicker({ open, onClose }: { open: boolean; onClose: () => void }
                 </div>
                 <div className="min-w-0 flex-1">
                   <p className="flex flex-wrap items-center gap-2 font-medium text-foreground">
-                    {r.id}
+                    {r.name}
                     {i === 0 && (
                       <span className="rounded-full bg-brand-green/15 px-1.5 py-0.5 text-xs font-medium text-brand-green">
                         Mais recente

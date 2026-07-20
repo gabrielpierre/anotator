@@ -10,6 +10,9 @@ import { TabNav } from "@/components/app/tab-nav"
 import { MetricLineChart, SparkLineChart } from "@/components/app/charts"
 import { DonutChart } from "@/components/snowui/charts"
 import { ConfusionMatrix } from "@/components/training/confusion-matrix"
+import { fetchTrainingRun, mockFallbackEnabled, trainingRunEventsUrl } from "@/lib/api/client"
+import { formatDateTimePt, toUiJobStatus } from "@/lib/api/status"
+import type { BackendTrainingRun } from "@/lib/api/types"
 import {
   trainingCurves,
   trainingMetrics,
@@ -81,14 +84,51 @@ const additionalInfo = [
 
 export function TrainingDetail({ id }: { id: string }) {
   const [tab, setTab] = React.useState("overview")
+  const [run, setRun] = React.useState<BackendTrainingRun | null>(null)
+  const useMocks = mockFallbackEnabled()
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    fetchTrainingRun(id, controller.signal)
+      .then(setRun)
+      .catch(() => setRun(null))
+
+    const events = new EventSource(trainingRunEventsUrl(id))
+    events.addEventListener("snapshot", (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as Partial<BackendTrainingRun>
+      setRun((current) => (current ? { ...current, ...payload } : current))
+    })
+    events.onerror = () => events.close()
+    return () => {
+      controller.abort()
+      events.close()
+    }
+  }, [id])
+
+  if (!run && !useMocks) {
+    return (
+      <div className="flex flex-col gap-4 p-4 md:p-6">
+        <h1 className="text-2xl font-semibold tracking-tight">Treinamento #{id}</h1>
+        <Card>
+          <CardContent className="p-6 text-sm text-muted-foreground">
+            Nenhum treinamento encontrado no backend local.
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
+  const progress = Math.round(run?.progress ?? 37)
+  const displayKpis = run ? kpisFromRun(run) : kpis
+  const displayConfig = run ? configFromRun(run) : config
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       {/* Header */}
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-semibold tracking-tight">Treinamento #{id}</h1>
-          <StatusBadge status="executando" />
+          <h1 className="text-2xl font-semibold tracking-tight">Treinamento #{run?.id.slice(0, 8) ?? id}</h1>
+          <StatusBadge status={run ? toUiJobStatus(run.status) : "executando"} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline">
@@ -109,7 +149,7 @@ export function TrainingDetail({ id }: { id: string }) {
       {/* KPI strip */}
       <Card className="p-0">
         <div className="grid grid-cols-2 divide-x divide-y divide-border sm:grid-cols-3 lg:grid-cols-7 lg:divide-y-0">
-          {kpis.map((k) => (
+          {displayKpis.map((k) => (
             <div key={k.label} className="flex flex-col gap-1 p-4">
               <span className="text-xs text-muted-foreground">{k.label}</span>
               <span className="text-sm font-semibold tabular-nums text-foreground">{k.value}</span>
@@ -118,9 +158,9 @@ export function TrainingDetail({ id }: { id: string }) {
           <div className="col-span-2 flex flex-col justify-center gap-2 p-4 sm:col-span-3 lg:col-span-1">
             <div className="flex items-center justify-between text-xs">
               <span className="text-muted-foreground">Progresso geral</span>
-              <span className="font-semibold tabular-nums text-foreground">37%</span>
+              <span className="font-semibold tabular-nums text-foreground">{progress}%</span>
             </div>
-            <ProgressBar value={37} color="bg-brand-green" />
+            <ProgressBar value={progress} color="bg-brand-green" />
           </div>
         </div>
       </Card>
@@ -135,8 +175,8 @@ export function TrainingDetail({ id }: { id: string }) {
           {tab === "per-class" && <PerClassTab />}
           {tab === "resources" && <ResourcesTab />}
           {tab === "logs" && <LogsTab />}
-          {tab === "artifacts" && <ArtifactsTab />}
-          {tab === "config" && <ConfigTab />}
+          {tab === "artifacts" && <ArtifactsTab run={run} />}
+          {tab === "config" && <ConfigTab run={run} />}
         </div>
 
         {/* Right rail */}
@@ -150,7 +190,7 @@ export function TrainingDetail({ id }: { id: string }) {
               </button>
             </CardHeader>
             <CardContent className="divide-y divide-border">
-              {config.slice(0, 9).map((c) => (
+              {displayConfig.slice(0, 9).map((c) => (
                 <StatRow key={c.label} label={c.label} value={c.value} />
               ))}
               <button className="pt-3 text-xs font-medium text-brand-blue hover:underline">
@@ -198,6 +238,59 @@ export function TrainingDetail({ id }: { id: string }) {
       </div>
     </div>
   )
+}
+
+function kpisFromRun(run: BackendTrainingRun) {
+  const epochs = numberParam(run.config, "epochs", 100)
+  const epoch = numberParam(run.metrics, "epoch", Math.round((run.progress / 100) * epochs))
+  return [
+    { label: "Modelo base", value: run.base_model },
+    { label: "Dataset", value: run.dataset_release_id.slice(0, 8) },
+    { label: "Iniciado em", value: formatDateTimePt(run.created_at) },
+    { label: "MLflow", value: run.mlflow_run_id?.slice(0, 10) ?? "--" },
+    { label: "Época", value: `${epoch} / ${epochs}` },
+    { label: "mAP50-95", value: metricText(bestMapFromMetrics(run.metrics)) },
+  ]
+}
+
+function configFromRun(run: BackendTrainingRun) {
+  return [
+    { label: "Modelo base", value: run.base_model },
+    { label: "Dataset", value: run.dataset_release_id },
+    { label: "Épocas", value: String(numberParam(run.config, "epochs", 100)) },
+    { label: "Imagem (imgsz)", value: String(numberParam(run.config, "image_size", 640)) },
+    { label: "Batch size", value: String(numberParam(run.config, "batch_size", 16)) },
+    { label: "Workers", value: String(numberParam(run.config, "workers", 8)) },
+    { label: "Device", value: String(run.config.device ?? "auto") },
+    { label: "Seed", value: String(numberParam(run.config, "seed", 42)) },
+    { label: "MLflow run", value: run.mlflow_run_id ?? "--" },
+  ]
+}
+
+function numberParam(record: Record<string, unknown>, key: string, fallback: number) {
+  const value = record[key]
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return fallback
+}
+
+function bestMapFromMetrics(metrics: Record<string, unknown>) {
+  for (const key of ["metrics/mAP50-95(B)", "map5095", "box_map", "box.map", "mAP50-95"]) {
+    const value = metrics[key]
+    if (typeof value === "number" && Number.isFinite(value)) return value
+    if (typeof value === "string") {
+      const parsed = Number(value)
+      if (Number.isFinite(parsed)) return parsed
+    }
+  }
+  return null
+}
+
+function metricText(value: number | null) {
+  return value === null ? "--" : value.toFixed(3)
 }
 
 function OverviewTab() {
@@ -500,11 +593,33 @@ const artifacts = [
   { name: "args.yaml", desc: "Configuração do treino", size: "4 KB" },
 ]
 
-function ArtifactsTab() {
+function artifactsFromRun(run: BackendTrainingRun) {
+  return run.artifacts.map((artifact, index) => {
+    const row = artifact && typeof artifact === "object" ? (artifact as Record<string, unknown>) : {}
+    const name = String(row.name ?? row.path ?? `artifact-${index + 1}`)
+    return {
+      name,
+      desc: String(row.uri ?? row.path ?? "Artefato MLflow"),
+      size: formatBytes(row.size_bytes),
+    }
+  })
+}
+
+function formatBytes(value: unknown) {
+  const bytes = typeof value === "number" && Number.isFinite(value) ? value : 0
+  if (!bytes) return "--"
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${bytes} B`
+}
+
+function ArtifactsTab({ run }: { run: BackendTrainingRun | null }) {
+  const rows = run && run.artifacts.length > 0 ? artifactsFromRun(run) : artifacts
   return (
     <Card className="p-0">
       <div className="divide-y divide-border">
-        {artifacts.map((a) => (
+        {rows.map((a) => (
           <div key={a.name} className="flex items-center gap-3 px-5 py-3.5">
             <div className="flex size-9 items-center justify-center rounded-lg bg-muted font-mono text-[10px] text-muted-foreground">
               {a.name.split(".").pop()}
@@ -522,7 +637,8 @@ function ArtifactsTab() {
   )
 }
 
-function ConfigTab() {
+function ConfigTab({ run }: { run: BackendTrainingRun | null }) {
+  const rows = run ? configFromRun(run) : config
   return (
     <Card>
       <CardHeader>
@@ -530,7 +646,7 @@ function ConfigTab() {
       </CardHeader>
       <CardContent className="grid grid-cols-1 gap-x-8 sm:grid-cols-2">
         <div className="divide-y divide-border">
-          {config.map((c) => (
+          {rows.map((c) => (
             <StatRow key={c.label} label={c.label} value={c.value} />
           ))}
         </div>

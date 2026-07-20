@@ -1,6 +1,5 @@
 "use client"
 
-import Image from "next/image"
 import { useCallback, useEffect, useRef, useState } from "react"
 import {
   MousePointer2,
@@ -25,6 +24,17 @@ import {
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { classes } from "@/lib/mock-data"
+import {
+  apiAssetUrl,
+  createInferenceRun,
+  deleteInferenceSuggestions,
+  fetchInferenceSuggestions,
+  fetchTasks,
+  jobsEventsUrl,
+  mockFallbackEnabled,
+} from "@/lib/api/client"
+import { labelsFromTasks } from "@/lib/api/status"
+import type { BackendInferenceSuggestion, BackendTask } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 import {
   AutoAnnotationCard,
@@ -90,8 +100,13 @@ const handles: { id: Handle; cls: string; cursor: string }[] = [
 const POLY_CLOSE_DIST = 0.02
 
 export function AnnotateView() {
+  const useMocks = mockFallbackEnabled()
+  const [tasks, setTasks] = useState<BackendTask[] | null>(null)
+  const currentTask = tasks?.[0] ?? null
+  const totalImages = Math.max(1, currentTask?.size ?? (useMocks ? 1250 : 1))
+  const previewSrc = apiAssetUrl(currentTask?.preview_url) ?? (useMocks ? "/street-scene.png" : "/placeholder.svg")
   const [tool, setTool] = useState<ToolKey>("box")
-  const [classList, setClassList] = useState<ClassItem[]>(initialClassList)
+  const [classList, setClassList] = useState<ClassItem[]>(() => (useMocks ? initialClassList : []))
   // Nenhuma classe ativa por padrão: o usuário desenha primeiro e escolhe a classe depois.
   const [activeClass, setActiveClass] = useState<string | null>(null)
   const colorFor = useCallback(
@@ -119,8 +134,8 @@ export function AnnotateView() {
   // Adição de classe/subclasse
   const [addingClass, setAddingClass] = useState<{ parent: string | null } | null>(null)
   const [newClassName, setNewClassName] = useState("")
-  const [shapes, setShapes] = useState<Shape[]>(initialShapes)
-  const [selectedId, setSelectedId] = useState<number | null>(88213)
+  const [shapes, setShapes] = useState<Shape[]>(() => (useMocks ? initialShapes : []))
+  const [selectedId, setSelectedId] = useState<number | null>(useMocks ? 88213 : null)
   const selectedIdRef = useRef(selectedId)
   selectedIdRef.current = selectedId
   const [view, setView] = useState({ s: 1, tx: 0, ty: 0 })
@@ -133,13 +148,33 @@ export function AnnotateView() {
   const [saved, setSaved] = useState(false)
 
   // ---- Navegação de imagens ----
-  const TOTAL_IMAGES = 1250
-  const [imageIndex, setImageIndex] = useState(342)
+  const [imageIndex, setImageIndex] = useState(useMocks ? 342 : 0)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
+    return () => controller.abort()
+  }, [])
+
+  useEffect(() => {
+    const labels = labelsFromTasks(tasks)
+    if (labels.length > 0) {
+      setClassList(labels.map((label) => ({ name: label.name, color: label.color })))
+      setActiveClass(null)
+    }
+  }, [tasks])
+
+  useEffect(() => {
+    setImageIndex((index) => Math.min(Math.max(index, 1), totalImages))
+  }, [totalImages])
 
   // ---- Autoanotação: sugestões e camadas de predição ----
-  const [suggestions, setSuggestions] = useState<Suggestion[]>([])
+  const [backendSuggestions, setBackendSuggestions] = useState<BackendInferenceSuggestion[]>([])
   const [hiddenLayers, setHiddenLayers] = useState<string[]>([])
-  const nextSuggestionId = useRef(95000)
+  const currentFrame = Math.max(0, imageIndex - 1)
+  const suggestions = backendSuggestions
+    .filter((suggestion) => suggestion.frame === currentFrame)
+    .map(mapBackendSuggestion)
 
   const layerUnit = (m: ModelInfo) =>
     m.task === "Segmentação" ? "máscaras" : m.task === "Classificação" ? "labels" : "sugestões"
@@ -154,7 +189,46 @@ export function AnnotateView() {
     }))
     .filter((l) => l.count > 0)
 
-  const generateSuggestions = (params: {
+  const loadSuggestions = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!currentTask) {
+        setBackendSuggestions([])
+        return
+      }
+      const rows = await fetchInferenceSuggestions({ taskExternalId: currentTask.external_id }, signal)
+      setBackendSuggestions(rows)
+    },
+    [currentTask],
+  )
+
+  useEffect(() => {
+    const controller = new AbortController()
+    loadSuggestions(controller.signal).catch(() => setBackendSuggestions([]))
+    return () => controller.abort()
+  }, [loadSuggestions])
+
+  useEffect(() => {
+    const source = new EventSource(jobsEventsUrl())
+    const onJobs = (event: MessageEvent) => {
+      try {
+        const payload = JSON.parse(event.data) as { jobs?: { kind?: string; status?: string; task_external_id?: string | null }[] }
+        const hasFinishedInference = payload.jobs?.some(
+          (job) =>
+            job.kind === "inference" &&
+            ["succeeded", "failed", "canceled"].includes(String(job.status)) &&
+            job.task_external_id === currentTask?.external_id,
+        )
+        if (hasFinishedInference) void loadSuggestions()
+      } catch {
+        // Ignore malformed SSE snapshots.
+      }
+    }
+    source.addEventListener("jobs", onJobs as EventListener)
+    source.onerror = () => source.close()
+    return () => source.close()
+  }, [currentTask?.external_id, loadSuggestions])
+
+  const generateSuggestions = async (params: {
     models: ModelInfo[]
     threshold: number
     nmsIou: number
@@ -162,48 +236,37 @@ export function AnnotateView() {
     scope: string
     applyMode: string
     replaceModels: string[]
+    frameStart: number
+    frameEnd: number
   }) => {
-    const pool = params.classes.length > 0 ? params.classes : classList.map((c) => c.name)
-    const timestamp = new Date().toISOString()
-    const created: Suggestion[] = []
-
-    for (const model of params.models) {
-      const count = 3 + Math.floor(Math.random() * 4)
-      for (let i = 0; i < count; i++) {
-        const conf = Math.round((params.threshold + Math.random() * (1 - params.threshold)) * 100) / 100
-        created.push({
-          id: nextSuggestionId.current++,
-          cls: pool[Math.floor(Math.random() * pool.length)],
-          conf,
-          x: clamp(0.05 + Math.random() * 0.75),
-          y: clamp(0.2 + Math.random() * 0.5),
-          w: 0.06 + Math.random() * 0.12,
-          h: 0.08 + Math.random() * 0.14,
-          status: "proposed",
-          origin: {
-            model_id: model.id,
-            model_version: model.version,
-            confidence: conf,
-            threshold_used: params.threshold,
-            nms_iou: params.nmsIou,
-            timestamp,
-            scope: params.scope,
-            user_id: "gabriel",
-          },
-        })
-      }
-    }
-
-    setSuggestions((prev) => [
-      ...prev.filter((s) => !params.replaceModels.includes(s.origin.model_id)),
-      ...created,
-    ])
+    if (!currentTask) throw new Error("Nenhuma task CVAT sincronizada para inferencia.")
+    const jobs = await Promise.all(
+      params.models.map((model) =>
+        createInferenceRun({
+          task_external_id: currentTask.external_id,
+          model_id: model.id,
+          model_version: model.version,
+          model_family: modelFamilyFor(model),
+          base_model: baseModelFor(model),
+          frame_start: params.frameStart,
+          frame_end: params.frameEnd,
+          threshold: params.threshold,
+          nms_iou: params.nmsIou,
+          classes: params.classes,
+          apply_mode: params.replaceModels.includes(model.id) || params.applyMode === "substituir" ? "replace" : "append",
+          confirm_replace: params.replaceModels.includes(model.id) || params.applyMode === "substituir",
+          user_id: "local-user",
+          write_to_cvat: params.applyMode === "aceitas",
+        }),
+      ),
+    )
     setHiddenLayers((prev) => prev.filter((id) => !params.models.some((m) => m.id === id)))
 
     return {
-      created: created.length,
-      ignored: Math.floor(Math.random() * 5),
-      conflicts: params.replaceModels.length > 0 ? 0 : Math.floor(Math.random() * 3),
+      created: 0,
+      ignored: 0,
+      conflicts: 0,
+      jobId: jobs.map((job) => job.id).join(", "),
     }
   }
 
@@ -694,19 +757,19 @@ export function AnnotateView() {
               <ChevronLeft className="size-4" />
             </Button>
             <span className="tabular-nums text-muted-foreground">
-              {imageIndex.toLocaleString("pt-BR")} / {TOTAL_IMAGES.toLocaleString("pt-BR")}
+              {imageIndex.toLocaleString("pt-BR")} / {totalImages.toLocaleString("pt-BR")}
             </span>
             <Button
               variant="ghost"
               size="icon"
               aria-label="Próxima imagem"
-              onClick={() => setImageIndex((i) => Math.min(TOTAL_IMAGES, i + 1))}
-              disabled={imageIndex >= TOTAL_IMAGES}
+              onClick={() => setImageIndex((i) => Math.min(totalImages, i + 1))}
+              disabled={imageIndex >= totalImages}
             >
               <ChevronRight className="size-4" />
             </Button>
             <span className="ml-2 font-medium text-foreground">
-              Imagem {String(imageIndex).padStart(6, "0")}.jpg
+              {currentTask ? currentTask.name : `Imagem ${String(imageIndex).padStart(6, "0")}.jpg`}
             </span>
           </div>
           <div className="flex items-center gap-1">
@@ -760,13 +823,11 @@ export function AnnotateView() {
             }}
             onPointerLeave={() => setCursorNorm(null)}
           >
-            <Image
-              src="/street-scene.png"
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={previewSrc}
               alt="Cena de rua para anotação"
-              fill
-              className="pointer-events-none object-cover"
-              sizes="(max-width: 1024px) 100vw, 896px"
-              priority
+              className="pointer-events-none size-full object-cover"
               draggable={false}
             />
 
@@ -1112,8 +1173,9 @@ export function AnnotateView() {
           </button>
           <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
             {(() => {
-              const windowStart = Math.max(1, Math.min(imageIndex - 4, TOTAL_IMAGES - 9))
-              return Array.from({ length: 10 }, (_, i) => windowStart + i).map((n) => {
+              const windowSize = Math.min(10, totalImages)
+              const windowStart = Math.max(1, Math.min(imageIndex - 4, totalImages - windowSize + 1))
+              return Array.from({ length: windowSize }, (_, i) => windowStart + i).map((n) => {
                 const isCurrent = n === imageIndex
                 return (
                   <button
@@ -1128,7 +1190,7 @@ export function AnnotateView() {
                     )}
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src="/street-scene.png" alt={`Imagem ${n}`} className="size-full object-cover" />
+                    <img src={previewSrc} alt={`Imagem ${n}`} className="size-full object-cover" />
                     <span className="absolute bottom-0 right-0 rounded-tl bg-black/60 px-1 text-[9px] tabular-nums text-white">
                       {n}
                     </span>
@@ -1140,7 +1202,7 @@ export function AnnotateView() {
           <button
             type="button"
             aria-label="Avançar 10 imagens"
-            onClick={() => setImageIndex((i) => Math.min(TOTAL_IMAGES, i + 10))}
+            onClick={() => setImageIndex((i) => Math.min(totalImages, i + 10))}
             className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
           >
             <ChevronsRight className="size-4" />
@@ -1329,12 +1391,15 @@ export function AnnotateView() {
         <AutoAnnotationCard
           classNames={classList.map((c) => c.name)}
           imageIndex={imageIndex}
-          totalImages={TOTAL_IMAGES}
+          totalImages={totalImages}
           layers={predictionLayers}
           suggestionModelIds={[...new Set(suggestions.map((s) => s.origin.model_id))]}
           onGenerate={generateSuggestions}
           onClearSuggestions={() => {
-            setSuggestions([])
+            if (!currentTask) return
+            deleteInferenceSuggestions({ taskExternalId: currentTask.external_id })
+              .then(() => loadSuggestions())
+              .catch(() => setBackendSuggestions([]))
             setHiddenLayers([])
           }}
           onToggleLayer={(modelId) =>
@@ -1343,11 +1408,82 @@ export function AnnotateView() {
             )
           }
           onRemoveLayer={(modelId) => {
-            setSuggestions((prev) => prev.filter((s) => s.origin.model_id !== modelId))
+            if (currentTask) {
+              deleteInferenceSuggestions({ taskExternalId: currentTask.external_id, modelId })
+                .then(() => loadSuggestions())
+                .catch(() =>
+                  setBackendSuggestions((prev) =>
+                    prev.filter((suggestion) => suggestion.model_id !== modelId),
+                  ),
+                )
+            }
             setHiddenLayers((prev) => prev.filter((id) => id !== modelId))
           }}
         />
       </aside>
     </div>
   )
+}
+
+function modelFamilyFor(model: ModelInfo): "detection" | "segmentation" | "classification" | "tracking" {
+  if (model.task.includes("Segment")) return "segmentation"
+  if (model.task.includes("Class")) return "classification"
+  return "detection"
+}
+
+function baseModelFor(model: ModelInfo) {
+  if (model.id === "yolo11m") return "yolo11m.pt"
+  if (model.id === "yoloseg") return "yolo11n-seg.pt"
+  if (model.id === "resnet50") return "resnet50.pt"
+  return "yolo11n.pt"
+}
+
+function mapBackendSuggestion(suggestion: BackendInferenceSuggestion): Suggestion {
+  const rawBox = suggestion.raw.bbox_norm
+  const box =
+    rawBox && typeof rawBox === "object"
+      ? (rawBox as { x?: number; y?: number; w?: number; h?: number })
+      : pointsToBox(suggestion.points)
+  return {
+    id: numericIdFromString(suggestion.id),
+    cls: suggestion.label_name ?? "unknown",
+    conf: suggestion.score ?? 0,
+    x: clamp(Number(box.x ?? 0)),
+    y: clamp(Number(box.y ?? 0)),
+    w: clamp(Number(box.w ?? 0.05)),
+    h: clamp(Number(box.h ?? 0.05)),
+    status: "proposed",
+    origin: {
+      model_id: suggestion.model_id,
+      model_version: suggestion.model_version,
+      confidence: suggestion.score ?? 0,
+      threshold_used: suggestion.threshold ?? 0,
+      nms_iou: suggestion.nms_iou ?? 0,
+      timestamp: String(suggestion.origin.timestamp ?? suggestion.created_at),
+      scope: `frame ${suggestion.frame}`,
+      user_id: String(suggestion.origin.user_id ?? "model"),
+    },
+  }
+}
+
+function pointsToBox(points: unknown[]) {
+  const values = points.map(Number).filter(Number.isFinite)
+  if (values.length >= 4) {
+    const [x1, y1, x2, y2] = values
+    const width = Math.max(1, Math.max(x1, x2))
+    const height = Math.max(1, Math.max(y1, y2))
+    return {
+      x: Math.min(x1, x2) / width,
+      y: Math.min(y1, y2) / height,
+      w: Math.abs(x2 - x1) / width,
+      h: Math.abs(y2 - y1) / height,
+    }
+  }
+  return { x: 0, y: 0, w: 0.05, h: 0.05 }
+}
+
+function numericIdFromString(value: string) {
+  let hash = 0
+  for (let i = 0; i < value.length; i++) hash = (hash * 31 + value.charCodeAt(i)) >>> 0
+  return hash
 }

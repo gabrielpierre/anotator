@@ -1,5 +1,6 @@
 "use client"
 
+import * as React from "react"
 import { Boxes, Search, Upload, Download, Star, MoreHorizontal } from "lucide-react"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
@@ -8,15 +9,105 @@ import { Badge } from "@/components/snowui/badge"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, StatusBadge } from "@/components/app/primitives"
 import { SparkLineChart } from "@/components/app/charts"
+import { fetchModelVersions, mockFallbackEnabled } from "@/lib/api/client"
+import { formatDateTimePt } from "@/lib/api/status"
+import type { BackendModelVersion } from "@/lib/api/types"
 import { models, modelEvolution } from "@/lib/mock-data"
 
 const familyTone: Record<string, "info" | "accent" | "neutral"> = {
   Detecção: "info",
   Classificação: "accent",
   Segmentação: "neutral",
+  Tracking: "neutral",
+}
+
+type ModelRow = {
+  id: string
+  family: string
+  map: string
+  mapValue: number
+  dataset: string
+  status: "aprovado" | "publicado" | "arquivado" | "em-construcao"
+  size: string
+  createdAt: string
+  best: boolean
+}
+
+function toMockModelRow(model: (typeof models)[number]): ModelRow {
+  return {
+    id: model.id,
+    family: model.family,
+    map: model.map,
+    mapValue: Number(model.map) || 0,
+    dataset: model.dataset,
+    status: model.status,
+    size: model.size,
+    createdAt: model.createdAt,
+    best: model.best,
+  }
+}
+
+function toModelRow(model: BackendModelVersion): ModelRow {
+  const mapValue = bestMapFromMetrics(model.metrics)
+  return {
+    id: `${model.name} ${model.version}`,
+    family: familyLabel(model.family),
+    map: mapValue === null ? "--" : mapValue.toFixed(3),
+    mapValue: mapValue ?? 0,
+    dataset: model.dataset_release_id?.slice(0, 8) ?? "--",
+    status: model.status === "registered" ? "publicado" : model.status === "archived" ? "arquivado" : "em-construcao",
+    size: model.artifact_uri ? "MLflow" : "--",
+    createdAt: formatDateTimePt(model.created_at),
+    best: false,
+  }
+}
+
+function familyLabel(family: string) {
+  switch (family) {
+    case "classification":
+      return "Classificação"
+    case "segmentation":
+      return "Segmentação"
+    case "tracking":
+      return "Tracking"
+    default:
+      return "Detecção"
+  }
+}
+
+function bestMapFromMetrics(metrics: Record<string, unknown>) {
+  for (const key of ["metrics/mAP50-95(B)", "map5095", "box_map", "box.map", "mAP50-95"]) {
+    const value = metrics[key]
+    if (typeof value === "number" && Number.isFinite(value)) return value
+    if (typeof value === "string") {
+      const parsed = Number(value)
+      if (Number.isFinite(parsed)) return parsed
+    }
+  }
+  return null
 }
 
 export function ModelsView() {
+  const [backendModels, setBackendModels] = React.useState<BackendModelVersion[] | null>(null)
+  const useMocks = mockFallbackEnabled()
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    fetchModelVersions(controller.signal)
+      .then(setBackendModels)
+      .catch(() => setBackendModels(null))
+    return () => controller.abort()
+  }, [])
+
+  const rows = React.useMemo(
+    () => (backendModels?.length ? backendModels.map(toModelRow) : useMocks ? models.map(toMockModelRow) : []),
+    [backendModels, useMocks],
+  )
+  const best = rows.reduce<ModelRow | null>(
+    (current, row) => (!current || row.mapValue > current.mapValue ? row : current),
+    null,
+  )
+
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <PageHeader
@@ -37,10 +128,20 @@ export function ModelsView() {
       />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <MetricCard label="Modelos registrados" value="18" hint="3 famílias" tone="blue" />
-        <MetricCard label="Modelo campeão" value="0.813" hint="YOLO11m v18 · mAP50-95" tone="mint" />
-        <MetricCard label="Em produção" value="3" hint="det · cls · seg" tone="purple" />
-        <MetricCard label="Tamanho total" value="1.2 GB" hint="artefatos" tone="subtle" />
+        <MetricCard label="Modelos registrados" value={String(rows.length)} hint="registro local" tone="blue" />
+        <MetricCard
+          label="Modelo campeão"
+          value={best ? best.map : "--"}
+          hint={best ? `${best.id} · mAP50-95` : "sem métricas"}
+          tone="mint"
+        />
+        <MetricCard
+          label="Registrados"
+          value={String(rows.filter((row) => row.status === "publicado" || row.status === "aprovado").length)}
+          hint="MLflow + banco"
+          tone="purple"
+        />
+        <MetricCard label="Tamanho total" value={useMocks ? "1.2 GB" : "--"} hint="artefatos" tone="subtle" />
       </div>
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
@@ -62,7 +163,7 @@ export function ModelsView() {
                 </tr>
               </thead>
               <tbody>
-                {models.map((m) => (
+                {rows.map((m) => (
                   <tr key={m.id} className="border-b border-border/60 last:border-0 hover:bg-muted/40">
                     <td className="px-5 py-3">
                       <div className="flex items-center gap-2 font-medium text-foreground">
@@ -91,6 +192,13 @@ export function ModelsView() {
                     </td>
                   </tr>
                 ))}
+                {rows.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="px-5 py-6 text-center text-sm text-muted-foreground">
+                      Nenhum modelo registrado.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </CardContent>
@@ -102,7 +210,7 @@ export function ModelsView() {
           </CardHeader>
           <CardContent>
             <SparkLineChart
-              data={modelEvolution}
+              data={useMocks ? modelEvolution : []}
               dataKey="map"
               color="var(--brand-blue)"
               height={200}

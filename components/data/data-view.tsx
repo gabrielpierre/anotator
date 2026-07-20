@@ -1,12 +1,24 @@
 "use client"
 
-import { Upload, Search, Filter, Image as ImageIcon, Database, HardDrive } from "lucide-react"
+import * as React from "react"
+import { Upload, Search, Filter, Image as ImageIcon, Database, HardDrive, Scissors } from "lucide-react"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/snowui/input"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, StatusBadge, ProgressBar } from "@/components/app/primitives"
-import { dataBatches, classes } from "@/lib/mock-data"
+import { dataBatches, classes, project } from "@/lib/mock-data"
+import {
+  apiAssetUrl,
+  createPipelineRun,
+  fetchDashboard,
+  fetchDerivedAssets,
+  fetchPipelineRuns,
+  fetchTasks,
+  mockFallbackEnabled,
+} from "@/lib/api/client"
+import { formatDateTimePt, formatPtNumber, labelsFromTasks, toUiJobStatus } from "@/lib/api/status"
+import type { BackendDashboard, BackendDerivedAsset, BackendPipelineRun, BackendTask } from "@/lib/api/types"
 
 const batchStatusTone: Record<string, string> = {
   Anotando: "text-brand-blue",
@@ -16,6 +28,90 @@ const batchStatusTone: Record<string, string> = {
 }
 
 export function DataView() {
+  const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
+  const [dashboard, setDashboard] = React.useState<BackendDashboard | null>(null)
+  const [derivedAssets, setDerivedAssets] = React.useState<BackendDerivedAsset[] | null>(null)
+  const [pipelineRuns, setPipelineRuns] = React.useState<BackendPipelineRun[] | null>(null)
+  const [creatingPipeline, setCreatingPipeline] = React.useState(false)
+  const [pipelineError, setPipelineError] = React.useState<string | null>(null)
+  const useMocks = mockFallbackEnabled()
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
+    fetchDashboard("default", controller.signal).then(setDashboard).catch(() => setDashboard(null))
+    fetchDerivedAssets({ limit: 8 }, controller.signal).then(setDerivedAssets).catch(() => setDerivedAssets(null))
+    fetchPipelineRuns(controller.signal).then(setPipelineRuns).catch(() => setPipelineRuns(null))
+    return () => controller.abort()
+  }, [])
+
+  const batches =
+    tasks && tasks.length > 0
+      ? tasks.map((task) => ({
+          id: task.name || `Task ${task.external_id}`,
+          externalId: task.external_id,
+          images: task.size,
+          status: taskStatusLabel(task.status),
+          progress: task.status.toLowerCase() === "completed" ? 100 : 0,
+          source: task.project_external_id ? `CVAT project ${task.project_external_id}` : "CVAT",
+          previewUrl: apiAssetUrl(task.preview_url),
+          createdAt: formatDateTimePt(task.created_at),
+        }))
+      : useMocks
+        ? dataBatches
+        : []
+
+  const taskClasses = labelsFromTasks(tasks)
+  const classDistribution =
+    dashboard?.class_distribution && dashboard.class_distribution.length > 0
+      ? dashboard.class_distribution.map((item, index) => ({
+          name: item.name,
+          count: item.count,
+          share: item.share,
+          color: classes[index % classes.length]?.color ?? "var(--brand-blue)",
+        }))
+      : taskClasses.length > 0
+        ? taskClasses.map((item) => ({
+            name: item.name,
+            count: item.count ?? 1,
+            share: Math.round((100 / taskClasses.length) * 100) / 100,
+            color: item.color,
+          }))
+      : useMocks
+        ? classes
+        : []
+
+  const imageCount = dashboard?.stats.images ?? (useMocks ? project.imagesImported : 0)
+  const annotatedCount = dashboard?.stats.images ?? (useMocks ? project.imagesAnnotated : 0)
+  const objectCount =
+    dashboard?.class_distribution.reduce((total, item) => total + item.count, 0) || (useMocks ? project.objectsAnnotated : 0)
+  const latestPipeline = pipelineRuns?.[0] ?? null
+
+  async function handleCreateDerivedPipeline() {
+    setCreatingPipeline(true)
+    setPipelineError(null)
+    try {
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "")
+      const run = await createPipelineRun({
+        name: `Pipeline crops classificacao ${stamp}`,
+        target_release_name: `crops_cls_${stamp}`,
+        task_external_ids: tasks?.map((task) => task.external_id) ?? [],
+        sample_policy: { max_assets: 100 },
+        definition: {
+          type: "detection-to-classification",
+          steps: ["detect", "filter", "crop", "classification", "review", "release"],
+          splits: { train: 0.8, val: 0.1, test: 0.1 },
+          padding: { mode: "relative", value: 0.08 },
+        },
+      })
+      setPipelineRuns((current) => [run, ...(current ?? [])])
+    } catch (error) {
+      setPipelineError(error instanceof Error ? error.message : "Erro ao criar pipeline derivado")
+    } finally {
+      setCreatingPipeline(false)
+    }
+  }
+
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <PageHeader
@@ -27,6 +123,10 @@ export function DataView() {
               <Search className="size-4" />
               Buscar imagens
             </Button>
+            <Button variant="outline" onClick={handleCreateDerivedPipeline} disabled={creatingPipeline}>
+              <Scissors className="size-4" />
+              {creatingPipeline ? "Gerando..." : "Dataset derivado"}
+            </Button>
             <Button>
               <Upload className="size-4" />
               Importar lote
@@ -36,11 +136,32 @@ export function DataView() {
       />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <MetricCard label="Imagens importadas" value="10.250" hint="+320 esta semana" tone="blue" />
-        <MetricCard label="Imagens anotadas" value="8.420" hint="82% do total" tone="mint" />
-        <MetricCard label="Objetos anotados" value="43.718" hint="+1.254 esta semana" tone="purple" />
-        <MetricCard label="Tamanho em disco" value="128.6 GB" hint="9 lotes ativos" tone="subtle" />
+        <MetricCard
+          label="Imagens importadas"
+          value={formatPtNumber(imageCount)}
+          hint={`${batches.length} lotes/tasks`}
+          tone="blue"
+        />
+        <MetricCard
+          label="Imagens anotadas"
+          value={formatPtNumber(annotatedCount)}
+          hint="Sincronizado do CVAT"
+          tone="mint"
+        />
+        <MetricCard
+          label="Objetos anotados"
+          value={formatPtNumber(objectCount)}
+          hint="Labels/classes conhecidas"
+          tone="purple"
+        />
+        <MetricCard
+          label="Crops derivados"
+          value={formatPtNumber(derivedAssets?.length ?? 0)}
+          hint={latestPipeline ? `Pipeline ${latestPipeline.status}` : "datasets de classificacao"}
+          tone="subtle"
+        />
       </div>
+      {pipelineError && <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{pipelineError}</p>}
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">
         <Card>
@@ -65,13 +186,20 @@ export function DataView() {
                 </tr>
               </thead>
               <tbody>
-                {dataBatches.map((b) => (
+                {batches.map((b) => {
+                  const previewUrl = "previewUrl" in b && typeof b.previewUrl === "string" ? b.previewUrl : null
+                  return (
                   <tr key={b.id} className="border-b border-border/60 last:border-0 hover:bg-muted/40">
                     <td className="px-5 py-3">
                       <div className="flex items-center gap-2 font-medium text-foreground">
-                        <span className="flex size-8 items-center justify-center rounded-lg bg-surface-blue text-brand-blue">
-                          <ImageIcon className="size-4" />
-                        </span>
+                        {previewUrl ? (
+                          // eslint-disable-next-line @next/next/no-img-element
+                          <img src={previewUrl} alt="" className="size-8 rounded-lg object-cover" />
+                        ) : (
+                          <span className="flex size-8 items-center justify-center rounded-lg bg-surface-blue text-brand-blue">
+                            <ImageIcon className="size-4" />
+                          </span>
+                        )}
                         {b.id}
                       </div>
                     </td>
@@ -89,7 +217,8 @@ export function DataView() {
                       </div>
                     </td>
                   </tr>
-                ))}
+                  )
+                })}
               </tbody>
             </table>
           </CardContent>
@@ -101,7 +230,7 @@ export function DataView() {
               <CardTitle>Distribuição por classe</CardTitle>
             </CardHeader>
             <CardContent className="flex flex-col gap-3">
-              {classes.slice(0, 8).map((c) => (
+              {classDistribution.slice(0, 8).map((c) => (
                 <div key={c.name} className="flex flex-col gap-1.5">
                   <div className="flex items-center justify-between text-sm">
                     <span className="flex items-center gap-2 text-foreground">
@@ -130,8 +259,50 @@ export function DataView() {
               </Button>
             </CardContent>
           </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Dataset derivado</CardTitle>
+              {latestPipeline && <StatusBadge status={toUiJobStatus(latestPipeline.status)} />}
+            </CardHeader>
+            <CardContent className="flex flex-col gap-3">
+              {latestPipeline ? (
+                <div className="rounded-lg bg-surface-subtle p-3 text-xs text-muted-foreground">
+                  <p className="font-medium text-foreground">{latestPipeline.name}</p>
+                  <p>Release: {String(latestPipeline.lineage.derived_release_id ?? "--").slice(0, 12)}</p>
+                  <p>Assets: {String(latestPipeline.lineage.derived_asset_count ?? derivedAssets?.length ?? 0)}</p>
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">Nenhum pipeline derivado executado.</p>
+              )}
+              <div className="divide-y divide-border">
+                {(derivedAssets ?? []).slice(0, 6).map((asset) => (
+                  <div key={asset.id} className="flex items-center gap-3 py-2.5">
+                    <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-surface-blue text-brand-blue">
+                      <Scissors className="size-4" />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-medium text-foreground">{asset.label_name ?? "classe"}</p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {asset.split} - frame {asset.frame ?? "--"} - {asset.source_track_id ? "track" : "shape"}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </CardContent>
+          </Card>
         </div>
       </div>
     </div>
   )
+}
+
+function taskStatusLabel(status: string) {
+  const normalized = status.toLowerCase()
+  if (normalized === "completed") return "ConcluÃ­do"
+  if (normalized === "annotation" || normalized === "in progress") return "Anotando"
+  if (normalized === "validation") return "RevisÃ£o"
+  if (normalized === "acceptance") return "QA"
+  return status || "CVAT"
 }

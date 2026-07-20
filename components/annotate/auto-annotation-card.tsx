@@ -66,11 +66,13 @@ export type PredictionLayer = {
 
 type ApplyMode = "sugestoes" | "aceitas" | "substituir"
 type ExecMode = "continua" | "intervalo"
+type GenerateSummary = { created: number; ignored: number; conflicts: number; jobId?: string }
 
 type RunState =
   | { phase: "idle" }
   | { phase: "running"; processed: number; total: number; detections: number }
-  | { phase: "done"; created: number; ignored: number; conflicts: number }
+  | { phase: "done"; created: number; ignored: number; conflicts: number; jobId?: string }
+  | { phase: "failed"; message: string }
 
 /* ---------- Small pieces ---------- */
 
@@ -213,7 +215,9 @@ export function AutoAnnotationCard({
     scope: string
     applyMode: ApplyMode
     replaceModels: string[]
-  }) => { created: number; ignored: number; conflicts: number }
+    frameStart: number
+    frameEnd: number
+  }) => GenerateSummary | Promise<GenerateSummary>
   onClearSuggestions: () => void
   onToggleLayer: (modelId: string) => void
   onRemoveLayer: (modelId: string) => void
@@ -304,8 +308,17 @@ export function AutoAnnotationCard({
           scope: `intervalo ${startNum}–${endNum}`,
           applyMode,
           replaceModels,
+          frameStart: startNum - 1,
+          frameEnd: endNum - 1,
         })
-        setRun({ phase: "done", ...summary })
+        Promise.resolve(summary)
+          .then((result) => setRun({ phase: "done", ...result }))
+          .catch((err) =>
+            setRun({
+              phase: "failed",
+              message: err instanceof Error ? err.message : "Falha ao enfileirar inferencia.",
+            }),
+          )
       } else {
         setRun({ phase: "running", processed, total, detections })
       }
@@ -334,7 +347,7 @@ export function AutoAnnotationCard({
     setLiveAnnotating(true)
     if (liveTimer.current) clearTimeout(liveTimer.current)
     liveTimer.current = setTimeout(() => {
-      onGenerate({
+      Promise.resolve(onGenerate({
         models: selectedModels,
         threshold,
         nmsIou,
@@ -343,9 +356,11 @@ export function AutoAnnotationCard({
         applyMode,
         // No modo contínuo, cada imagem substitui as sugestões anteriores dos mesmos modelos.
         replaceModels: selectedModels.map((m) => m.id),
-      })
-      setLiveCount((c) => c + 1)
-      setLiveAnnotating(false)
+        frameStart: imageIndex - 1,
+        frameEnd: imageIndex - 1,
+      }))
+        .then(() => setLiveCount((c) => c + 1))
+        .finally(() => setLiveAnnotating(false))
     }, 700)
   }
 
@@ -572,6 +587,7 @@ export function AutoAnnotationCard({
               <li>{run.created} sugestões criadas</li>
               <li>{run.ignored} abaixo do threshold ignoradas</li>
               <li>{run.conflicts} conflitos detectados</li>
+              {run.jobId && <li>Job backend: {run.jobId}</li>}
             </ul>
             <Button size="sm" variant="outline" className="self-start">
               Enviar para revisão rápida
@@ -580,6 +596,16 @@ export function AutoAnnotationCard({
         )}
 
         {/* Camadas de predição */}
+        {run.phase === "failed" && (
+          <div className="flex flex-col gap-2 rounded-lg border border-destructive/30 bg-surface-subtle p-3">
+            <p className="flex items-center gap-2 text-sm font-medium text-destructive">
+              <AlertTriangle className="size-4" />
+              Falha na autoanotacao
+            </p>
+            <p className="text-xs text-muted-foreground">{run.message}</p>
+          </div>
+        )}
+
         {layers.length > 0 && (
           <CollapsibleSection title="Camadas de predição">
             <div className="flex flex-col gap-1.5">

@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import {
   Check,
   ChevronRight,
@@ -23,6 +24,7 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/ca
 import { Button } from "@/components/ui/button"
 import { StatRow, Meter } from "@/components/app/primitives"
 import { SparkLineChart } from "@/components/app/charts"
+import { createTrainingRun } from "@/lib/api/client"
 import { trainingCurves } from "@/lib/mock-data"
 import { cn } from "@/lib/utils"
 
@@ -36,8 +38,21 @@ const STEPS = [
 ]
 
 export function TrainingWizard({ release = "release_014" }: { release?: string }) {
+  const router = useRouter()
   const [step, setStep] = React.useState(0)
   const [cfg, setCfg] = React.useState<SplitConfig>({ ...defaultSplitConfig, release })
+  const [trainingCfg, setTrainingCfg] = React.useState<TrainingConfig>({
+    baseModel: "YOLO11m",
+    epochs: "100",
+    batchSize: "16",
+    imageSize: "640",
+    workers: "8",
+    device: "2x GPU (RTX 4090)",
+    patience: "30",
+    seed: "42",
+  })
+  const [starting, setStarting] = React.useState(false)
+  const [startError, setStartError] = React.useState<string | null>(null)
   const validation = useSplitValidation(cfg)
 
   const nextBlocked = step === 0 && validation.status === "invalid"
@@ -48,6 +63,44 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
     step === 0
       ? "Etapa 1 de 6: Configure a divisão e as políticas de preparo dos dados."
       : "Configure os hiperparâmetros e opções de treino do seu modelo."
+
+  async function startTraining() {
+    if (starting) return
+    setStarting(true)
+    setStartError(null)
+    try {
+      const run = await createTrainingRun({
+        dataset_release_id: release,
+        base_model: toUltralyticsWeight(trainingCfg.baseModel),
+        model_family: "detection",
+        epochs: intOr(trainingCfg.epochs, 100),
+        image_size: intOr(trainingCfg.imageSize, 640),
+        batch_size: intOr(trainingCfg.batchSize, 16),
+        device: toBackendDevice(trainingCfg.device),
+        workers: intOr(trainingCfg.workers, 8),
+        patience: intOr(trainingCfg.patience, 30),
+        seed: intOr(trainingCfg.seed, 42),
+        config: {
+          model_name: trainingCfg.baseModel,
+          split: cfg,
+          resource_policy: {
+            device: trainingCfg.device,
+            workers: intOr(trainingCfg.workers, 8),
+          },
+          ultralytics: {
+            optimizer: "AdamW",
+            cos_lr: true,
+            amp: true,
+          },
+        },
+      })
+      router.push(`/treinar/${run.id}`)
+    } catch (error) {
+      setStartError(error instanceof Error ? error.message : "Falha ao iniciar treinamento.")
+    } finally {
+      setStarting(false)
+    }
+  }
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -62,10 +115,16 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
           </Button>
           <span title={nextBlocked ? nextBlockedReason : undefined} className="inline-flex">
             <Button
-              onClick={() => setStep((s) => Math.min(STEPS.length - 1, s + 1))}
-              disabled={nextBlocked}
+              onClick={() => {
+                if (step >= STEPS.length - 1) {
+                  void startTraining()
+                  return
+                }
+                setStep((s) => Math.min(STEPS.length - 1, s + 1))
+              }}
+              disabled={nextBlocked || starting}
             >
-              {step >= STEPS.length - 1 ? "Iniciar treinamento" : "Próximo"}
+              {starting ? "Enfileirando..." : step >= STEPS.length - 1 ? "Iniciar treinamento" : "Próximo"}
               <ChevronRight className="size-4" />
             </Button>
           </span>
@@ -129,10 +188,13 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
       ) : (
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
         <div className="flex min-w-0 flex-col gap-6">
-          {step === 1 && <ModelStep />}
-          {step === 2 && <ParametersStep />}
-          {step === 3 && <ResourcesStep />}
-          {step >= 4 && <ReviewStep />}
+          {step === 1 && <ModelStep selected={trainingCfg.baseModel} onSelect={(baseModel) => setTrainingCfg((current) => ({ ...current, baseModel }))} />}
+          {step === 2 && <ParametersStep trainingCfg={trainingCfg} setTrainingCfg={setTrainingCfg} />}
+          {step === 3 && <ResourcesStep trainingCfg={trainingCfg} setTrainingCfg={setTrainingCfg} />}
+          {step >= 4 && <ReviewStep onStart={startTraining} starting={starting} />}
+          {startError && (
+            <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{startError}</p>
+          )}
 
           {/* Bottom estimate row */}
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
@@ -189,8 +251,8 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
             <CardContent className="flex flex-col gap-4">
               <div className="rounded-xl bg-surface-subtle p-4">
                 <div className="divide-y divide-border">
-                  <StatRow label="Modelo" value="YOLO11m" />
-                  <StatRow label="Dataset" value="release_014" />
+                  <StatRow label="Modelo" value={trainingCfg.baseModel} />
+                  <StatRow label="Dataset" value={release} />
                 </div>
                 <p className="pt-2 text-xs text-muted-foreground">
                   8.420 imagens · 43.718 objetos · Criado em 14/07/2024 09:30
@@ -199,9 +261,9 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
               <div>
                 <p className="mb-1 text-xs font-medium tracking-wide text-muted-foreground">PARÂMETROS PRINCIPAIS</p>
                 <div className="divide-y divide-border">
-                  <StatRow label="Épocas" value="100" />
-                  <StatRow label="Batch size" value="16" />
-                  <StatRow label="Imagem (imgsz)" value="640" />
+                  <StatRow label="Épocas" value={trainingCfg.epochs} />
+                  <StatRow label="Batch size" value={trainingCfg.batchSize} />
+                  <StatRow label="Imagem (imgsz)" value={trainingCfg.imageSize} />
                   <StatRow label="Optimizer" value="AdamW" />
                   <StatRow label="LR inicial" value="0.001" />
                   <StatRow label="Scheduler" value="Cosine" />
@@ -241,6 +303,32 @@ export function TrainingWizard({ release = "release_014" }: { release?: string }
 }
 
 /* ---------- Steps ---------- */
+
+type TrainingConfig = {
+  baseModel: string
+  epochs: string
+  batchSize: string
+  imageSize: string
+  workers: string
+  device: string
+  patience: string
+  seed: string
+}
+
+function intOr(value: string, fallback: number) {
+  const parsed = Number.parseInt(value, 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function toUltralyticsWeight(model: string) {
+  return `${model.toLowerCase()}.pt`
+}
+
+function toBackendDevice(device: string) {
+  if (device.startsWith("CPU")) return "cpu"
+  if (device.startsWith("1x")) return "0"
+  return "0,1"
+}
 
 function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
   return (
@@ -404,7 +492,16 @@ function MiniSelect({ options, defaultValue }: { options: string[]; defaultValue
   )
 }
 
-function ParametersStep() {
+function ParametersStep({
+  trainingCfg,
+  setTrainingCfg,
+}: {
+  trainingCfg: TrainingConfig
+  setTrainingCfg: React.Dispatch<React.SetStateAction<TrainingConfig>>
+}) {
+  const set = (key: keyof TrainingConfig) => (value: string) => {
+    setTrainingCfg((current) => ({ ...current, [key]: value }))
+  }
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
       <Card>
@@ -412,18 +509,22 @@ function ParametersStep() {
           <CardTitle>Parâmetros principais</CardTitle>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
-          <Field label="Épocas"><TextField defaultValue="100" /></Field>
-          <Field label="Batch size"><TextField defaultValue="16" /></Field>
+          <Field label="Épocas"><TextField value={trainingCfg.epochs} onChange={set("epochs")} /></Field>
+          <Field label="Batch size"><TextField value={trainingCfg.batchSize} onChange={set("batchSize")} /></Field>
           <Field label="Imagem (imgsz)">
-            <SelectField options={["320", "480", "640", "960", "1280"]} defaultValue="640" />
+            <SelectField
+              options={["320", "480", "640", "960", "1280"]}
+              value={trainingCfg.imageSize}
+              onChange={set("imageSize")}
+            />
           </Field>
           <Field label="Acumulação de gradientes" hint="Passos para acumular antes do update">
             <TextField defaultValue="1" />
           </Field>
           <Field label="Early stopping (paciência)" hint="Parar treino se não melhorar por N épocas">
-            <TextField defaultValue="30" />
+            <TextField value={trainingCfg.patience} onChange={set("patience")} />
           </Field>
-          <Field label="Seed (reprodutibilidade)"><TextField defaultValue="42" /></Field>
+          <Field label="Seed (reprodutibilidade)"><TextField value={trainingCfg.seed} onChange={set("seed")} /></Field>
           <ToggleRow label="Determinístico (reprodutível)" />
         </CardContent>
       </Card>
@@ -1395,14 +1496,13 @@ function DatasetSummary({
   )
 }
 
-function ModelStep() {
+function ModelStep({ selected, onSelect }: { selected: string; onSelect: (model: string) => void }) {
   const models = [
     { id: "YOLO11n", desc: "Nano · mais rápido", params: "2.6M" },
     { id: "YOLO11s", desc: "Small · equilibrado", params: "9.4M" },
     { id: "YOLO11m", desc: "Medium · recomendado", params: "20.1M", tag: "Recomendado" },
     { id: "YOLO11l", desc: "Large · mais preciso", params: "25.3M" },
   ]
-  const [sel, setSel] = React.useState("YOLO11m")
   return (
     <Card>
       <CardHeader>
@@ -1413,10 +1513,10 @@ function ModelStep() {
           <button
             key={m.id}
             type="button"
-            onClick={() => setSel(m.id)}
+            onClick={() => onSelect(m.id)}
             className={cn(
               "flex items-center gap-3 rounded-xl border p-4 text-left transition-colors",
-              sel === m.id ? "border-brand-blue bg-surface-blue" : "border-border hover:bg-muted/40",
+              selected === m.id ? "border-brand-blue bg-surface-blue" : "border-border hover:bg-muted/40",
             )}
           >
             <div className="flex size-10 items-center justify-center rounded-lg bg-card text-brand-blue">
@@ -1440,7 +1540,13 @@ function ModelStep() {
   )
 }
 
-function ResourcesStep() {
+function ResourcesStep({
+  trainingCfg,
+  setTrainingCfg,
+}: {
+  trainingCfg: TrainingConfig
+  setTrainingCfg: React.Dispatch<React.SetStateAction<TrainingConfig>>
+}) {
   return (
     <Card>
       <CardHeader>
@@ -1448,9 +1554,18 @@ function ResourcesStep() {
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <Field label="Dispositivo">
-          <SelectField options={["2x GPU (RTX 4090)", "1x GPU (RTX 4090)", "CPU"]} defaultValue="2x GPU (RTX 4090)" />
+          <SelectField
+            options={["2x GPU (RTX 4090)", "1x GPU (RTX 4090)", "CPU"]}
+            value={trainingCfg.device}
+            onChange={(device) => setTrainingCfg((current) => ({ ...current, device }))}
+          />
         </Field>
-        <Field label="Workers de dados"><TextField defaultValue="8" /></Field>
+        <Field label="Workers de dados">
+          <TextField
+            value={trainingCfg.workers}
+            onChange={(workers) => setTrainingCfg((current) => ({ ...current, workers }))}
+          />
+        </Field>
         <Field label="Limite de memória por GPU (GB)"><TextField defaultValue="22" /></Field>
         <ToggleRow label="Distribuir entre múltiplas GPUs (DDP)" defaultChecked />
         <ToggleRow label="Cache de dataset em RAM" defaultChecked />
@@ -1459,7 +1574,7 @@ function ResourcesStep() {
   )
 }
 
-function ReviewStep() {
+function ReviewStep({ onStart, starting }: { onStart: () => void; starting: boolean }) {
   return (
     <Card tone="mint">
       <div className="flex flex-col items-center gap-3 py-8 text-center">
@@ -1471,8 +1586,8 @@ function ReviewStep() {
           Revise o resumo à direita. Ao iniciar, o treinamento entrará na fila de jobs e você poderá acompanhar as
           métricas em tempo real.
         </p>
-        <Button size="lg" nativeButton={false} render={<Link href="/treinar/18" />}>
-          Iniciar treinamento
+        <Button size="lg" onClick={onStart} disabled={starting}>
+          {starting ? "Enfileirando..." : "Iniciar treinamento"}
           <ChevronRight className="size-4" />
         </Button>
       </div>

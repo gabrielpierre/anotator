@@ -1,10 +1,12 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
 import { Menu, Bell, HelpCircle, ChevronDown, Activity } from "lucide-react"
 import { ThemeToggle } from "@/components/snowui/theme-toggle"
 import { Avatar } from "@/components/snowui/avatar"
 import { activeJobs } from "@/lib/mock-data"
+import { fetchJobs, mockFallbackEnabled } from "@/lib/api/client"
 import { cn } from "@/lib/utils"
 
 export type Crumb = { label: string; href?: string }
@@ -16,6 +18,19 @@ export function AppTopbar({
   breadcrumb: Crumb[]
   onMenuClick?: () => void
 }) {
+  const useMocks = mockFallbackEnabled()
+  const [activeJobCount, setActiveJobCount] = React.useState(useMocks ? activeJobs.length : 0)
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    fetchJobs(controller.signal)
+      .then((jobs) =>
+        setActiveJobCount(jobs.filter((job) => job.status === "running" || job.status === "queued").length),
+      )
+      .catch(() => setActiveJobCount(useMocks ? activeJobs.length : 0))
+    return () => controller.abort()
+  }, [useMocks])
+
   return (
     <header className="sticky top-0 z-30 flex h-16 items-center gap-3 border-b border-border bg-background/80 px-4 backdrop-blur md:px-6">
       <button
@@ -63,7 +78,7 @@ export function AppTopbar({
           <Activity className="size-4 text-brand-green" />
           <span className="font-medium">Jobs ativos</span>
           <span className="rounded-full bg-surface-blue px-1.5 text-xs font-medium text-brand-blue">
-            {activeJobs.length}
+            {activeJobCount}
           </span>
         </Link>
 
