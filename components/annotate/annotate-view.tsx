@@ -24,17 +24,25 @@ import {
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import {
-  apiAssetUrl,
   createInferenceRun,
   deleteInferenceSuggestions,
   fetchModelVersions,
   fetchInferenceSuggestions,
+  fetchReviewAnnotations,
   fetchTasks,
   jobsEventsUrl,
+  saveManualAnnotations,
+  taskFrameAssetUrl,
 } from "@/lib/api/client"
 import { labelsFromTasks } from "@/lib/api/status"
 import { useCurrentUser } from "@/lib/auth/user-context"
-import type { BackendInferenceSuggestion, BackendModelVersion, BackendTask } from "@/lib/api/types"
+import type {
+  BackendAnnotationRecord,
+  BackendInferenceSuggestion,
+  BackendManualAnnotationShape,
+  BackendModelVersion,
+  BackendTask,
+} from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 import {
   AutoAnnotationCard,
@@ -102,7 +110,6 @@ export function AnnotateView() {
     .filter((model) => model.status !== "archived")
     .map(modelInfoFromBackend)
   const totalImages = Math.max(1, currentTask?.size ?? 1)
-  const previewSrc = apiAssetUrl(currentTask?.preview_url) ?? "/placeholder.svg"
   const [tool, setTool] = useState<ToolKey>("box")
   const [classList, setClassList] = useState<ClassItem[]>(() => initialClassList)
   // Nenhuma classe ativa por padrão: o usuário desenha primeiro e escolhe a classe depois.
@@ -132,7 +139,7 @@ export function AnnotateView() {
   // Adição de classe/subclasse
   const [addingClass, setAddingClass] = useState<{ parent: string | null } | null>(null)
   const [newClassName, setNewClassName] = useState("")
-  const [shapes, setShapes] = useState<Shape[]>(() => initialShapes)
+  const [shapesByFrame, setShapesByFrame] = useState<Record<string, Shape[]>>({})
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const selectedIdRef = useRef(selectedId)
   selectedIdRef.current = selectedId
@@ -144,9 +151,13 @@ export function AnnotateView() {
   const [cursorNorm, setCursorNorm] = useState<{ x: number; y: number } | null>(null)
   const lastPolyClick = useRef(0)
   const [saved, setSaved] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   // ---- Navegação de imagens ----
   const [imageIndex, setImageIndex] = useState(0)
+  const loadedAnnotationKeys = useRef(new Set<string>())
+  const dirtyFrameSignatures = useRef(new Map<string, string>())
 
   useEffect(() => {
     const controller = new AbortController()
@@ -171,6 +182,50 @@ export function AnnotateView() {
   const [backendSuggestions, setBackendSuggestions] = useState<BackendInferenceSuggestion[]>([])
   const [hiddenLayers, setHiddenLayers] = useState<string[]>([])
   const currentFrame = Math.max(0, imageIndex - 1)
+  const currentTaskId = currentTask?.external_id ?? currentTask?.id
+  const currentFrameKey = `${currentTaskId ?? "no-task"}:${currentFrame}`
+  const previewSrc = taskFrameAssetUrl(currentTaskId, currentFrame) ?? "/placeholder.svg"
+  const shapes = shapesByFrame[currentFrameKey] ?? initialShapes
+  const currentFrameKeyRef = useRef(currentFrameKey)
+  currentFrameKeyRef.current = currentFrameKey
+  const setShapes = useCallback((updater: Shape[] | ((prev: Shape[]) => Shape[])) => {
+    setShapesByFrame((prevByFrame) => {
+      const frameKey = currentFrameKeyRef.current
+      const previousShapes = prevByFrame[frameKey] ?? initialShapes
+      const nextShapes =
+        typeof updater === "function" ? (updater as (prev: Shape[]) => Shape[])(previousShapes) : updater
+      if (nextShapes === previousShapes) return prevByFrame
+      dirtyFrameSignatures.current.set(frameKey, frameShapesSignature(nextShapes))
+      return { ...prevByFrame, [frameKey]: nextShapes }
+    })
+  }, [])
+
+  useEffect(() => {
+    const taskExternalId = currentTask?.external_id
+    if (!taskExternalId || loadedAnnotationKeys.current.has(currentFrameKey)) return
+    const controller = new AbortController()
+    fetchReviewAnnotations({ taskExternalId, frame: currentFrame }, controller.signal)
+      .then((records) => {
+        loadedAnnotationKeys.current.add(currentFrameKey)
+        const loadedShapes = records
+          .filter((record) => record.review_state !== "rejected")
+          .map(shapeFromAnnotationRecord)
+          .filter((shape): shape is Shape => Boolean(shape))
+        if (loadedShapes.length > 0) {
+          nextId.current = Math.max(nextId.current, Math.max(...loadedShapes.map((shape) => shape.id)) + 1)
+        }
+        setClassList((prev) => mergeAnnotationClasses(prev, records))
+        setShapesByFrame((prev) => {
+          if ((prev[currentFrameKey]?.length ?? 0) > 0) return prev
+          return { ...prev, [currentFrameKey]: loadedShapes }
+        })
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) loadedAnnotationKeys.current.add(currentFrameKey)
+      })
+    return () => controller.abort()
+  }, [currentFrame, currentFrameKey, currentTask?.external_id])
+
   const suggestions = backendSuggestions
     .filter((suggestion) => suggestion.frame === currentFrame)
     .map(mapBackendSuggestion)
@@ -285,6 +340,19 @@ export function AnnotateView() {
   const past = useRef<Shape[][]>([])
   const future = useRef<Shape[][]>([])
   const [, forceRender] = useState(0)
+
+  useEffect(() => {
+    setSelectedId(null)
+    setClassPicker(null)
+    setClassQuery("")
+    setDraft(null)
+    setPolyDraft(null)
+    setCursorNorm(null)
+    past.current = []
+    future.current = []
+    setView({ s: 1, tx: 0, ty: 0 })
+    forceRender((n) => n + 1)
+  }, [currentFrameKey])
 
   const commit = useCallback((updater: (prev: Shape[]) => Shape[]) => {
     setShapes((prev) => {
@@ -411,6 +479,44 @@ export function AnnotateView() {
   }
   const cancelPickerRef = useRef(cancelPicker)
   cancelPickerRef.current = cancelPicker
+
+  const createClassItem = (rawName: string, parent: string | null = null) => {
+    const name = rawName.trim()
+    if (!name) return null
+    const existing = classList.find((item) => item.name.toLowerCase() === name.toLowerCase())
+    if (existing) return existing.name
+
+    setClassList((prev) => {
+      if (prev.some((item) => item.name.toLowerCase() === name.toLowerCase())) return prev
+
+      if (parent) {
+        const parentIndex = prev.findIndex((item) => item.name === parent)
+        const parentItem = parentIndex >= 0 ? prev[parentIndex] : null
+        const color = parentItem?.color ?? newClassPalette[prev.length % newClassPalette.length]
+        if (parentIndex < 0) return [...prev, { name, color }]
+
+        let insertAt = parentIndex + 1
+        while (insertAt < prev.length && prev[insertAt].parent === parent) insertAt++
+        const next = [...prev]
+        next.splice(insertAt, 0, { name, color, parent })
+        return next
+      }
+
+      const color = newClassPalette[prev.length % newClassPalette.length]
+      return [...prev, { name, color }]
+    })
+
+    return name
+  }
+
+  const createAndApplyPickerClass = () => {
+    if (!classPicker) return
+    const name = createClassItem(classQuery, classPicker.filterParent ?? null)
+    if (!name) return
+    commit((prev) => prev.map((s) => (s.id === classPicker.id ? { ...s, cls: name } : s)))
+    setClassPicker(null)
+    setClassQuery("")
+  }
 
   // Aplica a classe escolhida no autocomplete.
   const applyPickerClass = (name: string) => {
@@ -704,10 +810,56 @@ export function AnnotateView() {
     return () => window.removeEventListener("keydown", onKey)
   }, [undo, redo, deleteSelected, finishPolygon, polyDraft, classList])
 
+  const persistCurrentFrame = useCallback(async (mode: "manual" | "auto" = "manual") => {
+    if (!currentTask?.external_id) {
+      if (mode === "manual") setSaveError("Nenhuma task CVAT sincronizada para salvar.")
+      return
+    }
+    if (shapes.some((shape) => !shape.cls.trim())) {
+      if (mode === "manual") setSaveError("Defina a classe de todos os objetos antes de salvar.")
+      return
+    }
+    const signature = frameShapesSignature(shapes)
+    setSaving(true)
+    setSaveError(null)
+    try {
+      const records = await saveManualAnnotations({
+        task_external_id: currentTask.external_id,
+        frame: currentFrame,
+        shapes: shapes.map(shapeToManualAnnotation),
+        actor: currentUser.email || currentUser.id,
+        sync_cvat: true,
+        replace_existing: true,
+      })
+      loadedAnnotationKeys.current.add(currentFrameKey)
+      setClassList((prev) => mergeAnnotationClasses(prev, records))
+      if (dirtyFrameSignatures.current.get(currentFrameKey) === signature) {
+        dirtyFrameSignatures.current.delete(currentFrameKey)
+      }
+      setSaved(true)
+      setTimeout(() => setSaved(false), 1600)
+    } catch (error) {
+      if (mode === "manual") {
+        setSaveError(error instanceof Error ? error.message : "Erro ao salvar anotacoes.")
+      }
+    } finally {
+      setSaving(false)
+    }
+  }, [currentFrame, currentFrameKey, currentTask?.external_id, currentUser.email, currentUser.id, shapes])
+
   const handleSave = () => {
-    setSaved(true)
-    setTimeout(() => setSaved(false), 1600)
+    void persistCurrentFrame("manual")
   }
+
+  useEffect(() => {
+    if (!dirtyFrameSignatures.current.has(currentFrameKey)) return
+    if (classPicker) return
+    if (shapes.some((shape) => !shape.cls.trim())) return
+    const timeout = window.setTimeout(() => {
+      void persistCurrentFrame("auto")
+    }, 350)
+    return () => window.clearTimeout(timeout)
+  }, [classPicker, currentFrameKey, persistCurrentFrame, shapes])
 
   const cursor =
     tool === "pan" ? "grab" : tool === "box" || tool === "polygon" || tool === "point" ? "crosshair" : "default"
@@ -798,12 +950,17 @@ export function AnnotateView() {
             <Button variant="ghost" size="icon" aria-label="Aumentar zoom" onClick={() => zoomBy(1.2)}>
               <ZoomIn className="size-4" />
             </Button>
-            <Button size="sm" className="ml-1" onClick={handleSave}>
+            <Button size="sm" className="ml-1" onClick={handleSave} disabled={saving}>
               {saved ? <Check className="size-4" /> : <Save className="size-4" />}
-              {saved ? "Salvo" : "Salvar"}
+              {saving ? "Salvando" : saved ? "Salvo" : "Salvar"}
             </Button>
           </div>
         </div>
+        {saveError && (
+          <div className="border-b border-destructive/20 bg-destructive/10 px-4 py-2 text-xs text-destructive">
+            {saveError}
+          </div>
+        )}
 
         <div
           ref={containerRef}
@@ -1099,6 +1256,11 @@ export function AnnotateView() {
                   if (e.key === "Enter" && pickerSuggestions.length > 0) {
                     e.preventDefault()
                     applyPickerClass(pickerSuggestions[0].name)
+                    return
+                  }
+                  if (e.key === "Enter") {
+                    e.preventDefault()
+                    createAndApplyPickerClass()
                   }
                 }}
                 placeholder="Digite o nome da classe..."
@@ -1189,7 +1351,11 @@ export function AnnotateView() {
                     )}
                   >
                     {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={previewSrc} alt={`Imagem ${n}`} className="size-full object-cover" />
+                    <img
+                      src={taskFrameAssetUrl(currentTaskId, n - 1) ?? "/placeholder.svg"}
+                      alt={`Imagem ${n}`}
+                      className="size-full object-cover"
+                    />
                     <span className="absolute bottom-0 right-0 rounded-tl bg-black/60 px-1 text-[9px] tabular-nums text-white">
                       {n}
                     </span>
@@ -1266,17 +1432,8 @@ export function AnnotateView() {
                       className="mt-1 flex items-center gap-1.5 pl-6"
                       onSubmit={(e) => {
                         e.preventDefault()
-                        const name = newClassName.trim()
-                        if (!name || classList.some((x) => x.name === name)) return
-                        // Insere a subclasse logo após o pai (e suas subclasses existentes)
-                        setClassList((prev) => {
-                          const idx = prev.findIndex((x) => x.name === c.name)
-                          let insertAt = idx + 1
-                          while (insertAt < prev.length && prev[insertAt].parent === c.name) insertAt++
-                          const next = [...prev]
-                          next.splice(insertAt, 0, { name, color: c.color, parent: c.name })
-                          return next
-                        })
+                        const name = createClassItem(newClassName, c.name)
+                        if (!name) return
                         setAddingClass(null)
                         setNewClassName("")
                       }}
@@ -1307,10 +1464,8 @@ export function AnnotateView() {
                 className="mt-1 flex items-center gap-1.5"
                 onSubmit={(e) => {
                   e.preventDefault()
-                  const name = newClassName.trim()
-                  if (!name || classList.some((x) => x.name === name)) return
-                  const color = newClassPalette[classList.length % newClassPalette.length]
-                  setClassList((prev) => [...prev, { name, color }])
+                  const name = createClassItem(newClassName)
+                  if (!name) return
                   setActiveClass(name)
                   setAddingClass(null)
                   setNewClassName("")
@@ -1489,6 +1644,136 @@ function mapBackendSuggestion(suggestion: BackendInferenceSuggestion): Suggestio
       user_id: String(suggestion.origin.user_id ?? "model"),
     },
   }
+}
+
+function shapeToManualAnnotation(shape: Shape): BackendManualAnnotationShape {
+  if (shape.type === "box") {
+    return {
+      client_id: String(shape.id),
+      shape_type: "rectangle",
+      label_name: shape.cls,
+      points: [shape.x, shape.y, shape.x + shape.w, shape.y + shape.h],
+      bbox_norm: { x: shape.x, y: shape.y, w: shape.w, h: shape.h },
+    }
+  }
+  if (shape.type === "polygon") {
+    const points = shape.points.flatMap((point) => [point.x, point.y])
+    return {
+      client_id: String(shape.id),
+      shape_type: "polygon",
+      label_name: shape.cls,
+      points,
+      bbox_norm: bboxFromNormalizedPoints(points),
+    }
+  }
+  return {
+    client_id: String(shape.id),
+    shape_type: "points",
+    label_name: shape.cls,
+    points: [shape.x, shape.y],
+    bbox_norm: { x: shape.x, y: shape.y, w: 0, h: 0 },
+  }
+}
+
+function frameShapesSignature(shapes: Shape[]) {
+  return JSON.stringify(
+    shapes.map((shape) => {
+      if (shape.type === "box") {
+        return [shape.id, shape.type, shape.cls, shape.x, shape.y, shape.w, shape.h]
+      }
+      if (shape.type === "polygon") {
+        return [shape.id, shape.type, shape.cls, ...shape.points.flatMap((point) => [point.x, point.y])]
+      }
+      return [shape.id, shape.type, shape.cls, shape.x, shape.y]
+    }),
+  )
+}
+
+function shapeFromAnnotationRecord(record: BackendAnnotationRecord): Shape | null {
+  const label = record.label_name ?? stringFromRecord(record.raw, "label_name") ?? "unknown"
+  const id = numericIdFromString(record.external_id)
+  const shapeType = record.shape_type ?? stringFromRecord(record.raw, "type")
+  const pointsNorm = numberArrayFromUnknown(record.raw.points_norm)
+
+  if (shapeType === "polygon" && pointsNorm.length >= 6) {
+    return {
+      id,
+      type: "polygon",
+      cls: label,
+      points: pairsFromNormalizedPoints(pointsNorm),
+    }
+  }
+
+  if ((shapeType === "points" || shapeType === "point") && pointsNorm.length >= 2) {
+    return { id, type: "point", cls: label, x: clamp(pointsNorm[0]), y: clamp(pointsNorm[1]) }
+  }
+
+  const bbox = normalizedBoxFromRecord(record.raw.bbox_norm)
+  if (bbox) return { id, type: "box", cls: label, ...bbox }
+
+  const points = numberArrayFromUnknown(record.points)
+  if (points.length >= 4 && points.every((value) => value >= 0 && value <= 1)) {
+    const box = bboxFromNormalizedPoints(points)
+    if (box) return { id, type: "box", cls: label, ...box }
+  }
+
+  return null
+}
+
+function mergeAnnotationClasses(classList: ClassItem[], records: BackendAnnotationRecord[]) {
+  const next = [...classList]
+  for (const record of records) {
+    const name = record.label_name ?? stringFromRecord(record.raw, "label_name")
+    if (!name) continue
+    if (next.some((item) => item.name.toLowerCase() === name.toLowerCase())) continue
+    next.push({ name, color: newClassPalette[next.length % newClassPalette.length] })
+  }
+  return next
+}
+
+function normalizedBoxFromRecord(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const x = Number(record.x)
+  const y = Number(record.y)
+  const w = Number(record.w)
+  const h = Number(record.h)
+  if (![x, y, w, h].every((number) => Number.isFinite(number))) return null
+  return { x: clamp(x), y: clamp(y), w: clamp(w), h: clamp(h) }
+}
+
+function bboxFromNormalizedPoints(points: number[]) {
+  if (points.length < 4) return null
+  const xs = points.filter((_, index) => index % 2 === 0)
+  const ys = points.filter((_, index) => index % 2 === 1)
+  const minX = Math.min(...xs)
+  const minY = Math.min(...ys)
+  const maxX = Math.max(...xs)
+  const maxY = Math.max(...ys)
+  if (![minX, minY, maxX, maxY].every(Number.isFinite)) return null
+  return {
+    x: clamp(minX),
+    y: clamp(minY),
+    w: clamp(maxX - minX),
+    h: clamp(maxY - minY),
+  }
+}
+
+function pairsFromNormalizedPoints(points: number[]) {
+  const pairs: { x: number; y: number }[] = []
+  for (let index = 0; index + 1 < points.length; index += 2) {
+    pairs.push({ x: clamp(points[index]), y: clamp(points[index + 1]) })
+  }
+  return pairs
+}
+
+function numberArrayFromUnknown(value: unknown) {
+  return Array.isArray(value) ? value.map(Number).filter(Number.isFinite) : []
+}
+
+function stringFromRecord(record: Record<string, unknown>, key: string) {
+  const value = record[key]
+  return typeof value === "string" ? value : null
 }
 
 function pointsToBox(points: unknown[]) {

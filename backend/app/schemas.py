@@ -230,6 +230,23 @@ class AnnotationRecordRead(OrmModel):
     updated_at: datetime
 
 
+class ManualAnnotationShape(BaseModel):
+    client_id: str
+    shape_type: Literal["rectangle", "polygon", "points"]
+    label_name: str
+    points: list[float] = Field(default_factory=list)
+    bbox_norm: dict[str, float] | None = None
+
+
+class ManualAnnotationSave(BaseModel):
+    task_external_id: str
+    frame: int = Field(ge=0)
+    shapes: list[ManualAnnotationShape] = Field(default_factory=list)
+    actor: str = "local-user"
+    sync_cvat: bool = True
+    replace_existing: bool = False
+
+
 class InferenceRunCreate(BaseModel):
     task_external_id: str
     cvat_job_id: str | None = None

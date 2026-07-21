@@ -181,7 +181,10 @@ class CvatSyncService:
             row.raw = raw
             self.db.add(row)
             counts.projects += 1
-            counts.labels += self._sync_labels(raw.get("labels") or [], project_external_id=external_id)
+            counts.labels += self._sync_labels(
+                self._project_labels(external_id, raw.get("labels")),
+                project_external_id=external_id,
+            )
         self.db.commit()
         return counts
 
@@ -198,13 +201,14 @@ class CvatSyncService:
             row.name = enriched.get("name") or row.name
             row.status = str(enriched.get("status") or "unknown")
             row.size = int(enriched.get("size") or enriched.get("data_chunk_size") or 0)
-            row.labels = self._normalized_labels(enriched.get("labels") or [], task_external_id=external_id)
+            labels = self._task_labels(external_id, enriched.get("labels"))
+            row.labels = self._normalized_labels(labels, task_external_id=external_id)
             row.preview_url = f"/api/v1/tasks/{external_id}/preview"
             row.raw = enriched
             self.db.add(row)
             counts.tasks += 1
             counts.labels += self._sync_labels(
-                enriched.get("labels") or [],
+                labels,
                 project_external_id=row.project_external_id,
                 task_external_id=external_id,
             )
@@ -255,6 +259,24 @@ class CvatSyncService:
         except Exception as exc:
             self._record_error("task_detail", external_id, exc)
             return raw
+
+    def _project_labels(self, external_id: str, labels: Any) -> list[Any]:
+        if isinstance(labels, list):
+            return labels
+        try:
+            return self.client.list_labels(project_id=external_id)
+        except Exception as exc:
+            self._record_error("project_labels", external_id, exc)
+            return []
+
+    def _task_labels(self, external_id: str, labels: Any) -> list[Any]:
+        if isinstance(labels, list):
+            return labels
+        try:
+            return self.client.list_labels(task_id=external_id)
+        except Exception as exc:
+            self._record_error("task_labels", external_id, exc)
+            return []
 
     def _sync_labels(
         self,

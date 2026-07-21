@@ -6,6 +6,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app/backend
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libxcb1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY backend/pyproject.toml ./pyproject.toml
 RUN pip install --upgrade pip \
     && pip install \

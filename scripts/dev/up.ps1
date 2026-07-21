@@ -20,7 +20,12 @@ if ($ResetDb) {
   & (Join-Path $PSScriptRoot "reset-local-db.ps1") @resetArgs
 }
 
-$compose = @("compose", "-f", (Join-Path $root "infra\docker-compose.dev.yml"), "up", "-d")
+$compose = @("compose")
+$envFile = Join-Path $root ".env"
+if (Test-Path -LiteralPath $envFile) {
+  $compose += @("--env-file", $envFile)
+}
+$compose += @("-f", (Join-Path $root "infra\docker-compose.dev.yml"), "up", "-d")
 if ($Build) {
   $compose += "--build"
 }

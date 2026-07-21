@@ -1,5 +1,6 @@
 import type {
   BackendArtifact,
+  BackendAnnotationRecord,
   BackendAuditEventPage,
   BackendAuthSession,
   BackendCvatStatus,
@@ -18,6 +19,7 @@ import type {
   BackendModelVersion,
   BackendModelVersionCreate,
   BackendModelVersionUpdate,
+  BackendManualAnnotationSave,
   BackendDerivedAsset,
   BackendPipelineDefinition,
   BackendPipelineDefinitionCreate,
@@ -68,6 +70,11 @@ export function apiAssetUrl(path: string | null | undefined) {
   if (/^https?:\/\//.test(path)) return path
   const base = apiBaseUrl().replace(/\/api\/v1$/, "")
   return withApiKeyQuery(`${base}${path.startsWith("/") ? path : `/${path}`}`)
+}
+
+export function taskFrameAssetUrl(taskId: string | null | undefined, frame: number) {
+  if (!taskId) return null
+  return apiAssetUrl(`/api/v1/tasks/${encodeURIComponent(taskId)}/frame/${frame}`)
 }
 
 function apiHeaders(headers: HeadersInit = {}) {
@@ -297,6 +304,21 @@ export function deleteInferenceSuggestions(
 
 export function fetchReviewQueue(signal?: AbortSignal) {
   return getJson<BackendReviewQueueItem[]>("/review/queue", signal)
+}
+
+export function fetchReviewAnnotations(
+  params: { taskExternalId?: string; frame?: number } = {},
+  signal?: AbortSignal,
+) {
+  const query = new URLSearchParams()
+  if (params.taskExternalId) query.set("task_external_id", params.taskExternalId)
+  if (params.frame !== undefined) query.set("frame", String(params.frame))
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendAnnotationRecord[]>(`/review/annotations${suffix}`, signal)
+}
+
+export function saveManualAnnotations(payload: BackendManualAnnotationSave, signal?: AbortSignal) {
+  return putJson<BackendAnnotationRecord[]>("/review/annotations/manual", payload, signal)
 }
 
 export function createReviewDecision(payload: BackendReviewDecisionCreate, signal?: AbortSignal) {

@@ -8,6 +8,7 @@ __v0_jsx-dev-runtime.ts
 .local/
 
 # Environment variables
+.env
 .env*.local
 
 # Common ignores
@@ -23,3 +24,8 @@ __pycache__/
 .pytest_cache/
 backend/.pytest_cache/
 backend/anotator.db
+
+# Model weights and exported training artifacts
+*.pt
+*.pth
+*.onnx

@@ -6,7 +6,13 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 
-docker compose -f (Join-Path $root "infra\docker-compose.dev.yml") down
+$compose = @("compose")
+$envFile = Join-Path $root ".env"
+if (Test-Path -LiteralPath $envFile) {
+  $compose += @("--env-file", $envFile)
+}
+$compose += @("-f", (Join-Path $root "infra\docker-compose.dev.yml"), "down")
+docker @compose
 
 if ($IncludeCvat) {
   if (-not $CvatDir) {

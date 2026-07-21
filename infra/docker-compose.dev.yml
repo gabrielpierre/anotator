@@ -25,6 +25,8 @@ services:
     build:
       context: ..
       dockerfile: backend/Dockerfile
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     working_dir: /app/backend
     command: sh -lc "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     environment:
@@ -33,6 +35,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CVAT_BASE_URL: http://host.docker.internal:8080
       CVAT_ACCESS_TOKEN: ${CVAT_ACCESS_TOKEN:-}
+      CVAT_HOST_HEADER: ${CVAT_HOST_HEADER:-localhost}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
       DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL:-admin@cvat.plus}
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
@@ -71,6 +74,8 @@ services:
     build:
       context: ..
       dockerfile: backend/Dockerfile
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     working_dir: /app/backend
     command: sh -lc "alembic upgrade head && celery -A app.core.celery_app.celery_app worker --loglevel=INFO"
     environment:
@@ -79,6 +84,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CVAT_BASE_URL: http://host.docker.internal:8080
       CVAT_ACCESS_TOKEN: ${CVAT_ACCESS_TOKEN:-}
+      CVAT_HOST_HEADER: ${CVAT_HOST_HEADER:-localhost}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
       DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL:-admin@cvat.plus}
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}

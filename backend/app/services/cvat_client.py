@@ -18,6 +18,7 @@ class CvatClient:
     def __init__(self, settings: Settings):
         self.base_url = settings.cvat_base_url.rstrip("/")
         self.token = settings.cvat_access_token
+        self.host_header = settings.cvat_host_header
         self.timeout = settings.cvat_request_timeout_seconds
 
     @property
@@ -29,9 +30,34 @@ class CvatClient:
         return bool(self.token)
 
     def _headers(self) -> dict[str, str]:
-        if not self.token:
-            return {}
-        return {"Authorization": f"Token {self.token}"}
+        headers = {}
+        if self.token:
+            headers["Authorization"] = f"Token {self.token}"
+        if self.host_header:
+            headers["Host"] = self.host_header
+        return headers
+
+    def _format_http_error(self, exc: httpx.HTTPError, url: str) -> str:
+        if isinstance(exc, httpx.HTTPStatusError):
+            status_code = exc.response.status_code
+            if status_code in {401, 403}:
+                return (
+                    "CVAT recusou a autenticacao. Verifique se CVAT_ACCESS_TOKEN "
+                    "esta configurado com um token valido."
+                )
+            if status_code == 404:
+                return (
+                    f"CVAT retornou 404 para {url}. Em ambiente Docker local, confirme "
+                    "CVAT_HOST_HEADER=localhost quando CVAT_BASE_URL usar host.docker.internal."
+                )
+            return f"CVAT retornou HTTP {status_code} para {url}: {exc.response.text[:500]}"
+        if isinstance(exc, httpx.ConnectError):
+            return (
+                f"CVAT nao esta acessivel em {self.base_url}. Verifique se o CVAT esta "
+                "rodando em http://localhost:8080 e se backend/worker conseguem resolver "
+                "host.docker.internal."
+            )
+        return str(exc)
 
     def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         url = f"{self.base_url}{path}"
@@ -40,7 +66,7 @@ class CvatClient:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as exc:
-            raise CvatClientError(str(exc)) from exc
+            raise CvatClientError(self._format_http_error(exc, url)) from exc
 
     def post_json(
         self,
@@ -63,7 +89,7 @@ class CvatClient:
                 return None
             return response.json()
         except httpx.HTTPError as exc:
-            raise CvatClientError(str(exc)) from exc
+            raise CvatClientError(self._format_http_error(exc, url)) from exc
 
     def post_multipart(
         self,
@@ -88,7 +114,7 @@ class CvatClient:
                 return None
             return response.json()
         except httpx.HTTPError as exc:
-            raise CvatClientError(str(exc)) from exc
+            raise CvatClientError(self._format_http_error(exc, url)) from exc
 
     def patch_json(
         self,
@@ -111,7 +137,7 @@ class CvatClient:
                 return None
             return response.json()
         except httpx.HTTPError as exc:
-            raise CvatClientError(str(exc)) from exc
+            raise CvatClientError(self._format_http_error(exc, url)) from exc
 
     def get_bytes(self, path: str, params: dict[str, Any] | None = None) -> CvatBinaryResponse:
         url = f"{self.base_url}{path}"
@@ -123,7 +149,7 @@ class CvatClient:
                 content_type=response.headers.get("content-type"),
             )
         except httpx.HTTPError as exc:
-            raise CvatClientError(str(exc)) from exc
+            raise CvatClientError(self._format_http_error(exc, url)) from exc
 
     def get_url_bytes(self, url_or_path: str) -> CvatBinaryResponse:
         url = url_or_path if url_or_path.startswith("http") else f"{self.base_url}{url_or_path}"
@@ -135,7 +161,7 @@ class CvatClient:
                 content_type=response.headers.get("content-type"),
             )
         except httpx.HTTPError as exc:
-            raise CvatClientError(str(exc)) from exc
+            raise CvatClientError(self._format_http_error(exc, url)) from exc
 
     def server_about(self) -> dict[str, Any]:
         return self.get_json("/api/server/about")
@@ -148,6 +174,22 @@ class CvatClient:
 
     def list_jobs(self) -> list[dict[str, Any]]:
         return self._paginated("/api/jobs")
+
+    def list_labels(
+        self,
+        *,
+        project_id: str | int | None = None,
+        task_id: str | int | None = None,
+        job_id: str | int | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if project_id is not None:
+            params["project_id"] = project_id
+        if task_id is not None:
+            params["task_id"] = task_id
+        if job_id is not None:
+            params["job_id"] = job_id
+        return self._paginated("/api/labels", params=params)
 
     def retrieve_task(self, task_id: str | int) -> dict[str, Any]:
         return self.get_json(f"/api/tasks/{task_id}")
@@ -173,8 +215,8 @@ class CvatClient:
         image_quality: int = 70,
     ) -> dict[str, Any]:
         multipart = [
-            ("client_files", (filename, content, content_type))
-            for filename, content, content_type in files
+            (f"client_files[{index}]", (filename, content, content_type))
+            for index, (filename, content, content_type) in enumerate(files)
         ]
         result = self.post_multipart(
             f"/api/tasks/{task_id}/data",
@@ -240,11 +282,17 @@ class CvatClient:
     def retrieve_quality_report_data(self, report_id: str | int) -> Any:
         return self.get_json(f"/api/quality/reports/{report_id}/data", {"format": "json"})
 
-    def _paginated(self, path: str, page_size: int = 100) -> list[dict[str, Any]]:
+    def _paginated(
+        self,
+        path: str,
+        page_size: int = 100,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         page = 1
         rows: list[dict[str, Any]] = []
         while True:
-            payload = self.get_json(path, {"page": page, "page_size": page_size})
+            request_params = {**(params or {}), "page": page, "page_size": page_size}
+            payload = self.get_json(path, request_params)
             rows.extend(self._results(payload))
             if not isinstance(payload, dict) or not payload.get("next"):
                 return rows

@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from typing import Any
 
@@ -57,9 +58,14 @@ def run_import_task_job(
         raise RuntimeError("CVAT did not return a task id")
     update_job_progress(db, job_id, 35, detail=f"Created CVAT task {task_id}.")
     upload_result: dict[str, Any] | None = None
+    upload_request: dict[str, Any] | None = None
     if files:
         upload_result = client.upload_task_data(task_id, files=files)
-        update_job_progress(db, job_id, 70, detail=f"Uploaded {len(files)} files to CVAT task {task_id}.")
+        update_job_progress(db, job_id, 55, detail=f"Uploaded {len(files)} files to CVAT task {task_id}.")
+        request_id = _request_id_from_payload(upload_result)
+        if request_id:
+            upload_request = _wait_for_cvat_request(client, request_id, settings)
+        update_job_progress(db, job_id, 70, detail=f"CVAT processed {len(files)} files for task {task_id}.")
     sync_result = None
     if payload.sync_after_import:
         sync_result = CvatSyncService(db, client, job_id=job_id).sync_all().model_dump(mode="json")
@@ -69,6 +75,7 @@ def run_import_task_job(
         "cvat_task_id": str(task_id),
         "cvat_task": task_payload,
         "upload_result": upload_result,
+        "upload_request": upload_request,
         "sync_result": sync_result,
     }
     db.add(
@@ -144,6 +151,39 @@ def _content_type(path: Path) -> str:
     if suffix == ".bmp":
         return "image/bmp"
     return "application/octet-stream"
+
+
+def _wait_for_cvat_request(client: CvatClient, request_id: str, settings: Settings) -> dict[str, Any]:
+    last_payload: dict[str, Any] = {}
+    terminal_statuses = {"finished", "completed", "succeeded", "failed", "error"}
+    for _ in range(settings.cvat_request_poll_attempts):
+        payload = client.retrieve_request(request_id)
+        last_payload = payload if isinstance(payload, dict) else {}
+        status = str(
+            last_payload.get("status")
+            or last_payload.get("state")
+            or last_payload.get("result", {}).get("status")
+            or ""
+        ).lower()
+        if status in terminal_statuses:
+            if status in {"failed", "error"}:
+                raise RuntimeError(f"CVAT request {request_id} failed: {last_payload}")
+            return last_payload
+        time.sleep(settings.cvat_request_poll_interval_seconds)
+    raise TimeoutError(f"Timed out waiting for CVAT request {request_id}: {last_payload}")
+
+
+def _request_id_from_payload(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("rq_id", "request_id", "id"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    result = payload.get("result")
+    if isinstance(result, dict):
+        return _request_id_from_payload(result)
+    return None
 
 
 def _int_value(value: Any) -> int | None:

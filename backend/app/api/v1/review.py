@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -8,7 +8,6 @@ from app.models import (
     AnnotationRecord,
     AnnotationRevision,
     AuditEvent,
-    JobRecord,
     ReviewDecision,
     Task,
     TrackRevision,
@@ -17,13 +16,14 @@ from app.models import (
 from app.schemas import (
     AnnotationRecordRead,
     AnnotationRevisionRead,
+    ManualAnnotationSave,
     ReviewDecisionCreate,
     ReviewDecisionRead,
     ReviewQueueItem,
     TrackActionPayload,
     TrackRevisionRead,
 )
-from app.services.annotations import apply_review_decision, normalize_cvat_job_id
+from app.services.annotations import apply_review_decision, save_manual_annotations
 from app.services.cvat_client import CvatClient
 
 router = APIRouter()
@@ -42,47 +42,7 @@ def review_queue(
             .limit(500)
         ).all()
     )
-    if annotations:
-        return [_queue_item_from_annotation(db, annotation) for annotation in annotations]
-
-    jobs = list(
-        db.scalars(
-            select(JobRecord)
-            .where(JobRecord.kind == "cvat_job")
-            .order_by(JobRecord.updated_at.desc())
-            .limit(200)
-        ).all()
-    )
-    items: list[ReviewQueueItem] = []
-    for job in jobs:
-        task = None
-        if job.task_external_id:
-            task = db.scalar(select(Task).where(Task.external_id == job.task_external_id))
-        label = None
-        labels = task.labels if task else []
-        if labels and isinstance(labels[0], dict):
-            label = labels[0].get("name")
-        items.append(
-            ReviewQueueItem(
-                external_annotation_id=None,
-                cvat_job_id=normalize_cvat_job_id(job.external_id),
-                task_external_id=job.task_external_id,
-                task_name=task.name if task else None,
-                preview_url=task.preview_url if task else None,
-                status=job.status,
-                annotation_type=None,
-                label=label,
-                confidence=None,
-                origin="CVAT job",
-                payload={
-                    "job_id": job.id,
-                    "job_name": job.name,
-                    "job_status": job.status,
-                    "task_external_id": job.task_external_id,
-                },
-            )
-        )
-    return items
+    return [_queue_item_from_annotation(db, annotation) for annotation in annotations]
 
 
 @router.post("/decisions", response_model=ReviewDecisionRead)
@@ -104,10 +64,34 @@ def list_review_decisions(
 
 @router.get("/annotations", response_model=list[AnnotationRecordRead])
 def list_review_annotations(
+    task_external_id: str | None = None,
+    frame: int | None = Query(default=None, ge=0),
     db: Session = Depends(db_session),
     _: User = Depends(current_user),
 ) -> list[AnnotationRecord]:
-    return list(db.scalars(select(AnnotationRecord).order_by(AnnotationRecord.updated_at.desc())).all())
+    query = select(AnnotationRecord)
+    if task_external_id:
+        query = query.where(AnnotationRecord.task_external_id == task_external_id)
+    if frame is not None:
+        query = query.where(AnnotationRecord.frame == frame)
+    return list(db.scalars(query.order_by(AnnotationRecord.updated_at.desc())).all())
+
+
+@router.put("/annotations/manual", response_model=list[AnnotationRecordRead])
+def save_review_manual_annotations(
+    payload: ManualAnnotationSave,
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> list[AnnotationRecord]:
+    actor = payload.actor if payload.actor != "local-user" else user.email
+    try:
+        return save_manual_annotations(
+            db,
+            CvatClient(get_settings()),
+            payload.model_copy(update={"actor": actor}),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/annotation-revisions", response_model=list[AnnotationRevisionRead])
@@ -182,12 +166,15 @@ def _queue_item_from_annotation(db: Session, annotation: AnnotationRecord) -> Re
     task = None
     if annotation.task_external_id:
         task = db.scalar(select(Task).where(Task.external_id == annotation.task_external_id))
+    preview_url = task.preview_url if task else None
+    if annotation.task_external_id and annotation.frame is not None:
+        preview_url = f"/api/v1/tasks/{annotation.task_external_id}/frame/{annotation.frame}"
     return ReviewQueueItem(
         external_annotation_id=annotation.external_id,
         cvat_job_id=annotation.cvat_job_id,
         task_external_id=annotation.task_external_id,
         task_name=task.name if task else None,
-        preview_url=task.preview_url if task else None,
+        preview_url=preview_url,
         status=annotation.review_state,
         annotation_type=annotation.annotation_type,  # type: ignore[arg-type]
         cvat_annotation_id=annotation.cvat_annotation_id,

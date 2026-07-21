@@ -46,5 +46,22 @@ def get_task_preview(task_id: str, db: Session = Depends(db_session)) -> Respons
     return Response(content=preview.content, media_type=preview.content_type or "image/jpeg")
 
 
+@router.get("/{task_id}/frame/{frame}")
+def get_task_frame(task_id: str, frame: int, db: Session = Depends(db_session)) -> Response:
+    task = _resolve_task(db, task_id)
+    external_id = task.external_id if task else task_id
+    if frame < 0:
+        raise HTTPException(status_code=400, detail="Frame must be greater than or equal to zero")
+    if task and task.size and frame >= task.size:
+        raise HTTPException(status_code=404, detail="Frame not found")
+
+    client = CvatClient(get_settings())
+    try:
+        image = client.retrieve_task_frame(external_id, frame)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"CVAT frame unavailable: {exc}") from exc
+    return Response(content=image.content, media_type=image.content_type or "image/jpeg")
+
+
 def _resolve_task(db: Session, task_id: str) -> Task | None:
     return db.get(Task, task_id) or db.scalar(select(Task).where(Task.external_id == task_id))

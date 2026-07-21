@@ -48,8 +48,9 @@ export function DataView() {
 
   const batches =
     tasks?.map((task) => ({
-          id: task.name || `Task ${task.external_id}`,
+          id: task.id || task.external_id,
           externalId: task.external_id,
+          name: task.name || `Task ${task.external_id}`,
           images: task.size,
           status: taskStatusLabel(task.status),
           progress: task.status.toLowerCase() === "completed" ? 100 : 0,
@@ -198,7 +199,7 @@ export function DataView() {
                             <ImageIcon className="size-4" />
                           </span>
                         )}
-                        {b.id}
+                        {b.name}
                       </div>
                     </td>
                     <td className="px-5 py-3 tabular-nums text-muted-foreground">{b.images.toLocaleString("pt-BR")}</td>

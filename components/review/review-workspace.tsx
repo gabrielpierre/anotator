@@ -100,7 +100,9 @@ function queueItemToAnnotation(item: BackendReviewQueueItem, index: number, clas
   const fallbackClass = classCatalog[0]?.name ?? "unknown"
   const cls = item.label ?? fallbackClass
   return {
-    id: stableNumericId(item.cvat_job_id ?? item.task_external_id ?? `queue-${index}`),
+    id: stableNumericId(
+      item.external_annotation_id ?? item.cvat_annotation_id ?? item.cvat_job_id ?? item.task_external_id ?? `queue-${index}`,
+    ),
     cls,
     conf: item.confidence ?? 1,
     origem: item.origin ?? "CVAT",
@@ -170,6 +172,13 @@ function boxFromNormalizedRecord(value: Record<string, unknown>): Box | null {
     w: clampPct(w * 100, 0, 100),
     h: clampPct(h * 100, 0, 100),
   }
+}
+
+function sameReviewFrame(annotation: ReviewAnnotation, current: ReviewAnnotation) {
+  if (current.id === emptyAnnotation.id) return false
+  if (annotation.id === current.id) return true
+  if (annotation.previewUrl && current.previewUrl) return annotation.previewUrl === current.previewUrl
+  return annotation.cvatJobId === current.cvatJobId && annotation.frame === current.frame
 }
 
 function stableNumericId(value: string) {
@@ -330,8 +339,14 @@ export function ReviewWorkspace() {
     [boxState, checkedClasses, onlyUnreviewed, onlyThisClass, selectedCls, minConf, sizeFilter, decisions, reviewItems],
   )
   const total = visibleAnnotations.length
-  const current =
-    visibleAnnotations.find((a) => a.id === selectedId) ?? visibleAnnotations[0] ?? reviewItems[0] ?? emptyAnnotation
+  const hasVisibleAnnotations = total > 0
+  const current = hasVisibleAnnotations
+    ? visibleAnnotations.find((a) => a.id === selectedId) ?? visibleAnnotations[0] ?? emptyAnnotation
+    : emptyAnnotation
+  const currentFrameAnnotations = hasVisibleAnnotations
+    ? visibleAnnotations.filter((annotation) => sameReviewFrame(annotation, current))
+    : []
+  const frameAnnotationTotal = currentFrameAnnotations.length
   const reviewedCount = Object.keys(decisions).length
   const queueTotal = reviewItems.length
   const currentQueueIndex = reviewItems.findIndex((item) => item.id === current.id)
@@ -425,7 +440,7 @@ export function ReviewWorkspace() {
             cvat_job_id: selected.cvatJobId,
             corrected_label: correctedLabel ?? null,
             actor: currentUser.email || currentUser.id,
-            patch_cvat: true,
+            patch_cvat: selected.labelId != null,
             payload: {
               confidence: selected.conf,
               frame: selected.frame,
@@ -708,7 +723,7 @@ export function ReviewWorkspace() {
                 draggable={false}
                 className="size-full select-none object-contain"
               />
-              {visibleAnnotations.map((a) => {
+              {currentFrameAnnotations.map((a) => {
                 const b = boxState[a.id]
                 const active = a.id === selectedId
                 const d = decisions[a.id]
@@ -756,6 +771,13 @@ export function ReviewWorkspace() {
                   </div>
                 )
               })}
+              {frameAnnotationTotal === 0 && (
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <div className="rounded-full bg-black/60 px-3 py-1.5 text-xs text-white/80">
+                    Nenhuma anotação com bounding box para revisar.
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Correção de classe com autocomplete (seta ↑, duplo clique ou "Corrigir classe") */}
@@ -839,7 +861,7 @@ export function ReviewWorkspace() {
             <div className="flex items-center gap-1 border-b border-border px-3">
               {(
                 [
-                  ["anotacoes", `Anotações (${total})`],
+                  ["anotacoes", `Anotações (${frameAnnotationTotal})`],
                   ["tracks", "Tracks (2)"],
                   ["tags", "Tags (0)"],
                   ["comentarios", "Comentários (0)"],
@@ -873,7 +895,7 @@ export function ReviewWorkspace() {
                     </tr>
                   </thead>
                   <tbody>
-                    {visibleAnnotations.map((a) => {
+                    {currentFrameAnnotations.map((a) => {
                       const active = a.id === selectedId
                       const d = decisions[a.id]
                       return (

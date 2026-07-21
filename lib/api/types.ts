@@ -146,6 +146,43 @@ export type BackendReviewQueueItem = {
   payload: Record<string, unknown>
 }
 
+export type BackendAnnotationRecord = {
+  id: string
+  external_id: string
+  cvat_job_id: string
+  task_external_id: string | null
+  annotation_type: string
+  cvat_annotation_id: string
+  frame: number | null
+  label_id: number | null
+  label_name: string | null
+  shape_type: string | null
+  source: string | null
+  confidence: number | null
+  points: unknown[]
+  review_state: string
+  raw: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+export type BackendManualAnnotationShape = {
+  client_id: string
+  shape_type: "rectangle" | "polygon" | "points"
+  label_name: string
+  points: number[]
+  bbox_norm?: Record<string, number> | null
+}
+
+export type BackendManualAnnotationSave = {
+  task_external_id: string
+  frame: number
+  shapes: BackendManualAnnotationShape[]
+  actor?: string
+  sync_cvat?: boolean
+  replace_existing?: boolean
+}
+
 export type BackendReviewDecisionValue = "accepted" | "rejected" | "corrected" | "uncertain" | "escalated"
 
 export type BackendReviewDecisionCreate = {
