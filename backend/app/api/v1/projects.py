@@ -8,13 +8,13 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import current_admin, current_user, db_session, require_project_access
 from app.models import (
+    AnnotationRecord,
     AuditEvent,
     CvatLabel,
     DatasetRelease,
     JobRecord,
     Project,
     ProjectMember,
-    ReviewDecision,
     Task,
     TrainingRun,
     User,
@@ -180,14 +180,19 @@ def project_dashboard(
         ClassDistribution(name=name, count=count, share=round((count / total_labels) * 100, 2))
         for name, count in sorted(labels.items())
     ]
+    pending_review_query = select(func.count(AnnotationRecord.id)).where(AnnotationRecord.review_state == "pending")
+    task_external_ids = [task.external_id for task in tasks]
+    if task_external_ids:
+        pending_review_query = pending_review_query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
+    elif project and project_id != "default":
+        pending_review_query = pending_review_query.where(AnnotationRecord.task_external_id == "__none__")
 
     stats = DashboardStats(
         projects=db.scalar(select(func.count(Project.id))) or 0,
         tasks=len(tasks),
         images=sum(task.size for task in tasks),
         jobs_running=db.scalar(select(func.count(JobRecord.id)).where(JobRecord.status == "running")) or 0,
-        pending_review=db.scalar(select(func.count(ReviewDecision.id)).where(ReviewDecision.decision == "uncertain"))
-        or 0,
+        pending_review=db.scalar(pending_review_query) or 0,
         dataset_releases=db.scalar(select(func.count(DatasetRelease.id))) or 0,
         training_runs=db.scalar(select(func.count(TrainingRun.id))) or 0,
     )

@@ -1,6 +1,8 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
+import { useSearchParams } from "next/navigation"
 import { Clock, Cpu, HardDrive, MemoryStick, Square } from "lucide-react"
 
 import { ProgressBar, Meter, StatusBadge } from "@/components/app/primitives"
@@ -9,12 +11,19 @@ import { MetricCard } from "@/components/snowui/metric-card"
 import { Button } from "@/components/ui/button"
 import { cancelJob, fetchJobCapacity, fetchJobs, jobsEventsUrl } from "@/lib/api/client"
 import { formatDateTimePt, toUiJobStatus } from "@/lib/api/status"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendJob, BackendJobCapacity } from "@/lib/api/types"
 
 export function JobsView() {
+  const searchParams = useSearchParams()
+  const projectId = searchParams.get("project")
+  const { projects } = useCurrentUser()
   const [backendJobs, setBackendJobs] = React.useState<BackendJob[] | null>(null)
   const [capacity, setCapacity] = React.useState<BackendJobCapacity | null>(null)
   const [cancelingIds, setCancelingIds] = React.useState<Set<string>>(new Set())
+  const scopedProject = projects.find((project) => project.id === projectId) ?? null
+  const defaultProject = projects[0] ?? null
+  const isProjectScoped = Boolean(projectId)
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -54,7 +63,10 @@ export function JobsView() {
     }
   }
 
-  const mappedJobs = backendJobs?.map(mapBackendJob) ?? []
+  const visibleBackendJobs = projectId
+    ? (backendJobs ?? []).filter((job) => jobMatchesProject(job, projectId))
+    : (backendJobs ?? [])
+  const mappedJobs = visibleBackendJobs.map(mapBackendJob)
   const activeItems = mappedJobs
     .filter((job) => job.status === "executando" || job.status === "pausado")
   const queuedItems = mappedJobs
@@ -75,11 +87,33 @@ export function JobsView() {
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Central de jobs</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Monitore syncs, releases, treinos, pipelines e exportacoes em execucao.
-        </p>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">
+            {isProjectScoped ? `Jobs do projeto ${scopedProject?.name ?? "selecionado"}` : "Jobs gerais"}
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {isProjectScoped
+              ? "Acompanhe importacoes, syncs, releases, treinos e pipelines deste projeto."
+              : "Visao administrativa dos jobs de todos os projetos."}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {isProjectScoped && (
+            <Button variant="outline" nativeButton={false} render={<Link href="/jobs" />}>
+              Ver jobs gerais
+            </Button>
+          )}
+          {!isProjectScoped && defaultProject && (
+            <Button
+              variant="outline"
+              nativeButton={false}
+              render={<Link href={`/jobs?project=${encodeURIComponent(defaultProject.id)}`} />}
+            >
+              Ver projeto atual
+            </Button>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -255,6 +289,28 @@ function mapBackendJob(job: BackendJob) {
     eta: "--",
     gpu: Number(job.resource_metrics.gpu ?? 0),
   }
+}
+
+function jobMatchesProject(job: BackendJob, projectId: string) {
+  const raw = job.raw ?? {}
+  const payload = objectValue(raw.payload)
+  const lineage = objectValue(raw.lineage)
+  const values = [
+    job.task_external_id,
+    raw.project_id,
+    raw.project_external_id,
+    raw.task_external_id,
+    payload.project_id,
+    payload.project_external_id,
+    payload.task_external_id,
+    lineage.project_id,
+    lineage.project_external_id,
+  ]
+  return values.some((value) => String(value ?? "") === projectId)
+}
+
+function objectValue(value: unknown) {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
 }
 
 function memoryUsage(capacity: BackendJobCapacity | null) {

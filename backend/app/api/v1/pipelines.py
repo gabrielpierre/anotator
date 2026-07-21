@@ -46,7 +46,7 @@ def create_pipeline_run(
         kind="pipeline",
         name=run.name,
         detail="Pipeline queued.",
-        raw={"operation": "pipeline_run", "pipeline_run_id": run.id},
+        raw={"operation": "pipeline_run", "pipeline_run_id": run.id, "lineage": lineage},
     )
     db.add(
         AuditEvent(
@@ -58,6 +58,7 @@ def create_pipeline_run(
             "definition_id": payload.definition_id,
             "source_release_id": payload.source_release_id,
             "target_release_name": payload.target_release_name,
+            "lineage": lineage,
         },
         )
     )

@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import {
   MousePointer2,
   Square,
@@ -29,6 +29,7 @@ import {
   fetchModelVersions,
   fetchInferenceSuggestions,
   fetchReviewAnnotations,
+  fetchTaskDataMeta,
   fetchTasks,
   jobsEventsUrl,
   saveManualAnnotations,
@@ -42,6 +43,7 @@ import type {
   BackendManualAnnotationShape,
   BackendModelVersion,
   BackendTask,
+  BackendTaskDataMeta,
 } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 import {
@@ -81,6 +83,9 @@ type Shape =
 
 const initialShapes: Shape[] = []
 
+type FrameDimensions = { width: number; height: number }
+type StageSize = { width: number; height: number }
+
 const clamp = (v: number, min = 0, max = 1) => Math.min(max, Math.max(min, v))
 const MIN_SCALE = 0.4
 const MAX_SCALE = 8
@@ -103,6 +108,7 @@ const POLY_CLOSE_DIST = 0.02
 
 export function AnnotateView() {
   const [tasks, setTasks] = useState<BackendTask[] | null>(null)
+  const [taskMeta, setTaskMeta] = useState<BackendTaskDataMeta | null>(null)
   const [modelVersions, setModelVersions] = useState<BackendModelVersion[]>([])
   const { currentUser } = useCurrentUser()
   const currentTask = tasks?.[0] ?? null
@@ -185,7 +191,30 @@ export function AnnotateView() {
   const currentTaskId = currentTask?.external_id ?? currentTask?.id
   const currentFrameKey = `${currentTaskId ?? "no-task"}:${currentFrame}`
   const previewSrc = taskFrameAssetUrl(currentTaskId, currentFrame) ?? "/placeholder.svg"
+  const [naturalFrameDimensionsByKey, setNaturalFrameDimensionsByKey] = useState<Record<string, FrameDimensions>>({})
+  const currentFrameDimensions = useMemo(
+    () => frameDimensionsFromMeta(taskMeta, currentFrame) ?? naturalFrameDimensionsByKey[currentFrameKey] ?? null,
+    [currentFrame, currentFrameKey, naturalFrameDimensionsByKey, taskMeta],
+  )
+  const stageAspectRatio = currentFrameDimensions
+    ? currentFrameDimensions.width / currentFrameDimensions.height
+    : 16 / 9
   const shapes = shapesByFrame[currentFrameKey] ?? initialShapes
+
+  useEffect(() => {
+    if (!currentTaskId) {
+      setTaskMeta(null)
+      return
+    }
+    const controller = new AbortController()
+    fetchTaskDataMeta(currentTaskId, controller.signal)
+      .then(setTaskMeta)
+      .catch(() => {
+        if (!controller.signal.aborted) setTaskMeta(null)
+      })
+    return () => controller.abort()
+  }, [currentTaskId])
+
   const currentFrameKeyRef = useRef(currentFrameKey)
   currentFrameKeyRef.current = currentFrameKey
   const setShapes = useCallback((updater: Shape[] | ((prev: Shape[]) => Shape[])) => {
@@ -202,15 +231,12 @@ export function AnnotateView() {
 
   useEffect(() => {
     const taskExternalId = currentTask?.external_id
-    if (!taskExternalId || loadedAnnotationKeys.current.has(currentFrameKey)) return
+    if (!taskExternalId || !currentFrameDimensions || loadedAnnotationKeys.current.has(currentFrameKey)) return
     const controller = new AbortController()
     fetchReviewAnnotations({ taskExternalId, frame: currentFrame }, controller.signal)
       .then((records) => {
         loadedAnnotationKeys.current.add(currentFrameKey)
-        const loadedShapes = records
-          .filter((record) => record.review_state !== "rejected")
-          .map(shapeFromAnnotationRecord)
-          .filter((shape): shape is Shape => Boolean(shape))
+        const loadedShapes = shapesFromAnnotationRecords(records, currentFrameDimensions)
         if (loadedShapes.length > 0) {
           nextId.current = Math.max(nextId.current, Math.max(...loadedShapes.map((shape) => shape.id)) + 1)
         }
@@ -224,7 +250,7 @@ export function AnnotateView() {
         if (!controller.signal.aborted) loadedAnnotationKeys.current.add(currentFrameKey)
       })
     return () => controller.abort()
-  }, [currentFrame, currentFrameKey, currentTask?.external_id])
+  }, [currentFrame, currentFrameDimensions, currentFrameKey, currentTask?.external_id])
 
   const suggestions = backendSuggestions
     .filter((suggestion) => suggestion.frame === currentFrame)
@@ -331,6 +357,7 @@ export function AnnotateView() {
 
   const containerRef = useRef<HTMLDivElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
+  const [stageSize, setStageSize] = useState<StageSize | null>(null)
   const viewRef = useRef(view)
   viewRef.current = view
   const toolRef = useRef(tool)
@@ -415,6 +442,41 @@ export function AnnotateView() {
     setView((v) => ({ ...v, s: clamp(v.s * factor, MIN_SCALE, MAX_SCALE) }))
   }, [])
   const resetView = useCallback(() => setView({ s: 1, tx: 0, ty: 0 }), [])
+
+  useLayoutEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+
+    const updateStageSize = () => {
+      const rect = container.getBoundingClientRect()
+      const style = window.getComputedStyle(container)
+      const horizontalPadding = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight)
+      const verticalPadding = Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom)
+      const availableWidth = Math.max(1, rect.width - horizontalPadding)
+      const availableHeight = Math.max(1, rect.height - verticalPadding)
+      let width = availableWidth
+      let height = width / stageAspectRatio
+      if (height > availableHeight) {
+        height = availableHeight
+        width = height * stageAspectRatio
+      }
+      setStageSize((previous) => {
+        if (previous && Math.abs(previous.width - width) < 0.5 && Math.abs(previous.height - height) < 0.5) {
+          return previous
+        }
+        return { width, height }
+      })
+    }
+
+    updateStageSize()
+    const observer = new ResizeObserver(updateStageSize)
+    observer.observe(container)
+    window.addEventListener("resize", updateStageSize)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener("resize", updateStageSize)
+    }
+  }, [stageAspectRatio])
 
   const dragWindow = (onMove: (e: PointerEvent) => void, onUp?: (e: PointerEvent) => void) => {
     const move = (e: PointerEvent) => onMove(e)
@@ -968,8 +1030,14 @@ export function AnnotateView() {
         >
           <div
             ref={stageRef}
-            className="relative aspect-[16/9] w-full max-w-4xl overflow-hidden rounded-lg shadow-2xl"
-            style={{ transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`, cursor }}
+            className="relative overflow-hidden rounded-lg shadow-2xl"
+            style={{
+              width: stageSize ? `${stageSize.width}px` : undefined,
+              height: stageSize ? `${stageSize.height}px` : undefined,
+              aspectRatio: `${stageAspectRatio}`,
+              transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`,
+              cursor,
+            }}
             onPointerDown={onStagePointerDown}
             onPointerMove={(e) => {
               if (toolRef.current === "polygon" && polyDraftRef.current?.length) {
@@ -983,8 +1051,18 @@ export function AnnotateView() {
             <img
               src={previewSrc}
               alt="Cena de rua para anotação"
-              className="pointer-events-none size-full object-cover"
+              className="pointer-events-none size-full object-contain"
               draggable={false}
+              onLoad={(event) => {
+                const image = event.currentTarget
+                if (!image.naturalWidth || !image.naturalHeight) return
+                const dimensions = { width: image.naturalWidth, height: image.naturalHeight }
+                setNaturalFrameDimensionsByKey((previous) => {
+                  const current = previous[currentFrameKey]
+                  if (current?.width === dimensions.width && current.height === dimensions.height) return previous
+                  return { ...previous, [currentFrameKey]: dimensions }
+                })
+              }}
             />
 
             {/* Committed shapes */}
@@ -1689,11 +1767,59 @@ function frameShapesSignature(shapes: Shape[]) {
   )
 }
 
-function shapeFromAnnotationRecord(record: BackendAnnotationRecord): Shape | null {
+function shapesFromAnnotationRecords(records: BackendAnnotationRecord[], dimensions: FrameDimensions): Shape[] {
+  const candidates = records
+    .filter((record) => record.review_state !== "deleted_by_reviewer")
+    .map((record) => {
+      const shape = shapeFromAnnotationRecord(record, dimensions)
+      return shape ? { record, shape, priority: annotationRecordPriority(record) } : null
+    })
+    .filter((candidate): candidate is { record: BackendAnnotationRecord; shape: Shape; priority: number } =>
+      Boolean(candidate),
+    )
+    .sort((a, b) => b.priority - a.priority || Date.parse(b.record.updated_at) - Date.parse(a.record.updated_at))
+
+  const kept: typeof candidates = []
+  for (const candidate of candidates) {
+    const duplicate = kept.some((existing) => duplicateBoxes(candidate.shape, existing.shape))
+    if (!duplicate) kept.push(candidate)
+  }
+  return kept.map((candidate) => candidate.shape)
+}
+
+function annotationRecordPriority(record: BackendAnnotationRecord) {
+  let priority = 0
+  if (record.external_id.startsWith("cvat_job:")) priority += 10
+  if (record.source === "cvat-plus" || record.raw.origin === "cvat-plus") priority -= 1
+  return priority
+}
+
+function duplicateBoxes(a: Shape, b: Shape) {
+  if (a.type !== "box" || b.type !== "box") return false
+  if (a.cls !== b.cls) return false
+  return boxIou(a, b) >= 0.6
+}
+
+function boxIou(
+  a: Extract<Shape, { type: "box" }>,
+  b: Extract<Shape, { type: "box" }>,
+) {
+  const ax2 = a.x + a.w
+  const ay2 = a.y + a.h
+  const bx2 = b.x + b.w
+  const by2 = b.y + b.h
+  const intersectionWidth = Math.max(0, Math.min(ax2, bx2) - Math.max(a.x, b.x))
+  const intersectionHeight = Math.max(0, Math.min(ay2, by2) - Math.max(a.y, b.y))
+  const intersection = intersectionWidth * intersectionHeight
+  const union = a.w * a.h + b.w * b.h - intersection
+  return union > 0 ? intersection / union : 0
+}
+
+function shapeFromAnnotationRecord(record: BackendAnnotationRecord, dimensions: FrameDimensions): Shape | null {
   const label = record.label_name ?? stringFromRecord(record.raw, "label_name") ?? "unknown"
   const id = numericIdFromString(record.external_id)
   const shapeType = record.shape_type ?? stringFromRecord(record.raw, "type")
-  const pointsNorm = numberArrayFromUnknown(record.raw.points_norm)
+  const pointsNorm = normalizedPointsFromRecord(record, dimensions)
 
   if (shapeType === "polygon" && pointsNorm.length >= 6) {
     return {
@@ -1708,12 +1834,16 @@ function shapeFromAnnotationRecord(record: BackendAnnotationRecord): Shape | nul
     return { id, type: "point", cls: label, x: clamp(pointsNorm[0]), y: clamp(pointsNorm[1]) }
   }
 
-  const bbox = normalizedBoxFromRecord(record.raw.bbox_norm)
-  if (bbox) return { id, type: "box", cls: label, ...bbox }
+  const rawBbox = normalizedBoxFromRecord(record.raw.bbox_norm)
+  if (rawBbox) {
+    const bbox = usesLegacyStageCoordinates(record)
+      ? legacyStageBoxToImageBox(rawBbox, dimensions)
+      : rawBbox
+    return { id, type: "box", cls: label, ...bbox }
+  }
 
-  const points = numberArrayFromUnknown(record.points)
-  if (points.length >= 4 && points.every((value) => value >= 0 && value <= 1)) {
-    const box = bboxFromNormalizedPoints(points)
+  if (pointsNorm.length >= 4) {
+    const box = bboxFromNormalizedPoints(pointsNorm)
     if (box) return { id, type: "box", cls: label, ...box }
   }
 
@@ -1731,6 +1861,77 @@ function mergeAnnotationClasses(classList: ClassItem[], records: BackendAnnotati
   return next
 }
 
+function frameDimensionsFromMeta(meta: BackendTaskDataMeta | null, frame: number): FrameDimensions | null {
+  const rawFrame = Array.isArray(meta?.frames) ? meta.frames[frame] : null
+  if (!rawFrame || typeof rawFrame !== "object" || Array.isArray(rawFrame)) return null
+  const record = rawFrame as Record<string, unknown>
+  const width = Number(record.width)
+  const height = Number(record.height)
+  if (![width, height].every((value) => Number.isFinite(value) && value > 0)) return null
+  return { width, height }
+}
+
+function normalizedPointsFromRecord(record: BackendAnnotationRecord, dimensions: FrameDimensions) {
+  const pointsNorm = numberArrayFromUnknown(record.raw.points_norm)
+  if (pointsNorm.length > 0 && pointsNorm.every(isNormalizedCoordinate)) {
+    return normalizeRecordPoints(pointsNorm, record, dimensions)
+  }
+
+  const points = numberArrayFromUnknown(record.points)
+  if (points.length === 0) return []
+  if (points.every(isNormalizedCoordinate)) return normalizeRecordPoints(points, record, dimensions)
+
+  return points.map((point, index) => {
+    const axisSize = index % 2 === 0 ? dimensions.width : dimensions.height
+    return clamp(point / axisSize)
+  })
+}
+
+function normalizeRecordPoints(
+  points: number[],
+  record: BackendAnnotationRecord,
+  dimensions: FrameDimensions,
+) {
+  const normalized = points.map((point) => clamp(point))
+  if (!usesLegacyStageCoordinates(record)) return normalized
+  const pairs = pairsFromNormalizedPoints(normalized).map((point) => legacyStagePointToImagePoint(point, dimensions))
+  return pairs.flatMap((point) => [point.x, point.y])
+}
+
+function usesLegacyStageCoordinates(record: BackendAnnotationRecord) {
+  return (
+    record.external_id.startsWith("manual:") &&
+    record.raw.origin === "cvat-plus" &&
+    record.raw.coordinate_space !== "image-normalized"
+  )
+}
+
+function legacyStageBoxToImageBox(box: { x: number; y: number; w: number; h: number }, dimensions: FrameDimensions) {
+  const topLeft = legacyStagePointToImagePoint({ x: box.x, y: box.y }, dimensions)
+  const bottomRight = legacyStagePointToImagePoint({ x: box.x + box.w, y: box.y + box.h }, dimensions)
+  return normalizedBoxFromEdges(topLeft.x, topLeft.y, bottomRight.x, bottomRight.y)
+}
+
+function legacyStagePointToImagePoint(point: { x: number; y: number }, dimensions: FrameDimensions) {
+  const imageAspectRatio = dimensions.width / dimensions.height
+  const legacyStageAspectRatio = 16 / 9
+  if (imageAspectRatio < legacyStageAspectRatio) {
+    const visibleShare = imageAspectRatio / legacyStageAspectRatio
+    const topCrop = (1 - visibleShare) / 2
+    return { x: clamp(point.x), y: clamp(point.y * visibleShare + topCrop) }
+  }
+  if (imageAspectRatio > legacyStageAspectRatio) {
+    const visibleShare = legacyStageAspectRatio / imageAspectRatio
+    const leftCrop = (1 - visibleShare) / 2
+    return { x: clamp(point.x * visibleShare + leftCrop), y: clamp(point.y) }
+  }
+  return { x: clamp(point.x), y: clamp(point.y) }
+}
+
+function isNormalizedCoordinate(value: number) {
+  return value >= 0 && value <= 1
+}
+
 function normalizedBoxFromRecord(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null
   const record = value as Record<string, unknown>
@@ -1740,6 +1941,19 @@ function normalizedBoxFromRecord(value: unknown) {
   const h = Number(record.h)
   if (![x, y, w, h].every((number) => Number.isFinite(number))) return null
   return { x: clamp(x), y: clamp(y), w: clamp(w), h: clamp(h) }
+}
+
+function normalizedBoxFromEdges(x1: number, y1: number, x2: number, y2: number) {
+  const left = clamp(Math.min(x1, x2))
+  const top = clamp(Math.min(y1, y2))
+  const right = clamp(Math.max(x1, x2))
+  const bottom = clamp(Math.max(y1, y2))
+  return {
+    x: left,
+    y: top,
+    w: clamp(right - left),
+    h: clamp(bottom - top),
+  }
 }
 
 function bboxFromNormalizedPoints(points: number[]) {

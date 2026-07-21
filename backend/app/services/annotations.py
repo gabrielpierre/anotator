@@ -1,5 +1,5 @@
-from dataclasses import dataclass
 import hashlib
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -70,48 +70,49 @@ def apply_review_decision(
     annotation = db.scalar(
         select(AnnotationRecord).where(AnnotationRecord.external_id == payload.external_annotation_id)
     )
-    before = annotation.raw if annotation else {}
+    before = dict(annotation.raw or {}) if annotation else {}
     after = dict(before)
-    action = _action_for_decision(payload.decision)
+    decision_value = _canonical_review_decision(payload.decision)
+    action = _action_for_decision(decision_value)
     cvat_synced = False
     cvat_error: str | None = None
 
     if annotation is not None:
-        if payload.decision == "corrected":
-            label_id = payload.corrected_label_id or _label_id_for_name(
-                db,
-                payload.corrected_label,
-                task_external_id=annotation.task_external_id,
-            )
-            if label_id is None:
-                cvat_error = "Corrected label id not found"
-            else:
-                after["label_id"] = label_id
-                annotation.label_id = label_id
-                annotation.label_name = payload.corrected_label or annotation.label_name
-        elif payload.decision == "rejected":
-            after = {"deleted": True, "raw": before}
+        if decision_value == "accepted":
+            after["review_status"] = "accepted"
+            after["release_ready"] = True
+        elif decision_value == "needs_annotation":
+            after["review_status"] = "needs_annotation"
+            after["needs_annotation"] = True
+            after["release_ready"] = False
+        elif decision_value == "corrected":
+            label_error = _apply_corrected_label(db, annotation, payload, after)
+            if label_error:
+                cvat_error = label_error
+            _apply_review_geometry(db, annotation, payload.payload, after)
+            after["review_status"] = "corrected"
+            after["release_ready"] = True
+        elif decision_value == "deleted_by_reviewer":
+            after["review_status"] = "deleted_by_reviewer"
+            after["deleted_by_reviewer"] = True
+            after["release_ready"] = False
 
-        annotation.review_state = payload.decision
+        annotation.review_state = decision_value
+        annotation.raw = after
         db.add(annotation)
 
         if payload.patch_cvat and action and cvat_error is None:
-            if action == "update" and annotation.label_id is None:
-                after["cvat_sync_skipped"] = "missing_label_id"
-                annotation.raw = {**annotation.raw, "cvat_sync_skipped": "missing_label_id"}
-                db.add(annotation)
-            else:
-                try:
-                    _patch_cvat_annotation(client, annotation, action, after)
-                    cvat_synced = True
-                except Exception as exc:
-                    cvat_error = str(exc)
+            try:
+                _patch_cvat_annotation(client, annotation, action, after)
+                cvat_synced = True
+            except Exception as exc:
+                cvat_error = str(exc)
     else:
         cvat_error = "Annotation not found locally"
 
     decision = ReviewDecision(
         external_annotation_id=payload.external_annotation_id,
-        decision=payload.decision,
+        decision=decision_value,
         cvat_job_id=payload.cvat_job_id or (annotation.cvat_job_id if annotation else None),
         corrected_label=payload.corrected_label,
         reason=payload.reason,
@@ -120,6 +121,7 @@ def apply_review_decision(
             **payload.payload,
             "annotation_type": payload.annotation_type or (annotation.annotation_type if annotation else None),
             "action": action,
+            "review_state": decision_value,
         },
         cvat_synced=cvat_synced,
         cvat_error=cvat_error,
@@ -138,7 +140,7 @@ def apply_review_decision(
     db.add(
         AuditEvent(
             actor=payload.actor,
-            action=f"review_{payload.decision}",
+            action=f"review_{decision_value}",
             target=payload.external_annotation_id,
             reason=payload.reason or cvat_error,
             confidence=payload.payload.get("confidence") if payload.payload else None,
@@ -147,6 +149,7 @@ def apply_review_decision(
                 "cvat_synced": cvat_synced,
                 "cvat_error": cvat_error,
                 "action": action,
+                "review_state": decision_value,
             },
         )
     )
@@ -211,6 +214,7 @@ def save_manual_annotations(
             "attributes": [],
             "bbox_norm": shape.bbox_norm,
             "points_norm": shape.points,
+            "coordinate_space": "image-normalized",
             "client_id": shape.client_id,
             "origin": "cvat-plus",
             "_cvat_version": version,
@@ -373,7 +377,7 @@ def _cvat_annotation_version(client: CvatClient, cvat_job_id: str | None) -> Any
 
 def _manual_external_id(task_external_id: str, frame: int, client_id: str) -> str:
     raw = f"{task_external_id}:{frame}:{client_id}"
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
     safe_client_id = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in client_id)[:36]
     return f"manual:{task_external_id}:{frame}:{safe_client_id or digest}-{digest}"
 
@@ -383,7 +387,7 @@ def _ensure_local_label(db: Session, task: Task, name: str) -> None:
         select(CvatLabel).where(CvatLabel.task_external_id == task.external_id, CvatLabel.name == name)
     )
     if existing is None:
-        digest = hashlib.sha1(f"{task.external_id}:{name}".encode("utf-8")).hexdigest()[:16]
+        digest = hashlib.sha1(f"{task.external_id}:{name}".encode()).hexdigest()[:16]
         label = CvatLabel(
             external_id=f"manual:{task.external_id}:label:{digest}",
             name=name,
@@ -400,15 +404,129 @@ def _ensure_local_label(db: Session, task: Task, name: str) -> None:
         db.add(task)
 
 
+def _canonical_review_decision(decision: str) -> str:
+    if decision == "rejected":
+        return "needs_annotation"
+    return decision
+
+
+def _apply_corrected_label(
+    db: Session,
+    annotation: AnnotationRecord,
+    payload: ReviewDecisionCreate,
+    after: dict[str, Any],
+) -> str | None:
+    if not payload.corrected_label:
+        if annotation.label_id is not None:
+            after["label_id"] = annotation.label_id
+        return None
+
+    label_id = payload.corrected_label_id or _label_id_for_name(
+        db,
+        payload.corrected_label,
+        task_external_id=annotation.task_external_id,
+    )
+    if label_id is None:
+        return "Corrected label id not found"
+
+    after["label_id"] = label_id
+    after["label_name"] = payload.corrected_label
+    annotation.label_id = label_id
+    annotation.label_name = payload.corrected_label
+    return None
+
+
+def _apply_review_geometry(
+    db: Session,
+    annotation: AnnotationRecord,
+    review_payload: dict[str, Any],
+    after: dict[str, Any],
+) -> None:
+    box = _box_from_payload(review_payload.get("local_box"))
+    if box is None:
+        return
+
+    dimensions = _payload_frame_dimensions(review_payload.get("frame_dimensions"))
+    if dimensions is None and annotation.task_external_id and annotation.frame is not None:
+        dimensions = _frame_dimensions(db, annotation.task_external_id, annotation.frame)
+        if dimensions == (1.0, 1.0):
+            dimensions = None
+    if dimensions is None:
+        after["review_geometry_skipped"] = "missing_frame_dimensions"
+        return
+
+    width, height = dimensions
+    x1 = clamp_float(box["x"] / 100 * width, 0, width)
+    y1 = clamp_float(box["y"] / 100 * height, 0, height)
+    x2 = clamp_float((box["x"] + box["w"]) / 100 * width, 0, width)
+    y2 = clamp_float((box["y"] + box["h"]) / 100 * height, 0, height)
+    if x2 <= x1 or y2 <= y1:
+        after["review_geometry_skipped"] = "invalid_box"
+        return
+
+    shape_type = (after.get("type") or annotation.shape_type or "rectangle").lower()
+    points = _points_from_box(x1, y1, x2, y2, shape_type)
+    points_norm = _points_from_box(
+        box["x"] / 100,
+        box["y"] / 100,
+        (box["x"] + box["w"]) / 100,
+        (box["y"] + box["h"]) / 100,
+        shape_type,
+    )
+    annotation.points = points
+    after["points"] = points
+    after["points_norm"] = points_norm
+    after["bbox_norm"] = {
+        "x": round(box["x"] / 100, 6),
+        "y": round(box["y"] / 100, 6),
+        "w": round(box["w"] / 100, 6),
+        "h": round(box["h"] / 100, 6),
+    }
+    after["coordinate_space"] = "image-normalized"
+    after["review_corrected_geometry"] = True
+
+
+def _box_from_payload(value: Any) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    parsed = {key: _float_or_none(value.get(key)) for key in ("x", "y", "w", "h")}
+    if any(number is None for number in parsed.values()):
+        return None
+    box = {key: float(number) for key, number in parsed.items() if number is not None}
+    if max(box.values()) <= 1:
+        box = {key: number * 100 for key, number in box.items()}
+    x = clamp_float(box["x"], 0, 100)
+    y = clamp_float(box["y"], 0, 100)
+    w = clamp_float(box["w"], 0, 100 - x)
+    h = clamp_float(box["h"], 0, 100 - y)
+    if w <= 0 or h <= 0:
+        return None
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def _payload_frame_dimensions(value: Any) -> tuple[float, float] | None:
+    if not isinstance(value, dict):
+        return None
+    width = _float_or_none(value.get("width"))
+    height = _float_or_none(value.get("height"))
+    if width and height and width > 0 and height > 0:
+        return width, height
+    return None
+
+
+def _points_from_box(x1: float, y1: float, x2: float, y2: float, shape_type: str) -> list[float]:
+    if shape_type == "polygon":
+        return [round(value, 3) for value in (x1, y1, x2, y1, x2, y2, x1, y2)]
+    return [round(value, 3) for value in (x1, y1, x2, y2)]
+
+
 def _patch_cvat_annotation(
     client: CvatClient,
     annotation: AnnotationRecord,
     action: str,
     raw: dict[str, Any],
 ) -> None:
-    patch_item = {key: value for key, value in raw.items() if not key.startswith("_")}
-    if action == "delete":
-        patch_item = {"id": _int_or_none(annotation.cvat_annotation_id) or annotation.cvat_annotation_id}
+    patch_item = _cvat_patch_item(annotation, raw)
     version = annotation.raw.get("_cvat_version")
     body = {"version": version} if version is not None else {}
     body["tags"] = []
@@ -416,6 +534,42 @@ def _patch_cvat_annotation(
     body["tracks"] = []
     body[_collection_for_annotation_type(annotation.annotation_type)] = [patch_item]
     client.partial_update_job_annotations(annotation.cvat_job_id, action, body)
+
+
+def _cvat_patch_item(annotation: AnnotationRecord, raw: dict[str, Any]) -> dict[str, Any]:
+    annotation_id = _int_or_none(annotation.cvat_annotation_id)
+    if annotation_id is None:
+        raise ValueError("CVAT annotation id unavailable for this local annotation")
+
+    frame = _int_or_none(raw.get("frame")) if raw.get("frame") is not None else annotation.frame
+    label_id = _int_or_none(raw.get("label_id")) if raw.get("label_id") is not None else annotation.label_id
+    points = raw.get("points") if isinstance(raw.get("points"), list) else annotation.points
+    shape_type = raw.get("type") or annotation.shape_type or "rectangle"
+
+    missing = []
+    if frame is None:
+        missing.append("frame")
+    if label_id is None:
+        missing.append("label_id")
+    if not points:
+        missing.append("points")
+    if missing:
+        raise ValueError(f"CVAT patch missing required fields: {', '.join(missing)}")
+
+    item: dict[str, Any] = {
+        "id": annotation_id,
+        "type": shape_type,
+        "frame": frame,
+        "label_id": label_id,
+        "points": points,
+    }
+    attributes = raw.get("attributes")
+    if isinstance(attributes, list):
+        item["attributes"] = attributes
+    for key in ("occluded", "outside", "z_order", "rotation", "group", "source"):
+        if key in raw:
+            item[key] = raw[key]
+    return item
 
 
 def _add_revision(
@@ -432,7 +586,7 @@ def _add_revision(
     annotation_type = payload.annotation_type or (annotation.annotation_type if annotation else "shape")
     common = {
         "cvat_job_id": payload.cvat_job_id or (annotation.cvat_job_id if annotation else None),
-        "decision": payload.decision,
+        "decision": str(after.get("review_status") or _canonical_review_decision(payload.decision)),
         "action": action,
         "before": before,
         "after": after,
@@ -447,9 +601,9 @@ def _add_revision(
 
 
 def _action_for_decision(decision: str) -> str | None:
-    if decision == "rejected":
+    if decision == "deleted_by_reviewer":
         return "delete"
-    if decision in {"accepted", "corrected"}:
+    if decision == "corrected":
         return "update"
     return None
 
@@ -545,3 +699,7 @@ def _float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def clamp_float(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))

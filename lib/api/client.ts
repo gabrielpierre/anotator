@@ -32,6 +32,7 @@ import type {
   BackendProjectUpdate,
   BackendReviewDecision,
   BackendReviewDecisionCreate,
+  BackendReviewQueueCount,
   BackendReviewQueueItem,
   BackendTask,
   BackendTaskDataMeta,
@@ -72,9 +73,15 @@ export function apiAssetUrl(path: string | null | undefined) {
   return withApiKeyQuery(`${base}${path.startsWith("/") ? path : `/${path}`}`)
 }
 
-export function taskFrameAssetUrl(taskId: string | null | undefined, frame: number) {
+export function taskFrameAssetUrl(
+  taskId: string | null | undefined,
+  frame: number,
+  options: { variant?: "annotation" | "original"; maxSide?: number } = {},
+) {
   if (!taskId) return null
-  return apiAssetUrl(`/api/v1/tasks/${encodeURIComponent(taskId)}/frame/${frame}`)
+  const query = new URLSearchParams({ variant: options.variant ?? "annotation" })
+  if (options.maxSide) query.set("max_side", String(options.maxSide))
+  return apiAssetUrl(`/api/v1/tasks/${encodeURIComponent(taskId)}/frame/${frame}?${query.toString()}`)
 }
 
 function apiHeaders(headers: HeadersInit = {}) {
@@ -306,6 +313,10 @@ export function fetchReviewQueue(signal?: AbortSignal) {
   return getJson<BackendReviewQueueItem[]>("/review/queue", signal)
 }
 
+export function fetchReviewQueueCount(signal?: AbortSignal) {
+  return getJson<BackendReviewQueueCount>("/review/queue/count", signal)
+}
+
 export function fetchReviewAnnotations(
   params: { taskExternalId?: string; frame?: number } = {},
   signal?: AbortSignal,
@@ -448,6 +459,63 @@ export async function uploadImportTaskFiles(jobId: string, files: File[], signal
     throw new Error(`Backend upload failed: ${response.status} ${response.statusText}`)
   }
   return response.json() as Promise<BackendImportJob>
+}
+
+export function uploadImportTaskFilesWithProgress(
+  jobId: string,
+  files: File[],
+  onProgress: (progress: { loaded: number; total: number; percent: number }) => void,
+) {
+  return new Promise<BackendImportJob>((resolve, reject) => {
+    const form = new FormData()
+    files.forEach((file) => form.append("files", file))
+
+    const request = new XMLHttpRequest()
+    request.open("POST", `${apiBaseUrl()}/imports/tasks/${encodeURIComponent(jobId)}/files`)
+    request.timeout = 20 * 60 * 1000
+    const key = apiKey()
+    const token = authToken()
+    request.setRequestHeader("Accept", "application/json")
+    if (key) request.setRequestHeader("X-API-Key", key)
+    if (token) request.setRequestHeader("Authorization", `Bearer ${token}`)
+
+    request.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return
+      onProgress({
+        loaded: event.loaded,
+        total: event.total,
+        percent: Math.min(100, Math.round((event.loaded / event.total) * 100)),
+      })
+    }
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) {
+        onProgress({ loaded: 1, total: 1, percent: 100 })
+        resolve(JSON.parse(request.responseText) as BackendImportJob)
+      } else {
+        reject(new Error(uploadErrorMessage(request)))
+      }
+    }
+    request.onerror = () =>
+      reject(
+        new Error(
+          "Conexao com o backend caiu durante o upload. Verifique se o backend continua rodando e se o storage local esta ativo.",
+        ),
+      )
+    request.onabort = () => reject(new Error("Upload cancelado."))
+    request.ontimeout = () => reject(new Error("Upload enviado, mas o backend demorou demais para finalizar o processamento."))
+    request.send(form)
+  })
+}
+
+function uploadErrorMessage(request: XMLHttpRequest) {
+  const fallback = `Backend upload failed: ${request.status} ${request.statusText}`
+  if (!request.responseText) return fallback
+  try {
+    const parsed = JSON.parse(request.responseText) as { detail?: unknown }
+    return typeof parsed.detail === "string" ? parsed.detail : fallback
+  } catch {
+    return request.responseText || fallback
+  }
 }
 
 export function fetchImportJob(jobId: string, signal?: AbortSignal) {

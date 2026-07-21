@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -7,6 +7,7 @@ from app.core.config import get_settings
 from app.models import Task, TaskDataMeta
 from app.schemas import TaskDataMetaRead, TaskRead
 from app.services.cvat_client import CvatClient
+from app.services.frame_previews import retrieve_annotation_frame_preview
 
 router = APIRouter()
 
@@ -47,7 +48,13 @@ def get_task_preview(task_id: str, db: Session = Depends(db_session)) -> Respons
 
 
 @router.get("/{task_id}/frame/{frame}")
-def get_task_frame(task_id: str, frame: int, db: Session = Depends(db_session)) -> Response:
+def get_task_frame(
+    task_id: str,
+    frame: int,
+    variant: str = Query(default="annotation", pattern="^(annotation|original)$"),
+    max_side: int | None = Query(default=None, ge=256, le=8192),
+    db: Session = Depends(db_session),
+) -> Response:
     task = _resolve_task(db, task_id)
     external_id = task.external_id if task else task_id
     if frame < 0:
@@ -55,12 +62,35 @@ def get_task_frame(task_id: str, frame: int, db: Session = Depends(db_session)) 
     if task and task.size and frame >= task.size:
         raise HTTPException(status_code=404, detail="Frame not found")
 
-    client = CvatClient(get_settings())
+    settings = get_settings()
+    client = CvatClient(settings)
     try:
-        image = client.retrieve_task_frame(external_id, frame)
+        if variant == "original":
+            image = client.retrieve_task_frame(external_id, frame, quality="original")
+            return Response(
+                content=image.content,
+                media_type=image.content_type or "image/jpeg",
+                headers={"Cache-Control": "private, max-age=3600"},
+            )
+
+        preview = retrieve_annotation_frame_preview(
+            client=client,
+            settings=settings,
+            task_id=external_id,
+            frame=frame,
+            max_side=max_side,
+        )
+        return Response(
+            content=preview.content,
+            media_type=preview.content_type,
+            headers={
+                "Cache-Control": "private, max-age=86400",
+                "X-Frame-Variant": "annotation",
+                "X-Frame-Preview-Source": preview.source,
+            },
+        )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"CVAT frame unavailable: {exc}") from exc
-    return Response(content=image.content, media_type=image.content_type or "image/jpeg")
 
 
 def _resolve_task(db: Session, task_id: str) -> Task | None:

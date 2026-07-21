@@ -20,7 +20,6 @@ import {
   ArrowRight,
   ArrowLeft,
   ArrowUp,
-  ArrowDown,
 } from "lucide-react"
 import { apiAssetUrl, createReviewDecision, fetchReviewQueue, fetchTasks } from "@/lib/api/client"
 import { labelsFromTasks, type ApiClassItem } from "@/lib/api/status"
@@ -28,9 +27,11 @@ import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendReviewQueueItem, BackendTask } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
-type Decision = "aceito" | "rejeitado" | "corrigido" | "incerto"
+type Decision = "aceito" | "anotacao" | "corrigido" | "excluido"
 
 type Box = { x: number; y: number; w: number; h: number }
+type EditSnapshot = { id: number; box?: Box }
+type FrameDimensions = { width: number; height: number }
 type Handle = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
 type ReviewAnnotation = {
   id: number
@@ -49,6 +50,7 @@ type ReviewAnnotation = {
   taskName?: string
   cvatJobId?: string | null
   raw?: Record<string, unknown>
+  frameDimensions?: FrameDimensions | null
 }
 
 const initialBoxes: Record<number, Box> = {}
@@ -68,9 +70,9 @@ const handles: { id: Handle; cls: string; cursor: string }[] = [
 
 const decisionInfo: Record<Decision, { label: string; text: string; dot: string; ring: string }> = {
   aceito: { label: "Aceito", text: "text-brand-green", dot: "bg-brand-green", ring: "ring-brand-green" },
-  rejeitado: { label: "Rejeitado", text: "text-destructive", dot: "bg-destructive", ring: "ring-destructive" },
+  anotacao: { label: "Para anotação", text: "text-destructive", dot: "bg-destructive", ring: "ring-destructive" },
   corrigido: { label: "Corrigido", text: "text-warning", dot: "bg-warning", ring: "ring-warning" },
-  incerto: { label: "Incerto", text: "text-brand-blue", dot: "bg-brand-blue", ring: "ring-brand-blue" },
+  excluido: { label: "Excluído", text: "text-destructive", dot: "bg-destructive", ring: "ring-destructive" },
 }
 
 const confOptions: { label: string; value: number }[] = [
@@ -118,6 +120,7 @@ function queueItemToAnnotation(item: BackendReviewQueueItem, index: number, clas
     taskName: item.task_name ?? undefined,
     cvatJobId: item.cvat_job_id,
     raw: objectRecord(item.payload.raw),
+    frameDimensions: frameDimensionsFromPayload(item.payload.frame_dimensions),
   }
 }
 
@@ -144,10 +147,11 @@ function boxFromAnnotation(item: ReviewAnnotation): Box | null {
   if (shapeBox) return shapeBox
 
   const points = item.points?.map(Number).filter(Number.isFinite) ?? []
-  if (points.length < 4 || points.some((value) => value < 0 || value > 1)) return null
+  const normalizedPoints = normalizedPointsForReview(points, item)
+  if (normalizedPoints.length < 4) return null
 
-  const xs = points.filter((_, index) => index % 2 === 0)
-  const ys = points.filter((_, index) => index % 2 === 1)
+  const xs = normalizedPoints.filter((_, index) => index % 2 === 0)
+  const ys = normalizedPoints.filter((_, index) => index % 2 === 1)
   const minX = Math.min(...xs)
   const minY = Math.min(...ys)
   const maxX = Math.max(...xs)
@@ -158,6 +162,29 @@ function boxFromAnnotation(item: ReviewAnnotation): Box | null {
     w: clampPct((maxX - minX) * 100, 0, 100),
     h: clampPct((maxY - minY) * 100, 0, 100),
   }
+}
+
+function normalizedPointsForReview(points: number[], item: ReviewAnnotation) {
+  const rawPointsNorm = Array.isArray(item.raw?.points_norm)
+    ? item.raw.points_norm.map(Number).filter(Number.isFinite)
+    : []
+  const source = rawPointsNorm.length >= 4 ? rawPointsNorm : points
+  if (source.length < 4) return []
+  if (source.every((value) => value >= 0 && value <= 1)) return source.map((value) => clampPct(value, 0, 1))
+  const dimensions = item.frameDimensions
+  if (!dimensions) return []
+  return source.map((value, index) => {
+    const axisSize = index % 2 === 0 ? dimensions.width : dimensions.height
+    return clampPct(value / axisSize, 0, 1)
+  })
+}
+
+function frameDimensionsFromPayload(value: unknown): FrameDimensions | null {
+  const record = objectRecord(value)
+  const width = Number(record.width)
+  const height = Number(record.height)
+  if (![width, height].every((number) => Number.isFinite(number) && number > 0)) return null
+  return { width, height }
 }
 
 function boxFromNormalizedRecord(value: Record<string, unknown>): Box | null {
@@ -205,9 +232,9 @@ function colorForName(name: string) {
 
 function decisionToBackend(decision: Decision) {
   if (decision === "aceito") return "accepted"
-  if (decision === "rejeitado") return "rejected"
+  if (decision === "anotacao") return "needs_annotation"
   if (decision === "corrigido") return "corrected"
-  return "uncertain"
+  return "deleted_by_reviewer"
 }
 
 const emptyAnnotation: ReviewAnnotation = {
@@ -252,9 +279,10 @@ export function ReviewWorkspace() {
   const scaleRef = React.useRef(scale)
   scaleRef.current = scale
 
-  // ---- Correção de classe com autocomplete ----
+  // ---- Correcao de objeto ----
   const [clsOverride, setClsOverride] = React.useState<Record<number, string>>({})
   const [correcting, setCorrecting] = React.useState(false)
+  const [editSnapshot, setEditSnapshot] = React.useState<EditSnapshot | null>(null)
   const [classQuery, setClassQuery] = React.useState("")
   const correctInputRef = React.useRef<HTMLInputElement>(null)
   const clsColor = React.useCallback(
@@ -295,13 +323,19 @@ export function ReviewWorkspace() {
     [clsOverride],
   )
 
-  const openCorrection = React.useCallback((id?: number) => {
-    if (id != null) setSelectedId(id)
-    setClassQuery("")
-    setCorrecting(true)
-    // Foca o input após renderizar
-    requestAnimationFrame(() => correctInputRef.current?.focus())
-  }, [])
+  const openCorrection = React.useCallback(
+    (id?: number) => {
+      const targetId = id ?? selectedId
+      const target = reviewItems.find((item) => item.id === targetId) ?? reviewItems[0]
+      if (!target || target.id === emptyAnnotation.id) return
+      setSelectedId(target.id)
+      setClassQuery(clsOf(target))
+      setEditSnapshot({ id: target.id, box: boxState[target.id] })
+      setCorrecting(true)
+      requestAnimationFrame(() => correctInputRef.current?.focus())
+    },
+    [boxState, clsOf, reviewItems, selectedId],
+  )
 
   const classSuggestions = React.useMemo(() => {
     const q = classQuery.trim().toLowerCase()
@@ -360,25 +394,6 @@ export function ReviewWorkspace() {
     if (next) setSelectedId(next.id)
   }, [selectedId, visibleAnnotations])
 
-  const deleteBox = React.useCallback(
-    (id: number) => {
-      const idx = visibleAnnotations.findIndex((a) => a.id === id)
-      const fallback = visibleAnnotations[idx + 1] ?? visibleAnnotations[idx - 1]
-      setBoxState((prev) => {
-        const next = { ...prev }
-        delete next[id]
-        return next
-      })
-      setDecisions((d) => {
-        const next = { ...d }
-        delete next[id]
-        return next
-      })
-      if (id === selectedId && fallback) setSelectedId(fallback.id)
-    },
-    [visibleAnnotations, selectedId],
-  )
-
   const beginDrag = React.useCallback(
     (e: React.PointerEvent, id: number, mode: "move" | Handle) => {
       e.preventDefault()
@@ -428,6 +443,8 @@ export function ReviewWorkspace() {
   const decide = React.useCallback(
     async (decision: Decision, correctedLabel?: string) => {
       const selected = current
+      if (selected.id === emptyAnnotation.id) return
+      const backendDecision = decisionToBackend(decision)
       setDecisions((d) => ({ ...d, [selected.id]: decision }))
       setSyncState((state) => ({ ...state, [selected.id]: { synced: false, error: null } }))
       setLog((l) => [{ id: selected.id, decision }, ...l].slice(0, 20))
@@ -435,23 +452,32 @@ export function ReviewWorkspace() {
         try {
           const response = await createReviewDecision({
             external_annotation_id: selected.externalAnnotationId,
-            decision: decisionToBackend(decision),
+            decision: backendDecision,
             annotation_type: selected.annotationType,
             cvat_job_id: selected.cvatJobId,
-            corrected_label: correctedLabel ?? null,
+            corrected_label: backendDecision === "corrected" ? correctedLabel ?? clsOf(selected) : null,
             actor: currentUser.email || currentUser.id,
-            patch_cvat: selected.labelId != null,
+            patch_cvat: backendDecision === "corrected" || backendDecision === "deleted_by_reviewer",
             payload: {
               confidence: selected.conf,
               frame: selected.frame,
               previous_label: selected.cls,
               local_box: boxState[selected.id],
+              frame_dimensions: selected.frameDimensions,
             },
           })
           setSyncState((state) => ({
             ...state,
             [selected.id]: { synced: response.cvat_synced, error: response.cvat_error },
           }))
+          window.dispatchEvent(new Event("review-queue-updated"))
+          if (decision === "excluido") {
+            setBoxState((prev) => {
+              const next = { ...prev }
+              delete next[selected.id]
+              return next
+            })
+          }
         } catch (error) {
           setSyncState((state) => ({
             ...state,
@@ -464,19 +490,39 @@ export function ReviewWorkspace() {
       }
       if (autoAdvance) selectNext()
     },
-    [autoAdvance, boxState, current, currentUser.email, currentUser.id, selectNext],
+    [autoAdvance, boxState, clsOf, current, currentUser.email, currentUser.id, selectNext],
   )
 
-  // Aplica a classe escolhida no autocomplete e registra a decisão "corrigido".
-  const applyCorrection = React.useCallback(
-    (name: string) => {
-      setClsOverride((prev) => ({ ...prev, [selectedId]: name }))
-      setCorrecting(false)
-      setClassQuery("")
-      void decide("corrigido", name)
-    },
-    [selectedId, decide],
-  )
+  // Escolha de classe e acoes do modo de correcao.
+  const chooseCorrectionClass = React.useCallback((name: string) => {
+    setClassQuery(name)
+    requestAnimationFrame(() => correctInputRef.current?.focus())
+  }, [])
+
+  const cancelCorrection = React.useCallback(() => {
+    if (editSnapshot?.box) {
+      setBoxState((prev) => ({ ...prev, [editSnapshot.id]: editSnapshot.box as Box }))
+    }
+    setCorrecting(false)
+    setEditSnapshot(null)
+    setClassQuery("")
+  }, [editSnapshot])
+
+  const saveCorrection = React.useCallback(() => {
+    const name = classQuery.trim() || clsOf(current)
+    setClsOverride((prev) => ({ ...prev, [current.id]: name }))
+    setCorrecting(false)
+    setEditSnapshot(null)
+    setClassQuery("")
+    void decide("corrigido", name)
+  }, [classQuery, clsOf, current, decide])
+
+  const deleteSelectedAnnotation = React.useCallback(() => {
+    setCorrecting(false)
+    setEditSnapshot(null)
+    setClassQuery("")
+    void decide("excluido")
+  }, [decide])
 
   const undo = React.useCallback(() => {
     setLog((l) => {
@@ -503,7 +549,11 @@ export function ReviewWorkspace() {
       }
       if (e.key === "Delete" || e.key === "Backspace") {
         e.preventDefault()
-        deleteBox(selectedId)
+        if (correcting) {
+          deleteSelectedAnnotation()
+        } else {
+          openCorrection(selectedId)
+        }
         return
       }
       if (e.key === "ArrowRight") {
@@ -511,20 +561,15 @@ export function ReviewWorkspace() {
         void decide("aceito")
       } else if (e.key === "ArrowLeft") {
         e.preventDefault()
-        void decide("rejeitado")
+        void decide("anotacao")
       } else if (e.key === "ArrowUp") {
         e.preventDefault()
         openCorrection()
-      } else if (e.key === "ArrowDown") {
-        e.preventDefault()
-        void decide("incerto")
-      } else if (/^[1-5]$/.test(e.key)) {
-        void decide("corrigido")
       }
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [decide, undo, deleteBox, selectedId, openCorrection])
+  }, [correcting, decide, deleteSelectedAnnotation, openCorrection, selectedId, undo])
 
   const onWheelZoom = React.useCallback((e: React.WheelEvent) => {
     e.preventDefault()
@@ -730,7 +775,13 @@ export function ReviewWorkspace() {
                 return (
                   <div
                     key={a.id}
-                    onPointerDown={(e) => beginDrag(e, a.id, "move")}
+                    onPointerDown={(e) => {
+                      if (correcting && active) {
+                        beginDrag(e, a.id, "move")
+                        return
+                      }
+                      setSelectedId(a.id)
+                    }}
                     onDoubleClick={(e) => {
                       e.stopPropagation()
                       openCorrection(a.id)
@@ -746,7 +797,7 @@ export function ReviewWorkspace() {
                       borderColor: clsColor(clsOf(a)),
                       opacity: active ? 1 : d ? 0.45 : 0.85,
                       boxShadow: active ? "0 0 0 2px rgba(0,0,0,0.4)" : undefined,
-                      cursor: active ? "move" : "pointer",
+                      cursor: correcting && active ? "move" : "pointer",
                     }}
                   >
                     <span
@@ -756,6 +807,7 @@ export function ReviewWorkspace() {
                       {clsOf(a)} {a.conf.toFixed(2)}
                     </span>
                     {active &&
+                      correcting &&
                       handles.map((h) => (
                         <span
                           key={h.id}
@@ -780,17 +832,31 @@ export function ReviewWorkspace() {
               )}
             </div>
 
-            {/* Correção de classe com autocomplete (seta ↑, duplo clique ou "Corrigir classe") */}
+            {/* Correção de objeto */}
             {correcting && (
               <div
-                className="absolute left-1/2 top-4 z-20 w-72 -translate-x-1/2 rounded-xl border border-border bg-popover p-3 shadow-xl"
+                className="absolute left-1/2 top-4 z-20 w-[22rem] -translate-x-1/2 rounded-xl border border-border bg-popover p-3 shadow-xl"
                 role="dialog"
-                aria-label="Corrigir classe da anotação"
+                aria-label="Corrigir anotação"
               >
-                <p className="mb-2 text-xs font-medium text-muted-foreground">
-                  Corrigir classe de <span className="font-semibold text-foreground">#{current.id}</span>{" "}
-                  <span className="text-foreground">({clsOf(current)})</span>
-                </p>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">Corrigir anotação #{current.id}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Ajuste a caixa no canvas, troque a classe se precisar, salve ou exclua o objeto.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={cancelCorrection}
+                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+                    aria-label="Cancelar correção"
+                  >
+                    <X className="size-4" />
+                  </button>
+                </div>
+
+                <label className="mt-3 block text-xs font-medium text-muted-foreground">Classe</label>
                 <input
                   ref={correctInputRef}
                   value={classQuery}
@@ -798,19 +864,19 @@ export function ReviewWorkspace() {
                   onKeyDown={(e) => {
                     if (e.key === "Escape") {
                       e.stopPropagation()
-                      setCorrecting(false)
+                      cancelCorrection()
                       return
                     }
-                    if (e.key === "Enter" && classSuggestions.length > 0) {
+                    if (e.key === "Enter") {
                       e.preventDefault()
-                      applyCorrection(classSuggestions[0])
+                      saveCorrection()
                     }
                   }}
-                  placeholder="Digite o nome da classe..."
-                  aria-label="Nome da classe correta"
-                  className="h-9 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none focus:border-brand-blue"
+                  placeholder="Digite a classe correta..."
+                  aria-label="Classe correta"
+                  className="mt-1 h-9 w-full rounded-lg border border-border bg-background px-3 text-sm text-foreground outline-none focus:border-brand-blue"
                 />
-                <ul className="mt-1.5 flex flex-col" role="listbox" aria-label="Sugestões de classe">
+                <ul className="mt-1.5 flex max-h-36 flex-col overflow-y-auto" role="listbox" aria-label="Sugestões de classe">
                   {classSuggestions.length === 0 && (
                     <li className="px-2 py-1.5 text-xs text-muted-foreground">Nenhuma classe encontrada.</li>
                   )}
@@ -819,20 +885,43 @@ export function ReviewWorkspace() {
                       <button
                         type="button"
                         role="option"
-                        aria-selected={i === 0}
-                        onClick={() => applyCorrection(name)}
+                        aria-selected={name === classQuery || i === 0}
+                        onClick={() => chooseCorrectionClass(name)}
                         className={cn(
                           "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted",
-                          i === 0 && "bg-muted/60",
+                          (name === classQuery || i === 0) && "bg-muted/60",
                         )}
                       >
                         <span className="size-2 shrink-0 rounded-full" style={{ background: clsColor(name) }} />
-                        <span className="flex-1">{name}</span>
-                        {i === 0 && <kbd className="rounded bg-background px-1 text-[10px] text-muted-foreground">Enter</kbd>}
+                        <span className="flex-1 truncate">{name}</span>
                       </button>
                     </li>
                   ))}
                 </ul>
+
+                <div className="mt-3 flex items-center gap-2 border-t border-border pt-3">
+                  <button
+                    type="button"
+                    onClick={deleteSelectedAnnotation}
+                    className="inline-flex h-9 items-center gap-2 rounded-lg border border-destructive/40 px-3 text-sm font-medium text-destructive hover:bg-destructive/10"
+                  >
+                    <Trash2 className="size-4" /> Excluir objeto
+                  </button>
+                  <button
+                    type="button"
+                    onClick={cancelCorrection}
+                    className="ml-auto inline-flex h-9 items-center gap-2 rounded-lg border border-border px-3 text-sm font-medium hover:bg-muted"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveCorrection}
+                    className="inline-flex h-9 items-center gap-2 rounded-lg bg-warning px-3 text-sm font-semibold text-white hover:brightness-110"
+                  >
+                    <Check className="size-4" /> Salvar
+                  </button>
+                </div>
               </div>
             )}
 
@@ -934,7 +1023,7 @@ export function ReviewWorkspace() {
                                 aria-label="Excluir anotação"
                                 onClick={(e) => {
                                   e.stopPropagation()
-                                  deleteBox(a.id)
+                                  openCorrection(a.id)
                                 }}
                                 className="hover:text-destructive"
                               >
@@ -1020,25 +1109,18 @@ export function ReviewWorkspace() {
                 <ArrowRight className="size-4" />
               </DecisionButton>
               <DecisionButton
-                onClick={() => void decide("rejeitado")}
-                className="bg-destructive text-destructive-foreground hover:brightness-110"
-              >
-                <ArrowLeft className="size-4" /> <span className="flex-1 text-center">Rejeitar</span>{" "}
-                <ArrowLeft className="size-4" />
-              </DecisionButton>
-              <DecisionButton
                 onClick={() => openCorrection()}
                 className="bg-warning text-white hover:brightness-110"
               >
-                <ArrowUp className="size-4" /> <span className="flex-1 text-center">Corrigir classe</span>{" "}
+                <ArrowUp className="size-4" /> <span className="flex-1 text-center">Corrigir objeto</span>{" "}
                 <ArrowUp className="size-4" />
               </DecisionButton>
               <DecisionButton
-                onClick={() => void decide("incerto")}
-                className="border border-brand-blue/40 bg-brand-blue/15 text-brand-blue hover:bg-brand-blue/25"
+                onClick={() => void decide("anotacao")}
+                className="bg-destructive text-destructive-foreground hover:brightness-110"
               >
-                <ArrowDown className="size-4" /> <span className="flex-1 text-center">Incerto</span>{" "}
-                <ArrowDown className="size-4" />
+                <ArrowLeft className="size-4" /> <span className="flex-1 text-center">Enviar para anotação</span>{" "}
+                <ArrowLeft className="size-4" />
               </DecisionButton>
             </div>
           </div>

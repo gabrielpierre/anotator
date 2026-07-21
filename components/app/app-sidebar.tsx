@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation"
 import { PanelLeftClose, PanelLeft } from "lucide-react"
 import { Brand } from "@/components/app/brand"
 import { navEntries } from "@/components/app/nav-config"
+import { fetchReviewQueueCount } from "@/lib/api/client"
 import { useCurrentUser } from "@/lib/auth/user-context"
 import { cn } from "@/lib/utils"
 
@@ -17,9 +18,34 @@ export function AppSidebar({
   onClose?: () => void
 }) {
   const pathname = usePathname()
-  const { isAdmin } = useCurrentUser()
+  const { isAdmin, projects } = useCurrentUser()
   const [collapsed, setCollapsed] = React.useState(false)
+  const [reviewPendingCount, setReviewPendingCount] = React.useState<number | null>(null)
   const entries = navEntries.filter((item) => !item.adminOnly || isAdmin)
+
+  const refreshReviewCount = React.useCallback((signal?: AbortSignal) => {
+    fetchReviewQueueCount(signal)
+      .then((summary) => setReviewPendingCount(summary.pending))
+      .catch(() => {
+        if (!signal?.aborted) setReviewPendingCount(null)
+      })
+  }, [])
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    refreshReviewCount(controller.signal)
+    const interval = window.setInterval(() => refreshReviewCount(), 30_000)
+    const onFocus = () => refreshReviewCount()
+    const onReviewQueueUpdated = () => refreshReviewCount()
+    window.addEventListener("focus", onFocus)
+    window.addEventListener("review-queue-updated", onReviewQueueUpdated)
+    return () => {
+      controller.abort()
+      window.clearInterval(interval)
+      window.removeEventListener("focus", onFocus)
+      window.removeEventListener("review-queue-updated", onReviewQueueUpdated)
+    }
+  }, [refreshReviewCount])
 
   return (
     <>
@@ -108,10 +134,12 @@ export function AppSidebar({
             const active =
               item.href === "/" ? pathname === "/" : pathname.startsWith(item.href)
             const Icon = item.icon
+            const href = item.href === "/" && isAdmin && projects.length === 0 ? "/projetos" : item.href
+            const badge = item.href === "/revisar" ? reviewPendingCount : item.badge
             return (
               <Link
                 key={item.href}
-                href={item.href}
+                href={href}
                 onClick={(e) => {
                   // Evita que o clique no link também dispare a expansão da barra retraída.
                   e.stopPropagation()
@@ -128,14 +156,14 @@ export function AppSidebar({
               >
                 <Icon className="size-4.5 shrink-0" />
                 <span className={cn("flex-1 truncate", collapsed && "lg:hidden")}>{item.label}</span>
-                {item.badge != null && (
+                {badge != null && badge > 0 && (
                   <span
                     className={cn(
                       "rounded-full bg-warning/15 px-1.5 py-0.5 text-xs font-medium tabular-nums text-warning",
                       collapsed && "lg:hidden",
                     )}
                   >
-                    {item.badge}
+                    {badge}
                   </span>
                 )}
               </Link>

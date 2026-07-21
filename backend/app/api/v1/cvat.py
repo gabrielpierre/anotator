@@ -19,11 +19,25 @@ def cvat_status() -> CvatStatusRead:
     client = CvatClient(settings)
     try:
         about = client.server_about()
+        authenticated = False
+        if client.authenticated:
+            try:
+                client.current_user()
+                authenticated = True
+            except Exception as auth_exc:
+                return CvatStatusRead(
+                    configured=client.configured,
+                    reachable=True,
+                    base_url=settings.cvat_base_url,
+                    authenticated=False,
+                    version=about.get("version") or about.get("server_version"),
+                    error=str(auth_exc),
+                )
         return CvatStatusRead(
             configured=client.configured,
             reachable=True,
             base_url=settings.cvat_base_url,
-            authenticated=client.authenticated,
+            authenticated=authenticated,
             version=about.get("version") or about.get("server_version"),
         )
     except Exception as exc:

@@ -4,7 +4,15 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 JobStatus = Literal["queued", "running", "paused", "succeeded", "failed", "canceled"]
-ReviewDecisionValue = Literal["accepted", "rejected", "corrected", "uncertain", "escalated"]
+ReviewDecisionValue = Literal[
+    "accepted",
+    "needs_annotation",
+    "corrected",
+    "deleted_by_reviewer",
+    "rejected",
+    "uncertain",
+    "escalated",
+]
 AnnotationType = Literal["shape", "track", "tag"]
 InferenceModelFamily = Literal["detection", "segmentation", "classification", "tracking"]
 InferenceApplyMode = Literal["append", "replace"]

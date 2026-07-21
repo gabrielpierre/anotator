@@ -1,16 +1,17 @@
 "use client"
 
 import * as React from "react"
+import { useRouter } from "next/navigation"
 import { Upload, Search, Filter, Image as ImageIcon, Database, HardDrive, Scissors, Download } from "lucide-react"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/snowui/input"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, StatusBadge, ProgressBar } from "@/components/app/primitives"
+import { DerivedDatasetDialog } from "@/components/data/derived-dataset-dialog"
 import { ImportBatchDialog } from "@/components/data/import-batch-dialog"
 import {
   apiAssetUrl,
-  createPipelineRun,
   derivedAssetDownloadPath,
   downloadBackendFile,
   fetchDashboard,
@@ -19,6 +20,7 @@ import {
   fetchTasks,
 } from "@/lib/api/client"
 import { formatDateTimePt, formatPtNumber, labelsFromTasks, toUiJobStatus } from "@/lib/api/status"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendDashboard, BackendDerivedAsset, BackendPipelineRun, BackendTask } from "@/lib/api/types"
 
 const batchStatusTone: Record<string, string> = {
@@ -29,13 +31,15 @@ const batchStatusTone: Record<string, string> = {
 }
 
 export function DataView() {
+  const router = useRouter()
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [dashboard, setDashboard] = React.useState<BackendDashboard | null>(null)
   const [derivedAssets, setDerivedAssets] = React.useState<BackendDerivedAsset[] | null>(null)
   const [pipelineRuns, setPipelineRuns] = React.useState<BackendPipelineRun[] | null>(null)
-  const [creatingPipeline, setCreatingPipeline] = React.useState(false)
   const [pipelineError, setPipelineError] = React.useState<string | null>(null)
   const [importDialogOpen, setImportDialogOpen] = React.useState(false)
+  const [derivedDialogOpen, setDerivedDialogOpen] = React.useState(false)
+  const { projects } = useCurrentUser()
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -84,31 +88,7 @@ export function DataView() {
   const objectCount = dashboard?.class_distribution.reduce((total, item) => total + item.count, 0) ?? 0
   const latestPipeline = pipelineRuns?.[0] ?? null
   const storage = storageFromDashboard(dashboard)
-
-  async function handleCreateDerivedPipeline() {
-    setCreatingPipeline(true)
-    setPipelineError(null)
-    try {
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "")
-      const run = await createPipelineRun({
-        name: `Pipeline crops classificacao ${stamp}`,
-        target_release_name: `crops_cls_${stamp}`,
-        task_external_ids: tasks?.map((task) => task.external_id) ?? [],
-        sample_policy: { max_assets: 100 },
-        definition: {
-          type: "detection-to-classification",
-          steps: ["detect", "filter", "crop", "classification", "review", "release"],
-          splits: { train: 0.8, val: 0.1, test: 0.1 },
-          padding: { mode: "relative", value: 0.08 },
-        },
-      })
-      setPipelineRuns((current) => [run, ...(current ?? [])])
-    } catch (error) {
-      setPipelineError(error instanceof Error ? error.message : "Erro ao criar pipeline derivado")
-    } finally {
-      setCreatingPipeline(false)
-    }
-  }
+  const currentProjectId = dashboard?.project?.id ?? projects[0]?.id ?? null
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -121,9 +101,9 @@ export function DataView() {
               <Search className="size-4" />
               Buscar imagens
             </Button>
-            <Button variant="outline" onClick={handleCreateDerivedPipeline} disabled={creatingPipeline}>
+            <Button variant="outline" onClick={() => setDerivedDialogOpen(true)}>
               <Scissors className="size-4" />
-              {creatingPipeline ? "Gerando..." : "Dataset derivado"}
+              Dataset derivado
             </Button>
             <Button onClick={() => setImportDialogOpen(true)}>
               <Upload className="size-4" />
@@ -132,7 +112,27 @@ export function DataView() {
           </>
         }
       />
-      <ImportBatchDialog open={importDialogOpen} onClose={() => setImportDialogOpen(false)} />
+      <ImportBatchDialog
+        open={importDialogOpen}
+        projectId={currentProjectId}
+        onClose={() => setImportDialogOpen(false)}
+        onImported={() => {
+          setImportDialogOpen(false)
+          router.push(currentProjectId ? `/jobs?project=${encodeURIComponent(currentProjectId)}` : "/jobs")
+        }}
+      />
+      <DerivedDatasetDialog
+        open={derivedDialogOpen}
+        tasks={tasks ?? []}
+        objectCount={objectCount}
+        classCount={classDistribution.length}
+        projectId={currentProjectId}
+        onClose={() => setDerivedDialogOpen(false)}
+        onCreated={(run) => {
+          setPipelineError(null)
+          setPipelineRuns((current) => [run, ...(current ?? [])])
+        }}
+      />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <MetricCard

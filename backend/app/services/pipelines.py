@@ -199,7 +199,7 @@ def _source_release(db: Session, definition: dict[str, Any]) -> DatasetRelease |
 
 
 def _source_annotations(db: Session, task_external_ids: list[str]) -> list[AnnotationRecord]:
-    query = select(AnnotationRecord).where(AnnotationRecord.review_state != "rejected")
+    query = select(AnnotationRecord).where(AnnotationRecord.review_state.in_(["accepted", "corrected"]))
     if task_external_ids:
         query = query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
     return list(db.scalars(query.order_by(AnnotationRecord.task_external_id, AnnotationRecord.frame)).all())

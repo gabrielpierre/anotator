@@ -146,6 +146,10 @@ export type BackendReviewQueueItem = {
   payload: Record<string, unknown>
 }
 
+export type BackendReviewQueueCount = {
+  pending: number
+}
+
 export type BackendAnnotationRecord = {
   id: string
   external_id: string
@@ -183,7 +187,14 @@ export type BackendManualAnnotationSave = {
   replace_existing?: boolean
 }
 
-export type BackendReviewDecisionValue = "accepted" | "rejected" | "corrected" | "uncertain" | "escalated"
+export type BackendReviewDecisionValue =
+  | "accepted"
+  | "needs_annotation"
+  | "corrected"
+  | "deleted_by_reviewer"
+  | "rejected"
+  | "uncertain"
+  | "escalated"
 
 export type BackendReviewDecisionCreate = {
   external_annotation_id: string

@@ -3,13 +3,7 @@ import { JobsView } from "@/components/jobs/jobs-view"
 
 export default function JobsPage() {
   return (
-    <AppShell
-      breadcrumb={[
-        { label: "Projetos", href: "/projetos" },
-        { label: "Projeto atual", href: "/" },
-        { label: "Jobs" },
-      ]}
-    >
+    <AppShell breadcrumb={[{ label: "Jobs" }]}>
       <JobsView />
     </AppShell>
   )

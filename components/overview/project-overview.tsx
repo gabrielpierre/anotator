@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 import {
   Sliders,
   Upload,
@@ -66,6 +67,7 @@ const classColors = [
 ]
 
 export function ProjectOverview() {
+  const router = useRouter()
   const [dashboard, setDashboard] = React.useState<BackendDashboard | null>(null)
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [releases, setReleases] = React.useState<BackendDatasetRelease[]>([])
@@ -96,6 +98,17 @@ export function ProjectOverview() {
     .reduce((total, task) => total + task.size, 0)
   const importedImages = stats?.images ?? taskList.reduce((total, task) => total + task.size, 0)
   const objectCount = dashboard?.class_distribution.reduce((total, item) => total + item.count, 0) ?? 0
+  const currentProject = dashboard?.project ?? null
+  const currentProjectStorage = storageFromProject(currentProject)
+  const contextProject = projects.find((project) => project.id === currentProject?.id) ?? projects[0] ?? null
+  const projectJobsHref = contextProject?.id ? `/jobs?project=${encodeURIComponent(contextProject.id)}` : "/jobs"
+  const projectTasks = taskList.filter((task) => {
+    const projectExternalId = currentProject?.external_id
+    return projectExternalId ? task.project_external_id === projectExternalId : false
+  })
+  const projectJobs = jobs.filter((job) => jobMatchesProject(job, currentProject, contextProject?.id ?? null, projectTasks))
+  const failedJobs = projectJobs.filter((job) => job.status === "failed")
+  const activeProjectJobs = projectJobs.filter((job) => job.status === "running" || job.status === "queued")
   const overviewKpis = [
     {
       ...kpiMeta[0],
@@ -116,7 +129,7 @@ export function ProjectOverview() {
     {
       ...kpiMeta[3],
       value: formatPtNumber(stats?.pending_review ?? 0),
-      sub: `${formatPtNumber(stats?.jobs_running ?? 0)} jobs ativos`,
+      sub: `${formatPtNumber(activeProjectJobs.length)} jobs ativos`,
     },
   ]
 
@@ -138,7 +151,6 @@ export function ProjectOverview() {
           }))
       : []
 
-  const failedJobs = jobs.filter((job) => job.status === "failed")
   const activeTrainingRuns = trainingRuns.filter((run) => run.status === "running" || run.status === "queued")
   const latestRelease = releases[0] ?? null
   const latestReleaseCounts = snapshotCounts(latestRelease?.snapshot ?? {})
@@ -154,11 +166,9 @@ export function ProjectOverview() {
           }
     })
     .filter((item): item is { version: string; map: number } => item !== null)
-  const activityItems = auditEvents.map((event) => ({
-    icon: auditIcon(event.action),
-    title: `${event.action} - ${event.target}`,
-    time: formatDateTimePt(event.created_at),
-  }))
+  const projectActivityItems = auditEvents
+    .filter((event) => isProjectAuditEvent(event, currentProject, projectTasks, releases, jobs))
+    .map((event) => formatAuditActivity(event, currentProject))
   const attentionItems = [
     ...(stats?.pending_review
       ? [
@@ -178,7 +188,7 @@ export function ProjectOverview() {
             tone: "bg-destructive/12 text-destructive",
             title: `${formatPtNumber(failedJobs.length)} jobs falharam`,
             desc: "Ver detalhes",
-            href: "/jobs",
+            href: projectJobsHref,
           },
         ]
       : []),
@@ -208,12 +218,11 @@ export function ProjectOverview() {
   const recommendedAction = recommendation({
     pendingReview: stats?.pending_review ?? 0,
     failedJobs: failedJobs.length,
+    jobsHref: projectJobsHref,
     tasks: taskList.length,
     releases: releases.length,
     trainingRuns: trainingRuns.length,
   })
-  const currentProjectStorage = storageFromProject(dashboard?.project ?? null)
-  const contextProject = projects.find((project) => project.id === dashboard?.project?.id) ?? projects[0] ?? null
   const customizeTarget: ProjectDialogTarget | null = dashboard?.project
     ? {
         id: dashboard.project.id,
@@ -259,7 +268,16 @@ export function ProjectOverview() {
           </div>
         )}
       </div>
-      <ImportBatchDialog open={importDialogOpen} onClose={() => setImportDialogOpen(false)} />
+      <ImportBatchDialog
+        open={importDialogOpen}
+        projectId={contextProject?.id ?? dashboard?.project?.id ?? null}
+        onClose={() => setImportDialogOpen(false)}
+        onImported={() => {
+          setImportDialogOpen(false)
+          const projectId = contextProject?.id ?? dashboard?.project?.id
+          router.push(projectId ? `/jobs?project=${encodeURIComponent(projectId)}` : "/jobs")
+        }}
+      />
       <ProjectDialog
         open={customizeOpen}
         mode="edit"
@@ -500,8 +518,8 @@ export function ProjectOverview() {
             <CardTitle>Atividades recentes</CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-1">
-            {activityItems.map((a) => (
-              <div key={a.title} className="flex items-center gap-3 rounded-lg py-2">
+            {projectActivityItems.map((a) => (
+              <div key={a.id} className="flex items-center gap-3 rounded-lg py-2">
                 <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground [&_svg]:size-4">
                   <a.icon />
                 </span>
@@ -509,8 +527,8 @@ export function ProjectOverview() {
                 <span className="shrink-0 text-xs text-muted-foreground">{a.time}</span>
               </div>
             ))}
-            {activityItems.length === 0 && (
-              <p className="text-sm text-muted-foreground">Nenhuma atividade recente sincronizada.</p>
+            {projectActivityItems.length === 0 && (
+              <p className="text-sm text-muted-foreground">Nenhuma atividade recente deste projeto.</p>
             )}
           </CardContent>
         </Card>
@@ -609,15 +627,166 @@ function numberFromRecord(record: Record<string, unknown>, key: string) {
   return numberFromUnknown(record[key])
 }
 
+function jobMatchesProject(
+  job: BackendJob,
+  project: BackendProject | null,
+  projectId: string | null,
+  projectTasks: BackendTask[],
+) {
+  const raw = job.raw ?? {}
+  const payload = objectValue(raw.payload)
+  const lineage = objectValue(raw.lineage)
+  const projectIds = new Set([project?.id, project?.external_id, project?.name, projectId].filter(Boolean).map(String))
+  const taskIds = new Set(
+    projectTasks.flatMap((task) => [task.id, task.external_id, task.name]).filter(Boolean).map(String),
+  )
+  const values = [
+    job.task_external_id,
+    raw.project_id,
+    raw.project_external_id,
+    raw.task_external_id,
+    payload.project_id,
+    payload.project_external_id,
+    payload.task_external_id,
+    lineage.project_id,
+    lineage.project_external_id,
+  ].map((value) => String(value ?? ""))
+
+  return values.some((value) => projectIds.has(value) || taskIds.has(value))
+}
+
+function isProjectAuditEvent(
+  event: BackendAuditEvent,
+  project: BackendProject | null,
+  projectTasks: BackendTask[],
+  releases: BackendDatasetRelease[],
+  jobs: BackendJob[],
+) {
+  if (!project) return false
+  const payload = event.payload ?? {}
+  const projectIds = new Set([project.id, project.external_id, project.name].filter(Boolean).map(String))
+  const taskIds = new Set(
+    projectTasks.flatMap((task) => [task.id, task.external_id, task.name]).filter(Boolean).map(String),
+  )
+  const releaseIds = new Set(
+    releases
+      .filter((release) => release.project_id === project.id || release.project_id === project.external_id)
+      .flatMap((release) => [release.id, release.name])
+      .filter(Boolean)
+      .map(String),
+  )
+  const jobIds = new Set(
+    jobs
+      .filter((job) => {
+        const raw = job.raw ?? {}
+        return (
+          projectIds.has(String(raw.project_id ?? "")) ||
+          projectIds.has(String(raw.project_external_id ?? "")) ||
+          taskIds.has(String(job.task_external_id ?? "")) ||
+          taskIds.has(String(raw.task_external_id ?? ""))
+        )
+      })
+      .flatMap((job) => [job.id, job.external_id])
+      .filter(Boolean)
+      .map(String),
+  )
+  const directValues = [
+    event.target,
+    payload.project_id,
+    payload.external_id,
+    payload.project_external_id,
+    payload.task_external_id,
+    payload.dataset_release_id,
+    payload.release_id,
+    payload.job_id,
+    payload.pipeline_run_id,
+  ].map((value) => String(value ?? ""))
+
+  return directValues.some(
+    (value) => projectIds.has(value) || taskIds.has(value) || releaseIds.has(value) || jobIds.has(value),
+  )
+}
+
+function objectValue(value: unknown) {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
+
+function formatAuditActivity(event: BackendAuditEvent, project: BackendProject | null) {
+  const label = auditActionLabel(event.action)
+  const target = auditTargetLabel(event, project)
+  return {
+    id: event.id,
+    icon: auditIcon(event.action),
+    title: target ? `${label} - ${target}` : label,
+    time: formatDateTimePt(event.created_at),
+  }
+}
+
+function auditActionLabel(action: string) {
+  const labels: Record<string, string> = {
+    project_created: "Projeto criado",
+    project_updated: "Projeto atualizado",
+    project_members_updated: "Equipe atualizada",
+    import_task_queued: "Importacao agendada",
+    import_task_files_uploaded: "Imagens enviadas",
+    import_task_completed: "Importacao concluida",
+    cvat_sync_completed: "CVAT sincronizado",
+    cvat_sync_partial_error: "Sync parcial do CVAT",
+    cvat_sync_failed: "Sync do CVAT falhou",
+    dataset_release_queued: "Release do dataset iniciado",
+    dataset_release_ready: "Release do dataset pronto",
+    dataset_release_failed: "Release do dataset falhou",
+    derived_dataset_release_queued: "Dataset derivado iniciado",
+    pipeline_run_created: "Pipeline criado",
+    pipeline_run_completed: "Pipeline concluido",
+    job_queued: "Job enfileirado",
+    job_succeeded: "Job concluido",
+    job_failed: "Job falhou",
+    training_run_created: "Treinamento iniciado",
+    training_run_completed: "Treinamento concluido",
+    inference_suggestions_created: "Sugestoes geradas",
+    inference_suggestions_replaced: "Sugestoes atualizadas",
+    manual_annotations_saved: "Anotacoes salvas",
+  }
+  if (labels[action]) return labels[action]
+  if (action.startsWith("review_")) return "Revisao registrada"
+  if (action.startsWith("track_")) return "Track atualizada"
+  return titleFromSnakeCase(action)
+}
+
+function auditTargetLabel(event: BackendAuditEvent, project: BackendProject | null) {
+  const target = String(event.target ?? "")
+  if (!target) return ""
+  if (project && (target === project.id || target === project.external_id)) return project.name
+  if (event.action.includes("project")) return project?.name ?? "Projeto"
+  if (event.action.includes("job")) return `Job ${target.slice(0, 8)}`
+  if (event.action.includes("pipeline")) return `Pipeline ${target.slice(0, 8)}`
+  if (event.action.includes("release")) return `Release ${target.slice(0, 8)}`
+  if (event.action.includes("training")) return `Treino ${target.slice(0, 8)}`
+  if (event.action.includes("sync")) return `Sync ${target.slice(0, 8)}`
+  if (target.length > 18) return target.slice(0, 8)
+  return target
+}
+
+function titleFromSnakeCase(value: string) {
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ")
+}
+
 function recommendation({
   pendingReview,
   failedJobs,
+  jobsHref,
   tasks,
   releases,
   trainingRuns,
 }: {
   pendingReview: number
   failedJobs: number
+  jobsHref: string
   tasks: number
   releases: number
   trainingRuns: number
@@ -639,7 +808,7 @@ function recommendation({
       tone: "text-destructive",
       title: `Verificar ${formatPtNumber(failedJobs)} jobs com falha.`,
       primaryLabel: "Abrir jobs",
-      href: "/jobs",
+      href: jobsHref,
     }
   }
   if (tasks === 0) {

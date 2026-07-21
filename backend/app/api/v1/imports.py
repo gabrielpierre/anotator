@@ -19,6 +19,14 @@ def create_import_task(
     db: Session = Depends(db_session),
     actor: User = Depends(current_user),
 ) -> ImportJobRead:
+    store = S3ArtifactStore(get_settings())
+    try:
+        store.verify_available()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Storage de artefatos indisponivel. Inicie MinIO/Docker antes de importar imagens.",
+        ) from exc
     try:
         validate_import_quota(db, payload)
     except ValueError as exc:
@@ -60,6 +68,25 @@ async def upload_import_task_files(
         raise HTTPException(status_code=409, detail="Import job is not accepting files")
     payload = ImportTaskCreate.model_validate((job.raw or {}).get("payload") or {})
     store = S3ArtifactStore(get_settings())
+    try:
+        store.verify_available()
+    except Exception as exc:
+        job.status = "failed"
+        job.detail = "Upload nao concluido: storage de artefatos indisponivel."
+        db.add(job)
+        db.add(
+            AuditEvent(
+                actor="system",
+                action="job_failed",
+                target=job.id,
+                payload={"reason": job.detail},
+            )
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="Storage de artefatos indisponivel. Inicie MinIO/Docker antes de importar imagens.",
+        ) from exc
     uploaded = []
     total_bytes = 0
     for file in files:

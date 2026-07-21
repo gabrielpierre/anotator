@@ -25,7 +25,7 @@ export const navEntries: NavEntry[] = [
   { label: "Projetos", href: "/projetos", icon: FolderKanban, adminOnly: true },
   { label: "Dados", href: "/dados", icon: Database },
   { label: "Anotar", href: "/anotar", icon: PenLine },
-  { label: "Revisar", href: "/revisar", icon: CheckSquare, badge: 93 },
+  { label: "Revisar", href: "/revisar", icon: CheckSquare },
   { label: "Treinar", href: "/treinar", icon: Cpu },
   { label: "Modelos", href: "/modelos", icon: Boxes },
   { label: "Releases", href: "/releases", icon: GitBranch },

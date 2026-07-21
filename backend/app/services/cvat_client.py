@@ -18,6 +18,7 @@ class CvatClient:
     def __init__(self, settings: Settings):
         self.base_url = settings.cvat_base_url.rstrip("/")
         self.token = settings.cvat_access_token
+        self.auth_scheme = (settings.cvat_auth_scheme or "Bearer").strip() or "Bearer"
         self.host_header = settings.cvat_host_header
         self.timeout = settings.cvat_request_timeout_seconds
 
@@ -29,10 +30,10 @@ class CvatClient:
     def authenticated(self) -> bool:
         return bool(self.token)
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, *, include_auth: bool = True) -> dict[str, str]:
         headers = {}
-        if self.token:
-            headers["Authorization"] = f"Token {self.token}"
+        if include_auth and self.token:
+            headers["Authorization"] = f"{self.auth_scheme} {self.token}"
         if self.host_header:
             headers["Host"] = self.host_header
         return headers
@@ -43,7 +44,8 @@ class CvatClient:
             if status_code in {401, 403}:
                 return (
                     "CVAT recusou a autenticacao. Verifique se CVAT_ACCESS_TOKEN "
-                    "esta configurado com um token valido."
+                    "tem um token valido e se CVAT_AUTH_SCHEME esta correto "
+                    "(Bearer para tokens de acesso da interface do CVAT)."
                 )
             if status_code == 404:
                 return (
@@ -59,10 +61,21 @@ class CvatClient:
             )
         return str(exc)
 
-    def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    def get_json(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        include_auth: bool = True,
+    ) -> Any:
         url = f"{self.base_url}{path}"
         try:
-            response = httpx.get(url, headers=self._headers(), params=params, timeout=self.timeout)
+            response = httpx.get(
+                url,
+                headers=self._headers(include_auth=include_auth),
+                params=params,
+                timeout=self.timeout,
+            )
             response.raise_for_status()
             return response.json()
         except httpx.HTTPError as exc:
@@ -164,7 +177,10 @@ class CvatClient:
             raise CvatClientError(self._format_http_error(exc, url)) from exc
 
     def server_about(self) -> dict[str, Any]:
-        return self.get_json("/api/server/about")
+        return self.get_json("/api/server/about", include_auth=False)
+
+    def current_user(self) -> dict[str, Any]:
+        return self.get_json("/api/users/self")
 
     def list_projects(self) -> list[dict[str, Any]]:
         return self._paginated("/api/projects")
@@ -231,10 +247,16 @@ class CvatClient:
     def retrieve_task_preview(self, task_id: str | int) -> CvatBinaryResponse:
         return self.get_bytes(f"/api/tasks/{task_id}/preview")
 
-    def retrieve_task_frame(self, task_id: str | int, frame: int) -> CvatBinaryResponse:
+    def retrieve_task_frame(
+        self,
+        task_id: str | int,
+        frame: int,
+        *,
+        quality: str = "original",
+    ) -> CvatBinaryResponse:
         return self.get_bytes(
             f"/api/tasks/{task_id}/data",
-            {"type": "frame", "number": frame, "quality": "original"},
+            {"type": "frame", "number": frame, "quality": quality},
         )
 
     def retrieve_job_annotations(self, job_id: str | int) -> dict[str, Any]:

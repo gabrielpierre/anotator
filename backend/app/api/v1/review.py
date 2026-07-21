@@ -10,6 +10,7 @@ from app.models import (
     AuditEvent,
     ReviewDecision,
     Task,
+    TaskDataMeta,
     TrackRevision,
     User,
 )
@@ -34,15 +35,37 @@ def review_queue(
     db: Session = Depends(db_session),
     _: User = Depends(current_user),
 ) -> list[ReviewQueueItem]:
-    annotations = list(
+    candidates = list(
         db.scalars(
             select(AnnotationRecord)
-            .where(AnnotationRecord.review_state.notin_(["accepted", "rejected"]))
+            .where(
+                AnnotationRecord.review_state == "pending",
+                AnnotationRecord.task_external_id.is_not(None),
+                AnnotationRecord.frame.is_not(None),
+            )
             .order_by(AnnotationRecord.updated_at.desc())
-            .limit(500)
+            .limit(2000)
         ).all()
     )
+    annotations = [annotation for annotation in candidates if _is_reviewable_annotation(annotation)][:500]
     return [_queue_item_from_annotation(db, annotation) for annotation in annotations]
+
+
+@router.get("/queue/count")
+def review_queue_count(
+    db: Session = Depends(db_session),
+    _: User = Depends(current_user),
+) -> dict[str, int]:
+    candidates = list(
+        db.scalars(
+            select(AnnotationRecord).where(
+                AnnotationRecord.review_state == "pending",
+                AnnotationRecord.task_external_id.is_not(None),
+                AnnotationRecord.frame.is_not(None),
+            )
+        ).all()
+    )
+    return {"pending": sum(1 for annotation in candidates if _is_reviewable_annotation(annotation))}
 
 
 @router.post("/decisions", response_model=ReviewDecisionRead)
@@ -190,8 +213,50 @@ def _queue_item_from_annotation(db: Session, annotation: AnnotationRecord) -> Re
             "annotation_id": annotation.id,
             "external_annotation_id": annotation.external_id,
             "raw": annotation.raw,
+            "frame_dimensions": _frame_dimensions(db, annotation.task_external_id, annotation.frame),
         },
     )
+
+
+def _is_reviewable_annotation(annotation: AnnotationRecord) -> bool:
+    if annotation.annotation_type == "tag":
+        return False
+    if annotation.frame is None or not annotation.task_external_id:
+        return False
+    if (annotation.shape_type or "").lower() not in {"rectangle", "polygon"}:
+        return False
+    points = _annotation_points(annotation)
+    return len(points) >= 4 and all(isinstance(value, int | float) for value in points)
+
+
+def _annotation_points(annotation: AnnotationRecord) -> list:
+    points = annotation.points if isinstance(annotation.points, list) else []
+    if points:
+        return points
+    raw = annotation.raw if isinstance(annotation.raw, dict) else {}
+    points_norm = raw.get("points_norm")
+    return points_norm if isinstance(points_norm, list) else []
+
+
+def _frame_dimensions(db: Session, task_external_id: str | None, frame: int | None) -> dict[str, int] | None:
+    if task_external_id is None or frame is None:
+        return None
+    meta = db.scalar(select(TaskDataMeta).where(TaskDataMeta.task_external_id == task_external_id))
+    frames = meta.frames if meta and isinstance(meta.frames, list) else []
+    if 0 <= frame < len(frames) and isinstance(frames[frame], dict):
+        width = _positive_int(frames[frame].get("width"))
+        height = _positive_int(frames[frame].get("height"))
+        if width and height:
+            return {"width": width, "height": height}
+    return None
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _apply_track_action(

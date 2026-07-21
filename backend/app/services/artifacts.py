@@ -45,6 +45,9 @@ class S3ArtifactStore(ArtifactStore):
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    def verify_available(self) -> None:
+        self._client().head_bucket(Bucket=self.settings.s3_bucket)
+
     def put_bytes(self, key: str, content: bytes, content_type: str | None = None) -> str:
         self._client().put_object(
             Bucket=self.settings.s3_bucket,
@@ -102,7 +105,12 @@ class S3ArtifactStore(ArtifactStore):
             aws_access_key_id=self.settings.s3_access_key_id,
             aws_secret_access_key=self.settings.s3_secret_access_key,
             region_name=self.settings.s3_region,
-            config=Config(signature_version="s3v4"),
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=5,
+                read_timeout=30,
+                retries={"max_attempts": 1},
+            ),
         )
 
 

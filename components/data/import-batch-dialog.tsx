@@ -3,15 +3,17 @@
 import * as React from "react"
 import { CheckCircle2, ImagePlus, Loader2, Upload, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { createImportTask, uploadImportTaskFiles } from "@/lib/api/client"
+import { createImportTask, uploadImportTaskFilesWithProgress } from "@/lib/api/client"
 import type { BackendImportJob } from "@/lib/api/types"
 
 export function ImportBatchDialog({
   open,
+  projectId,
   onClose,
   onImported,
 }: {
   open: boolean
+  projectId?: string | null
   onClose: () => void
   onImported?: (job: BackendImportJob) => void
 }) {
@@ -20,6 +22,7 @@ export function ImportBatchDialog({
   const [error, setError] = React.useState<string | null>(null)
   const [result, setResult] = React.useState<BackendImportJob | null>(null)
   const [submitting, setSubmitting] = React.useState(false)
+  const [uploadProgress, setUploadProgress] = React.useState({ loaded: 0, total: 0, percent: 0 })
 
   React.useEffect(() => {
     if (!open) return
@@ -27,6 +30,7 @@ export function ImportBatchDialog({
     setFiles([])
     setError(null)
     setResult(null)
+    setUploadProgress({ loaded: 0, total: 0, percent: 0 })
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose()
     }
@@ -37,6 +41,7 @@ export function ImportBatchDialog({
   if (!open) return null
 
   const totalBytes = files.reduce((total, file) => total + file.size, 0)
+  const uploadFinished = submitting && uploadProgress.percent >= 100
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
@@ -51,13 +56,15 @@ export function ImportBatchDialog({
     setSubmitting(true)
     setError(null)
     setResult(null)
+    setUploadProgress({ loaded: 0, total: totalBytes, percent: 0 })
     try {
       const created = await createImportTask({
+        project_id: projectId || null,
         name: name.trim(),
         estimated_bytes: totalBytes,
         sync_after_import: true,
       })
-      const uploaded = await uploadImportTaskFiles(created.job.id, files)
+      const uploaded = await uploadImportTaskFilesWithProgress(created.job.id, files, setUploadProgress)
       setResult(uploaded)
       onImported?.(uploaded)
     } catch (err) {
@@ -132,8 +139,31 @@ export function ImportBatchDialog({
           </label>
 
           {files.length > 0 && (
-            <div className="rounded-lg bg-surface-subtle px-3 py-2 text-xs text-muted-foreground">
-              <span className="font-medium text-foreground">{formatBytes(totalBytes)}</span> em {files.length} arquivos
+            <div className="flex flex-col gap-2 rounded-lg bg-surface-subtle px-3 py-2 text-xs text-muted-foreground">
+              <div className="flex items-center justify-between gap-3">
+                <span>
+                  <span className="font-medium text-foreground">{formatBytes(totalBytes)}</span> em {files.length} arquivos
+                </span>
+                {submitting && (
+                  <span className="shrink-0 font-medium tabular-nums text-foreground">
+                    {uploadFinished ? "Finalizando..." : `${uploadProgress.percent}%`}
+                  </span>
+                )}
+              </div>
+              {submitting && (
+                <>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full rounded-full bg-brand-blue transition-[width] duration-200"
+                      style={{ width: `${uploadProgress.percent}%` }}
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span>{uploadFinished ? "Validando e salvando no servidor" : `${formatBytes(uploadProgress.loaded)} enviados`}</span>
+                    <span>{uploadFinished ? "Aguarde" : `${formatBytes(Math.max(totalBytes - uploadProgress.loaded, 0))} restantes`}</span>
+                  </div>
+                </>
+              )}
             </div>
           )}
           {error && <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
@@ -152,7 +182,7 @@ export function ImportBatchDialog({
           {!result && (
             <Button type="submit" disabled={submitting}>
               {submitting ? <Loader2 className="size-4 animate-spin" /> : <Upload className="size-4" />}
-              {submitting ? "Enviando..." : "Subir lote"}
+              {uploadFinished ? "Finalizando..." : submitting ? "Enviando..." : "Subir lote"}
             </Button>
           )}
         </div>
