@@ -1,15 +1,15 @@
 "use client"
 
 import * as React from "react"
-import { Boxes, Search, Upload, Download, Star, MoreHorizontal } from "lucide-react"
+import { Boxes, Search, Upload, Download, Star, MoreHorizontal, Trash2 } from "lucide-react"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/snowui/input"
 import { Badge } from "@/components/snowui/badge"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, StatusBadge } from "@/components/app/primitives"
-import { SparkLineChart } from "@/components/app/charts"
-import { downloadBackendFile, fetchModelVersions, modelDownloadPath } from "@/lib/api/client"
+import { MetricLineChart } from "@/components/app/charts"
+import { deleteModelVersion, downloadBackendFile, fetchModelVersions, modelDownloadPath } from "@/lib/api/client"
 import { formatDateTimePt } from "@/lib/api/status"
 import type { BackendModelVersion } from "@/lib/api/types"
 
@@ -51,6 +51,37 @@ function toModelRow(model: BackendModelVersion): ModelRow {
   }
 }
 
+const modelMetricOptions = [
+  {
+    key: "map5095",
+    label: "mAP50-95",
+    aliases: ["metrics/mAP50-95(B)", "map5095", "box_map", "box.map", "mAP50-95"],
+    color: "var(--brand-blue)",
+    domain: [0, 1] as [number, number],
+  },
+  {
+    key: "map50",
+    label: "mAP50",
+    aliases: ["metrics/mAP50(B)", "map50", "box_map50", "box.map50", "mAP50"],
+    color: "var(--brand-green)",
+    domain: [0, 1] as [number, number],
+  },
+  {
+    key: "precision",
+    label: "Precision",
+    aliases: ["metrics/precision(B)", "precision", "box_precision"],
+    color: "var(--brand-lavender)",
+    domain: [0, 1] as [number, number],
+  },
+  {
+    key: "recall",
+    label: "Recall",
+    aliases: ["metrics/recall(B)", "recall", "box_recall"],
+    color: "var(--warning)",
+    domain: [0, 1] as [number, number],
+  },
+] as const
+
 function familyLabel(family: string) {
   switch (family) {
     case "classification":
@@ -78,14 +109,22 @@ function bestMapFromMetrics(metrics: Record<string, unknown>) {
 
 export function ModelsView() {
   const [backendModels, setBackendModels] = React.useState<BackendModelVersion[] | null>(null)
+  const [selectedMetricKey, setSelectedMetricKey] = React.useState<(typeof modelMetricOptions)[number]["key"]>("map5095")
+  const [actionMenuId, setActionMenuId] = React.useState<string | null>(null)
+  const [deletingModelId, setDeletingModelId] = React.useState<string | null>(null)
+  const [actionError, setActionError] = React.useState<string | null>(null)
+
+  const loadModels = React.useCallback((signal?: AbortSignal) => {
+    fetchModelVersions(signal)
+      .then(setBackendModels)
+      .catch(() => setBackendModels(null))
+  }, [])
 
   React.useEffect(() => {
     const controller = new AbortController()
-    fetchModelVersions(controller.signal)
-      .then(setBackendModels)
-      .catch(() => setBackendModels(null))
+    loadModels(controller.signal)
     return () => controller.abort()
-  }, [])
+  }, [loadModels])
 
   const rows = React.useMemo(
     () => (backendModels?.length ? backendModels.map(toModelRow) : []),
@@ -95,9 +134,38 @@ export function ModelsView() {
     (current, row) => (!current || row.mapValue > current.mapValue ? row : current),
     null,
   )
-  const mapEvolution = rows
-    .filter((row) => row.mapValue > 0)
-    .map((row) => ({ version: row.id, map: row.mapValue }))
+  const availableMetricOptions = modelMetricOptions.filter((option) =>
+    (backendModels ?? []).some((model) => metricValue(model.metrics, option.aliases) !== null),
+  )
+  const selectedMetric =
+    availableMetricOptions.find((option) => option.key === selectedMetricKey) ?? availableMetricOptions[0] ?? modelMetricOptions[0]
+  const metricEvolution = (backendModels ?? [])
+    .slice()
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
+    .map((model) => ({
+      version: compactModelLabel(model),
+      value: metricValue(model.metrics, selectedMetric.aliases),
+    }))
+    .filter((item): item is { version: string; value: number } => item.value !== null)
+
+  async function handleDeleteModel(row: ModelRow) {
+    if (!row.modelId || deletingModelId) return
+    const confirmed = window.confirm(
+      `Excluir definitivamente ${row.id}? Isso remove o registro, peso/artefatos do modelo e sugestões geradas por ele.`,
+    )
+    if (!confirmed) return
+    setDeletingModelId(row.modelId)
+    setActionError(null)
+    setActionMenuId(null)
+    try {
+      await deleteModelVersion(row.modelId)
+      setBackendModels((current) => current?.filter((model) => model.id !== row.modelId) ?? [])
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Não foi possível excluir o modelo.")
+    } finally {
+      setDeletingModelId(null)
+    }
+  }
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -134,6 +202,9 @@ export function ModelsView() {
         />
         <MetricCard label="Artefatos disponíveis" value={String(rows.filter((row) => row.downloadable).length)} hint="downloads reais" tone="subtle" />
       </div>
+      {actionError && (
+        <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{actionError}</p>
+      )}
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
         <Card>
@@ -184,11 +255,32 @@ export function ModelsView() {
                         >
                           <Download className="size-4" />
                         </Button>
-                        <Button variant="ghost" size="icon" aria-label="Mais ações">
-                          <MoreHorizontal className="size-4" />
-                        </Button>
-                      </div>
-                    </td>
+	                        <div className="relative">
+	                          <Button
+	                            variant="ghost"
+	                            size="icon"
+	                            aria-label={`Mais ações de ${m.id}`}
+	                            aria-expanded={actionMenuId === m.modelId}
+	                            onClick={() => setActionMenuId((current) => (current === m.modelId ? null : (m.modelId ?? null)))}
+	                          >
+	                            <MoreHorizontal className="size-4" />
+	                          </Button>
+	                          {m.modelId && actionMenuId === m.modelId && (
+	                            <div className="absolute right-0 top-full z-20 mt-1 w-52 overflow-hidden rounded-xl border border-border bg-card p-1 text-left shadow-lg">
+	                              <button
+	                                type="button"
+	                                disabled={deletingModelId !== null}
+	                                onClick={() => void handleDeleteModel(m)}
+	                                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-50"
+	                              >
+	                                <Trash2 className="size-4" />
+	                                {deletingModelId === m.modelId ? "Excluindo..." : "Excluir modelo"}
+	                              </button>
+	                            </div>
+	                          )}
+	                        </div>
+	                      </div>
+	                    </td>
                   </tr>
                 ))}
                 {rows.length === 0 && (
@@ -203,24 +295,82 @@ export function ModelsView() {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Evolução do mAP50-95</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <SparkLineChart
-              data={mapEvolution}
-              dataKey="map"
-              color="var(--brand-blue)"
-              height={200}
-              highlightLast
-            />
-            <p className="mt-3 text-xs text-muted-foreground">
-              Evolução calculada a partir das métricas registradas no backend.
-            </p>
-          </CardContent>
-        </Card>
+	        <Card>
+	          <CardHeader>
+	            <CardTitle>Evolução</CardTitle>
+	            <select
+	              value={selectedMetric.key}
+	              onChange={(event) => setSelectedMetricKey(event.target.value as typeof selectedMetricKey)}
+	              className="h-9 rounded-full border border-border bg-background px-3 text-sm font-medium text-foreground outline-none hover:bg-muted focus:border-brand-blue"
+	              aria-label="Selecionar métrica do gráfico"
+	            >
+	              {(availableMetricOptions.length ? availableMetricOptions : modelMetricOptions).map((option) => (
+	                <option key={option.key} value={option.key}>
+	                  {option.label}
+	                </option>
+	              ))}
+	            </select>
+	          </CardHeader>
+	          <CardContent className="flex flex-col gap-4">
+	            {metricEvolution.length > 0 ? (
+	              <>
+	                <MetricLineChart
+	                  data={metricEvolution}
+	                  xKey="version"
+	                  series={[{ key: "value", label: selectedMetric.label, color: selectedMetric.color }]}
+	                  domain={selectedMetric.domain}
+	                  height={220}
+	                />
+	                <div className="grid grid-cols-2 gap-2 text-xs">
+	                  <MetricSummary label="Atual" value={metricEvolution.at(-1)?.value ?? null} />
+	                  <MetricSummary label="Melhor" value={Math.max(...metricEvolution.map((item) => item.value))} />
+	                </div>
+	              </>
+	            ) : (
+	              <div className="flex h-56 items-center justify-center rounded-xl border border-dashed border-border text-center text-sm text-muted-foreground">
+	                Nenhuma métrica disponível para montar o gráfico.
+	              </div>
+	            )}
+	            <p className="text-xs text-muted-foreground">
+	              Cada ponto representa uma versão registrada, em ordem de criação.
+	            </p>
+	          </CardContent>
+	        </Card>
       </div>
     </div>
+	)
+}
+
+function MetricSummary({ label, value }: { label: string; value: number | null }) {
+  return (
+    <div className="rounded-xl bg-surface-subtle px-3 py-2">
+      <p className="text-muted-foreground">{label}</p>
+      <p className="mt-1 text-sm font-semibold tabular-nums text-foreground">
+        {value === null ? "--" : value.toFixed(3)}
+      </p>
+    </div>
   )
+}
+
+function metricValue(metrics: Record<string, unknown>, aliases: readonly string[]) {
+  for (const key of aliases) {
+    const value = metrics[key]
+    const parsed = numberFromUnknown(value)
+    if (parsed !== null) return parsed
+  }
+  return null
+}
+
+function numberFromUnknown(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function compactModelLabel(model: BackendModelVersion) {
+  const version = model.version.length > 12 ? `${model.version.slice(0, 8)}...` : model.version
+  return `${model.name} ${version}`
 }

@@ -16,7 +16,8 @@ Copie `.env.example` e preencha os valores necessarios.
 | Variavel | Uso |
 | --- | --- |
 | `CVAT_BASE_URL` | URL do CVAT local. Padrao: `http://localhost:8080`. |
-| `CVAT_ACCESS_TOKEN` | Token usado pelo backend para chamar a API do CVAT. |
+| `CVAT_ACCESS_TOKEN` | Token usado pelo backend para chamar a API do CVAT. No CVAT local, `./start.sh` atualiza esse valor automaticamente quando encontra um superusuario ativo. |
+| `CVAT_AUTH_SCHEME` | Esquema do token CVAT. Padrao local: `Token`. |
 | `INTERNAL_API_KEY` | Chave opcional para proteger a API local. Se vazia, auth interna fica desligada. |
 | `NEXT_PUBLIC_INTERNAL_API_KEY` | Mesma chave para o frontend chamar a API quando `INTERNAL_API_KEY` estiver ativa. |
 | `AUTO_CREATE_TABLES` | Deve ficar `false`; schemas sobem por Alembic. |
@@ -27,7 +28,45 @@ Copie `.env.example` e preencha os valores necessarios.
 | `S3_ENDPOINT` / `S3_BUCKET` | MinIO para releases, datasets derivados e artefatos MLflow. |
 | `FRONTEND_PORT`, `BACKEND_PORT`, `POSTGRES_PORT`, `REDIS_PORT`, `MINIO_PORT`, `MINIO_CONSOLE_PORT`, `MLFLOW_PORT` | Portas publicadas pelo Compose local. Ajuste se houver conflito. |
 
-## Subida
+## Subida rapida
+
+No Linux/WSL, o caminho recomendado para uso diario e um unico comando na raiz do projeto:
+
+```bash
+./start.sh
+```
+
+Esse comando sobe o CVAT em `.local/cvat` quando necessario e depois inicia frontend, backend, worker, Postgres, Redis, MinIO e MLflow. Se precisar rebuildar as imagens:
+
+```bash
+./start.sh --build
+```
+
+Quando o container `cvat_server` esta disponivel, o script cria ou reutiliza um token do superusuario ativo do CVAT e grava `CVAT_ACCESS_TOKEN`/`CVAT_AUTH_SCHEME=Token` no `.env`.
+
+Se a porta externa do MinIO estiver ocupada por outro projeto, o script escolhe automaticamente o proximo par livre e mostra a URL correta no final da execucao.
+
+Para subir apenas a stack da aplicacao, mantendo o CVAT como estiver:
+
+```bash
+./start.sh --skip-cvat
+```
+
+Para finalizar tudo sem apagar dados locais:
+
+```bash
+./stop.sh
+```
+
+Esse comando para a aplicacao e o CVAT, preservando os volumes Docker. Para parar apenas a aplicacao:
+
+```bash
+./stop.sh --keep-cvat
+```
+
+Use `./stop.sh --volumes` somente quando quiser apagar banco, MinIO, MLflow e dados locais do CVAT.
+
+## Subida via PowerShell
 
 ```powershell
 $env:CVAT_ACCESS_TOKEN = "<token>"

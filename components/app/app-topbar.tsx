@@ -6,7 +6,8 @@ import { useRouter } from "next/navigation"
 import { Menu, Bell, HelpCircle, ChevronDown, Activity, UserCog, LogOut } from "lucide-react"
 import { ThemeToggle } from "@/components/snowui/theme-toggle"
 import { Avatar } from "@/components/snowui/avatar"
-import { fetchJobs } from "@/lib/api/client"
+import { fetchJobs, jobsEventsUrl } from "@/lib/api/client"
+import type { BackendJob } from "@/lib/api/types"
 import { useCurrentUser, roleLabels } from "@/lib/auth/user-context"
 import { cn } from "@/lib/utils"
 
@@ -37,11 +38,24 @@ export function AppTopbar({
   React.useEffect(() => {
     const controller = new AbortController()
     fetchJobs(controller.signal)
-      .then((jobs) =>
-        setActiveJobCount(jobs.filter((job) => job.status === "running" || job.status === "queued").length),
-      )
+      .then((jobs) => setActiveJobCount(countActiveJobs(jobs)))
       .catch(() => setActiveJobCount(0))
     return () => controller.abort()
+  }, [])
+
+  React.useEffect(() => {
+    const source = new EventSource(jobsEventsUrl())
+    const handleJobs = (event: MessageEvent) => {
+      try {
+        const payload = JSON.parse(event.data) as { jobs?: BackendJob[] }
+        if (Array.isArray(payload.jobs)) setActiveJobCount(countActiveJobs(payload.jobs))
+      } catch {
+        // Ignore malformed stream events; the next snapshot will replace state.
+      }
+    }
+    source.addEventListener("jobs", handleJobs as EventListener)
+    source.onerror = () => source.close()
+    return () => source.close()
   }, [])
 
   return (
@@ -173,4 +187,8 @@ export function AppTopbar({
       </div>
     </header>
   )
+}
+
+function countActiveJobs(jobs: BackendJob[]) {
+  return jobs.filter((job) => job.status === "running" || job.status === "queued").length
 }

@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     cvat_base_url: str = Field(default="http://localhost:8080", alias="CVAT_BASE_URL")
     cvat_access_token: str | None = Field(default=None, alias="CVAT_ACCESS_TOKEN")
-    cvat_auth_scheme: str = Field(default="Bearer", alias="CVAT_AUTH_SCHEME")
+    cvat_auth_scheme: str = Field(default="Token", alias="CVAT_AUTH_SCHEME")
     cvat_host_header: str | None = Field(default=None, alias="CVAT_HOST_HEADER")
     cvat_request_timeout_seconds: float = Field(default=20.0, alias="CVAT_REQUEST_TIMEOUT_SECONDS")
     annotation_frame_max_side: int = Field(default=1920, alias="ANNOTATION_FRAME_MAX_SIDE")

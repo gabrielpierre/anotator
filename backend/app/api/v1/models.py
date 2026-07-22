@@ -1,12 +1,12 @@
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_admin, current_user, db_session
 from app.api.v1.artifacts import artifact_read_from_uri, persist_artifact_record
 from app.core.config import get_settings
-from app.models import AuditEvent, ModelVersion, User
+from app.models import ArtifactRecord, AuditEvent, InferenceSuggestion, ModelVersion, User
 from app.schemas import ModelImportRead, ModelVersionCreate, ModelVersionRead, ModelVersionUpdate
 from app.services.artifacts import S3ArtifactStore
 
@@ -215,6 +215,53 @@ def archive_model(
     db.commit()
     db.refresh(model)
     return model
+
+
+@router.delete("/{model_id}", response_model=dict)
+def delete_model(
+    model_id: str,
+    db: Session = Depends(db_session),
+    actor: User = Depends(current_admin),
+) -> dict:
+    model = _require_model(db, model_id)
+    artifact_uris = {model.artifact_uri} if model.artifact_uri else set()
+    artifact_filters = [((ArtifactRecord.owner_type == "model") & (ArtifactRecord.owner_id == model.id))]
+    if artifact_uris:
+        artifact_filters.append(ArtifactRecord.uri.in_(artifact_uris))
+    artifact_records = list(
+        db.scalars(select(ArtifactRecord).where(or_(*artifact_filters))).all()
+    )
+    artifact_uris.update(record.uri for record in artifact_records if record.uri)
+
+    store = S3ArtifactStore(get_settings())
+    deleted_objects = 0
+    warnings: list[str] = []
+    for uri in sorted(artifact_uris):
+        try:
+            store.delete(uri)
+            deleted_objects += 1
+        except Exception as exc:
+            warnings.append(f"Artifact {uri} nao removido do storage: {exc}")
+
+    deleted_artifact_records = 0
+    for artifact in artifact_records:
+        db.delete(artifact)
+        deleted_artifact_records += 1
+    deleted_suggestions = db.execute(delete(InferenceSuggestion).where(InferenceSuggestion.model_id == model.id)).rowcount or 0
+
+    deleted_payload = {
+        "model_id": model.id,
+        "name": model.name,
+        "version": model.version,
+        "artifact_objects": deleted_objects,
+        "artifact_records": deleted_artifact_records,
+        "inference_suggestions": deleted_suggestions,
+        "warnings": warnings,
+    }
+    db.add(AuditEvent(actor=actor.email, action="model_deleted", target=model.id, payload=deleted_payload))
+    db.delete(model)
+    db.commit()
+    return deleted_payload
 
 
 @router.get("/{model_id}/download")

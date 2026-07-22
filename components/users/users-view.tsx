@@ -376,8 +376,8 @@ function NewUserDialog({
     try {
       await onCreate({ name: name.trim(), email: email.trim(), password: initialPassword, role })
       onClose()
-    } catch {
-      setError("Não foi possível criar o usuário.")
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "Não foi possível criar o usuário.")
     } finally {
       setSaving(false)
     }

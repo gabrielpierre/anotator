@@ -1,3 +1,4 @@
+import mimetypes
 from pathlib import PurePosixPath
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -39,6 +40,7 @@ def presign_artifact(
 @router.get("/{artifact_id}/download")
 def download_artifact(
     artifact_id: str,
+    inline: bool = Query(default=False),
     db: Session = Depends(db_session),
     _: User = Depends(current_user),
 ) -> Response:
@@ -58,10 +60,14 @@ def download_artifact(
         raise HTTPException(status_code=404, detail="Artifact not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    disposition = "inline" if inline else "attachment"
+    media_type = blob.content_type
+    if not media_type or media_type == "application/octet-stream":
+        media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
     return Response(
         content=blob.content,
-        media_type=blob.content_type or "application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        media_type=media_type,
+        headers={"Content-Disposition": f'{disposition}; filename="{name}"'},
     )
 
 

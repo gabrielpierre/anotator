@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
+import { useRouter, useSearchParams } from "next/navigation"
 import {
   Sliders,
   Upload,
@@ -68,6 +68,7 @@ const classColors = [
 
 export function ProjectOverview() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [dashboard, setDashboard] = React.useState<BackendDashboard | null>(null)
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [releases, setReleases] = React.useState<BackendDatasetRelease[]>([])
@@ -240,6 +241,11 @@ export function ProjectOverview() {
           annotatorIds: contextProject.annotatorIds,
         }
       : null
+
+  React.useEffect(() => {
+    if (!isAdmin || !customizeTarget || searchParams.get("personalizar") !== "1") return
+    setCustomizeOpen(true)
+  }, [customizeTarget, isAdmin, searchParams])
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">

@@ -122,7 +122,9 @@ def build_dataset_release(
         _report_progress(progress_callback, 90, "Collecting QA snapshot.")
         snapshot["qa"] = _quality_snapshot(db, client, task_external_ids)
         _record_project_storage_usage(db, release, artifacts)
-        release.snapshot = {**release.snapshot, **snapshot}
+        clean_snapshot = dict(release.snapshot or {})
+        clean_snapshot.pop("error", None)
+        release.snapshot = {**clean_snapshot, **snapshot}
         release.artifact_uri = artifacts[0]["uri"] if artifacts else None
         release.status = "ready"
         _report_progress(progress_callback, 98, "Release artifacts stored.")

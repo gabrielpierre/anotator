@@ -1,4 +1,5 @@
 from typing import Any, NamedTuple
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -44,8 +45,8 @@ class CvatClient:
             if status_code in {401, 403}:
                 return (
                     "CVAT recusou a autenticacao. Verifique se CVAT_ACCESS_TOKEN "
-                    "tem um token valido e se CVAT_AUTH_SCHEME esta correto "
-                    "(Bearer para tokens de acesso da interface do CVAT)."
+                    "tem um token valido e se CVAT_AUTH_SCHEME esta correto. "
+                    "No CVAT local deste projeto, use CVAT_AUTH_SCHEME=Token."
                 )
             if status_code == 404:
                 return (
@@ -152,6 +153,22 @@ class CvatClient:
         except httpx.HTTPError as exc:
             raise CvatClientError(self._format_http_error(exc, url)) from exc
 
+    def delete_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        url = f"{self.base_url}{path}"
+        try:
+            response = httpx.delete(
+                url,
+                headers=self._headers(),
+                params=params,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            if not response.content:
+                return {}
+            return response.json()
+        except httpx.HTTPError as exc:
+            raise CvatClientError(self._format_http_error(exc, url)) from exc
+
     def get_bytes(self, path: str, params: dict[str, Any] | None = None) -> CvatBinaryResponse:
         url = f"{self.base_url}{path}"
         try:
@@ -165,7 +182,7 @@ class CvatClient:
             raise CvatClientError(self._format_http_error(exc, url)) from exc
 
     def get_url_bytes(self, url_or_path: str) -> CvatBinaryResponse:
-        url = url_or_path if url_or_path.startswith("http") else f"{self.base_url}{url_or_path}"
+        url = self._download_url(url_or_path)
         try:
             response = httpx.get(url, headers=self._headers(), timeout=self.timeout)
             response.raise_for_status()
@@ -175,6 +192,19 @@ class CvatClient:
             )
         except httpx.HTTPError as exc:
             raise CvatClientError(self._format_http_error(exc, url)) from exc
+
+    def _download_url(self, url_or_path: str) -> str:
+        if not url_or_path.startswith("http"):
+            return urljoin(f"{self.base_url}/", url_or_path.lstrip("/"))
+
+        parsed = urlparse(url_or_path)
+        if parsed.hostname not in {"localhost", "127.0.0.1", "0.0.0.0", "host.docker.internal"}:
+            return url_or_path
+
+        base = urlparse(self.base_url)
+        if not base.netloc:
+            return url_or_path
+        return urlunparse(parsed._replace(scheme=base.scheme or parsed.scheme, netloc=base.netloc))
 
     def server_about(self) -> dict[str, Any]:
         return self.get_json("/api/server/about", include_auth=False)
@@ -209,6 +239,10 @@ class CvatClient:
 
     def retrieve_task(self, task_id: str | int) -> dict[str, Any]:
         return self.get_json(f"/api/tasks/{task_id}")
+
+    def delete_task(self, task_id: str | int) -> dict[str, Any]:
+        result = self.delete_json(f"/api/tasks/{task_id}")
+        return result if isinstance(result, dict) else {}
 
     def create_task(
         self,

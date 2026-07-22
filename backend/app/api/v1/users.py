@@ -12,14 +12,34 @@ router = APIRouter()
 
 @router.get("", response_model=list[UserRead])
 def list_users(db: Session = Depends(db_session), _: User = Depends(current_admin)) -> list[User]:
-    return list(db.scalars(select(User).order_by(User.created_at.desc())).all())
+    return list(db.scalars(select(User).where(User.status == "active").order_by(User.created_at.desc())).all())
 
 
 @router.post("", response_model=UserRead)
 def create_user(payload: UserCreate, db: Session = Depends(db_session), actor: User = Depends(current_admin)) -> User:
     email = normalize_email(payload.email)
-    if db.scalar(select(User).where(User.email == email)) is not None:
-        raise HTTPException(status_code=409, detail="User email already exists")
+    existing = db.scalar(select(User).where(User.email == email))
+    if existing is not None:
+        if existing.status != "inactive":
+            raise HTTPException(status_code=409, detail="Já existe um usuário ativo com este e-mail.")
+        existing.name = payload.name.strip()
+        existing.role = payload.role
+        existing.status = "active"
+        existing.avatar_url = payload.avatar_url
+        existing.password_hash = hash_password(payload.password)
+        existing.raw = {**(existing.raw or {}), "source": "api", "reactivated": True}
+        db.add(existing)
+        db.add(
+            AuditEvent(
+                actor=actor.email,
+                action="user_reactivated",
+                target=existing.id,
+                payload={"email": existing.email, "role": existing.role},
+            )
+        )
+        db.commit()
+        db.refresh(existing)
+        return existing
     user = User(
         name=payload.name.strip(),
         email=email,
@@ -68,7 +88,7 @@ def update_user(
         email = normalize_email(payload.email)
         existing = db.scalar(select(User).where(User.email == email, User.id != user.id))
         if existing is not None:
-            raise HTTPException(status_code=409, detail="User email already exists")
+            raise HTTPException(status_code=409, detail="Já existe um usuário com este e-mail.")
         user.email = email
         changes["email"] = user.email
     if payload.role is not None:

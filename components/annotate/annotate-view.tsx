@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
+import { useSearchParams } from "next/navigation"
 import {
   MousePointer2,
   Square,
@@ -26,6 +27,7 @@ import { Button } from "@/components/ui/button"
 import {
   createInferenceRun,
   deleteInferenceSuggestions,
+  fetchLabels,
   fetchModelVersions,
   fetchInferenceSuggestions,
   fetchReviewAnnotations,
@@ -34,11 +36,13 @@ import {
   jobsEventsUrl,
   saveManualAnnotations,
   taskFrameAssetUrl,
+  updateLabelColor,
 } from "@/lib/api/client"
 import { labelsFromTasks } from "@/lib/api/status"
 import { useCurrentUser } from "@/lib/auth/user-context"
 import type {
   BackendAnnotationRecord,
+  BackendCvatLabel,
   BackendInferenceSuggestion,
   BackendManualAnnotationShape,
   BackendModelVersion,
@@ -69,11 +73,18 @@ type ClassItem = { name: string; color: string; parent?: string }
 const initialClassList: ClassItem[] = []
 
 const newClassPalette = [
-  "oklch(0.65 0.18 25)",
-  "oklch(0.6 0.15 300)",
-  "oklch(0.7 0.14 160)",
-  "oklch(0.68 0.16 70)",
-  "oklch(0.62 0.17 220)",
+  "#4f8cff",
+  "#ef4444",
+  "#22c55e",
+  "#f59e0b",
+  "#8b5cf6",
+  "#06b6d4",
+  "#ec4899",
+  "#84cc16",
+  "#f97316",
+  "#14b8a6",
+  "#6366f1",
+  "#eab308",
 ]
 
 type Shape =
@@ -107,11 +118,37 @@ const handles: { id: Handle; cls: string; cursor: string }[] = [
 const POLY_CLOSE_DIST = 0.02
 
 export function AnnotateView() {
+  const searchParams = useSearchParams()
   const [tasks, setTasks] = useState<BackendTask[] | null>(null)
+  const [backendLabels, setBackendLabels] = useState<BackendCvatLabel[]>([])
   const [taskMeta, setTaskMeta] = useState<BackendTaskDataMeta | null>(null)
   const [modelVersions, setModelVersions] = useState<BackendModelVersion[]>([])
   const { currentUser } = useCurrentUser()
-  const currentTask = tasks?.[0] ?? null
+  const selectedTaskId = searchParams.get("task")
+  const currentTask = useMemo(() => {
+    if (!tasks?.length) return null
+    if (!selectedTaskId) return tasks[0]
+    return tasks.find((task) => task.external_id === selectedTaskId || task.id === selectedTaskId) ?? tasks[0]
+  }, [selectedTaskId, tasks])
+  const currentProjectExternalId = currentTask?.project_external_id ?? null
+  const currentClassScopeKey = classScopeKey(currentProjectExternalId)
+  const projectTasks = useMemo(() => {
+    if (!tasks?.length) return []
+    if (!currentTask) return tasks
+    return currentProjectExternalId
+      ? tasks.filter((task) => task.project_external_id === currentProjectExternalId)
+      : tasks.filter((task) => !task.project_external_id)
+  }, [currentProjectExternalId, currentTask, tasks])
+  const [localProjectClasses, setLocalProjectClasses] = useState<Record<string, ClassItem[]>>({})
+  const projectClassCatalog = useMemo(
+    () =>
+      mergeClassItems(
+        localProjectClasses[currentClassScopeKey] ?? [],
+        classItemsFromBackendLabels(backendLabels, projectTasks, currentProjectExternalId),
+        labelsFromTasks(projectTasks).map((label) => ({ name: label.name, color: label.color })),
+      ),
+    [backendLabels, currentClassScopeKey, currentProjectExternalId, localProjectClasses, projectTasks],
+  )
   const annotationModels = modelVersions
     .filter((model) => model.status !== "archived")
     .map(modelInfoFromBackend)
@@ -168,17 +205,17 @@ export function AnnotateView() {
   useEffect(() => {
     const controller = new AbortController()
     fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
+    fetchLabels(controller.signal).then(setBackendLabels).catch(() => setBackendLabels([]))
     fetchModelVersions(controller.signal).then(setModelVersions).catch(() => setModelVersions([]))
     return () => controller.abort()
   }, [])
 
   useEffect(() => {
-    const labels = labelsFromTasks(tasks)
-    if (labels.length > 0) {
-      setClassList(labels.map((label) => ({ name: label.name, color: label.color })))
-      setActiveClass(null)
-    }
-  }, [tasks])
+    setClassList(projectClassCatalog)
+    setActiveClass((active) =>
+      active && projectClassCatalog.some((label) => label.name === active) ? active : null,
+    )
+  }, [projectClassCatalog])
 
   useEffect(() => {
     setImageIndex((index) => Math.min(Math.max(index, 1), totalImages))
@@ -200,6 +237,14 @@ export function AnnotateView() {
     ? currentFrameDimensions.width / currentFrameDimensions.height
     : 16 / 9
   const shapes = shapesByFrame[currentFrameKey] ?? initialShapes
+
+  useEffect(() => {
+    setImageIndex(1)
+    setSelectedId(null)
+    setDraft(null)
+    setPolyDraft(null)
+    setClassPicker(null)
+  }, [currentTaskId])
 
   useEffect(() => {
     if (!currentTaskId) {
@@ -547,29 +592,44 @@ export function AnnotateView() {
     if (!name) return null
     const existing = classList.find((item) => item.name.toLowerCase() === name.toLowerCase())
     if (existing) return existing.name
+    const item: ClassItem = { name, color: nextClassColor(classList, name), parent: parent ?? undefined }
 
-    setClassList((prev) => {
-      if (prev.some((item) => item.name.toLowerCase() === name.toLowerCase())) return prev
-
-      if (parent) {
-        const parentIndex = prev.findIndex((item) => item.name === parent)
-        const parentItem = parentIndex >= 0 ? prev[parentIndex] : null
-        const color = parentItem?.color ?? newClassPalette[prev.length % newClassPalette.length]
-        if (parentIndex < 0) return [...prev, { name, color }]
-
-        let insertAt = parentIndex + 1
-        while (insertAt < prev.length && prev[insertAt].parent === parent) insertAt++
-        const next = [...prev]
-        next.splice(insertAt, 0, { name, color, parent })
-        return next
-      }
-
-      const color = newClassPalette[prev.length % newClassPalette.length]
-      return [...prev, { name, color }]
+    setClassList((prev) => insertClassItem(prev, item, parent))
+    setLocalProjectClasses((prev) => {
+      const current = mergeClassItems(prev[currentClassScopeKey] ?? [], classList)
+      return { ...prev, [currentClassScopeKey]: insertClassItem(current, item, parent) }
     })
 
     return name
   }
+
+  const updateClassColor = useCallback(
+    (name: string, rawColor: string) => {
+      const color = normalizeHexColor(rawColor)
+      if (!color) return
+      const applyColor = (items: ClassItem[]) =>
+        items.map((item) => (item.name.toLowerCase() === name.toLowerCase() ? { ...item, color } : item))
+
+      setClassList((prev) => applyColor(prev))
+      setLocalProjectClasses((prev) => {
+        const current = mergeClassItems(prev[currentClassScopeKey] ?? [], classList)
+        return { ...prev, [currentClassScopeKey]: applyColor(current) }
+      })
+      void updateLabelColor({
+        name,
+        color,
+        project_external_id: currentProjectExternalId,
+        task_external_id: currentTask?.external_id ?? null,
+      })
+        .then((updated) => {
+          setBackendLabels((prev) => mergeBackendLabels(prev, updated))
+        })
+        .catch(() => {
+          // A cor permanece localmente; o próximo salvamento da anotação também envia label_color.
+        })
+    },
+    [classList, currentClassScopeKey, currentProjectExternalId, currentTask?.external_id],
+  )
 
   const createAndApplyPickerClass = () => {
     if (!classPicker) return
@@ -888,13 +948,19 @@ export function AnnotateView() {
       const records = await saveManualAnnotations({
         task_external_id: currentTask.external_id,
         frame: currentFrame,
-        shapes: shapes.map(shapeToManualAnnotation),
+        shapes: shapes.map((shape) => shapeToManualAnnotation(shape, classList)),
         actor: currentUser.email || currentUser.id,
         sync_cvat: true,
         replace_existing: true,
       })
       loadedAnnotationKeys.current.add(currentFrameKey)
       setClassList((prev) => mergeAnnotationClasses(prev, records))
+      setLocalProjectClasses((prev) => {
+        const existing = prev[currentClassScopeKey] ?? []
+        const saved = classItemsFromAnnotationRecords(records, classList)
+        if (saved.length === 0) return prev
+        return { ...prev, [currentClassScopeKey]: mergeClassItems(existing, saved) }
+      })
       if (dirtyFrameSignatures.current.get(currentFrameKey) === signature) {
         dirtyFrameSignatures.current.delete(currentFrameKey)
       }
@@ -907,7 +973,7 @@ export function AnnotateView() {
     } finally {
       setSaving(false)
     }
-  }, [currentFrame, currentFrameKey, currentTask?.external_id, currentUser.email, currentUser.id, shapes])
+  }, [classList, currentClassScopeKey, currentFrame, currentFrameKey, currentTask?.external_id, currentUser.email, currentUser.id, shapes])
 
   const handleSave = () => {
     void persistCurrentFrame("manual")
@@ -1472,14 +1538,30 @@ export function AnnotateView() {
                       isActive ? "bg-muted ring-1 ring-brand-blue/40" : "hover:bg-muted",
                     )}
                   >
+                    <label
+                      className={cn(
+                        "ml-2 flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md hover:bg-background",
+                        c.parent && "ml-6",
+                      )}
+                      title={`Alterar cor de ${c.name}`}
+                      aria-label={`Alterar cor de ${c.name}`}
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <span className="size-3 shrink-0 rounded-full" style={{ backgroundColor: c.color }} />
+                      <input
+                        type="color"
+                        value={colorInputValue(c.color)}
+                        onChange={(event) => updateClassColor(c.name, event.target.value)}
+                        className="sr-only"
+                      />
+                    </label>
                     <button
                       type="button"
                       onClick={() => setActiveClass((prev) => (prev === c.name ? null : c.name))}
                       aria-pressed={isActive}
                       title={isActive ? "Clique para desmarcar" : undefined}
-                      className={cn("flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-sm", c.parent && "pl-6")}
+                      className="flex min-w-0 flex-1 items-center gap-2 px-1 py-1.5 text-sm"
                     >
-                      <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: c.color }} />
                       <span className="truncate text-foreground">{c.name}</span>
                     </button>
                     <span className="flex shrink-0 items-center gap-1 pr-2">
@@ -1724,12 +1806,14 @@ function mapBackendSuggestion(suggestion: BackendInferenceSuggestion): Suggestio
   }
 }
 
-function shapeToManualAnnotation(shape: Shape): BackendManualAnnotationShape {
+function shapeToManualAnnotation(shape: Shape, classList: ClassItem[]): BackendManualAnnotationShape {
+  const labelColor = classList.find((item) => item.name === shape.cls)?.color ?? null
   if (shape.type === "box") {
     return {
       client_id: String(shape.id),
       shape_type: "rectangle",
       label_name: shape.cls,
+      label_color: labelColor,
       points: [shape.x, shape.y, shape.x + shape.w, shape.y + shape.h],
       bbox_norm: { x: shape.x, y: shape.y, w: shape.w, h: shape.h },
     }
@@ -1740,6 +1824,7 @@ function shapeToManualAnnotation(shape: Shape): BackendManualAnnotationShape {
       client_id: String(shape.id),
       shape_type: "polygon",
       label_name: shape.cls,
+      label_color: labelColor,
       points,
       bbox_norm: bboxFromNormalizedPoints(points),
     }
@@ -1748,6 +1833,7 @@ function shapeToManualAnnotation(shape: Shape): BackendManualAnnotationShape {
     client_id: String(shape.id),
     shape_type: "points",
     label_name: shape.cls,
+    label_color: labelColor,
     points: [shape.x, shape.y],
     bbox_norm: { x: shape.x, y: shape.y, w: 0, h: 0 },
   }
@@ -1769,7 +1855,7 @@ function frameShapesSignature(shapes: Shape[]) {
 
 function shapesFromAnnotationRecords(records: BackendAnnotationRecord[], dimensions: FrameDimensions): Shape[] {
   const candidates = records
-    .filter((record) => record.review_state !== "deleted_by_reviewer")
+    .filter(isEditableAnnotationRecord)
     .map((record) => {
       const shape = shapeFromAnnotationRecord(record, dimensions)
       return shape ? { record, shape, priority: annotationRecordPriority(record) } : null
@@ -1785,6 +1871,12 @@ function shapesFromAnnotationRecords(records: BackendAnnotationRecord[], dimensi
     if (!duplicate) kept.push(candidate)
   }
   return kept.map((candidate) => candidate.shape)
+}
+
+function isEditableAnnotationRecord(record: BackendAnnotationRecord) {
+  return !["deleted_by_reviewer", "needs_annotation", "rejected", "incorrect"].includes(
+    String(record.review_state ?? "").toLowerCase(),
+  )
 }
 
 function annotationRecordPriority(record: BackendAnnotationRecord) {
@@ -1851,14 +1943,151 @@ function shapeFromAnnotationRecord(record: BackendAnnotationRecord, dimensions: 
 }
 
 function mergeAnnotationClasses(classList: ClassItem[], records: BackendAnnotationRecord[]) {
-  const next = [...classList]
+  return mergeClassItems(classList, classItemsFromAnnotationRecords(records, classList))
+}
+
+function classScopeKey(projectExternalId: string | null | undefined) {
+  return projectExternalId ? `project:${projectExternalId}` : "project:__none__"
+}
+
+function mergeClassItems(...groups: ClassItem[][]) {
+  const next: ClassItem[] = []
+  const byName = new Set<string>()
+  for (const group of groups) {
+    for (const item of group) {
+      const name = item.name.trim()
+      if (!name) continue
+      const key = name.toLowerCase()
+      if (byName.has(key)) continue
+      byName.add(key)
+      next.push({ ...item, name })
+    }
+  }
+  return next
+}
+
+function insertClassItem(items: ClassItem[], item: ClassItem, parent: string | null = item.parent ?? null) {
+  if (items.some((current) => current.name.toLowerCase() === item.name.toLowerCase())) return items
+  if (!parent) return [...items, { ...item, parent: undefined }]
+
+  const parentIndex = items.findIndex((current) => current.name === parent)
+  if (parentIndex < 0) return [...items, { ...item, parent: undefined }]
+
+  let insertAt = parentIndex + 1
+  while (insertAt < items.length && items[insertAt].parent === parent) insertAt++
+  const next = [...items]
+  next.splice(insertAt, 0, { ...item, parent })
+  return next
+}
+
+function nextClassColor(existing: ClassItem[], seed: string) {
+  const used = new Set(existing.map((item) => normalizeHexColor(item.color)).filter(Boolean))
+  const start = Math.abs(hashString(seed)) % newClassPalette.length
+  for (let offset = 0; offset < newClassPalette.length; offset++) {
+    const color = newClassPalette[(start + offset) % newClassPalette.length]
+    if (!used.has(color.toLowerCase())) return color
+  }
+
+  for (let index = 0; index < 64; index++) {
+    const color = hslToHex((hashString(seed) + index * 137) % 360, 72, 52)
+    if (!used.has(color.toLowerCase())) return color
+  }
+  return newClassPalette[start]
+}
+
+function colorInputValue(color: string) {
+  return normalizeHexColor(color) ?? "#4f8cff"
+}
+
+function normalizeHexColor(color: string | null | undefined) {
+  if (!color) return null
+  const value = color.trim()
+  if (/^#[0-9a-fA-F]{6}$/.test(value)) return value.toLowerCase()
+  if (/^#[0-9a-fA-F]{3}$/.test(value)) {
+    const [, r, g, b] = value
+    return `#${r}${r}${g}${g}${b}${b}`.toLowerCase()
+  }
+  return null
+}
+
+function hashString(value: string) {
+  let hash = 0
+  for (let index = 0; index < value.length; index++) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0
+  }
+  return hash
+}
+
+function hslToHex(hue: number, saturation: number, lightness: number) {
+  const h = ((hue % 360) + 360) % 360
+  const s = saturation / 100
+  const l = lightness / 100
+  const chroma = (1 - Math.abs(2 * l - 1)) * s
+  const x = chroma * (1 - Math.abs(((h / 60) % 2) - 1))
+  const m = l - chroma / 2
+  const [r, g, b] =
+    h < 60
+      ? [chroma, x, 0]
+      : h < 120
+        ? [x, chroma, 0]
+        : h < 180
+          ? [0, chroma, x]
+          : h < 240
+            ? [0, x, chroma]
+            : h < 300
+              ? [x, 0, chroma]
+              : [chroma, 0, x]
+  return `#${[r, g, b]
+    .map((channel) => Math.round((channel + m) * 255).toString(16).padStart(2, "0"))
+    .join("")}`
+}
+
+function classItemsFromBackendLabels(
+  labels: BackendCvatLabel[],
+  projectTasks: BackendTask[],
+  projectExternalId: string | null,
+) {
+  const taskExternalIds = new Set(projectTasks.map((task) => task.external_id).filter(Boolean))
+  const items: ClassItem[] = []
+  for (const label of labels) {
+    const taskScopedToProject = label.task_external_id ? taskExternalIds.has(label.task_external_id) : false
+    const projectScoped = projectExternalId
+      ? label.project_external_id === projectExternalId
+      : !label.project_external_id && (!label.task_external_id || taskScopedToProject)
+    if (!projectScoped && !taskScopedToProject) continue
+    const name = label.name.trim()
+    if (!name) continue
+    items.push({
+      name,
+      color: label.color || stringFromRecord(label.raw, "color") || nextClassColor(items, name),
+      parent: stringFromRecord(label.raw, "parent") ?? undefined,
+    })
+  }
+  return items
+}
+
+function mergeBackendLabels(current: BackendCvatLabel[], incoming: BackendCvatLabel[]) {
+  if (incoming.length === 0) return current
+  const byId = new Map(current.map((label) => [label.id, label]))
+  for (const label of incoming) {
+    byId.set(label.id, label)
+  }
+  return Array.from(byId.values())
+}
+
+function classItemsFromAnnotationRecords(records: BackendAnnotationRecord[], existing: ClassItem[]) {
+  const items: ClassItem[] = []
   for (const record of records) {
     const name = record.label_name ?? stringFromRecord(record.raw, "label_name")
     if (!name) continue
-    if (next.some((item) => item.name.toLowerCase() === name.toLowerCase())) continue
-    next.push({ name, color: newClassPalette[next.length % newClassPalette.length] })
+    const current = existing.find((item) => item.name.toLowerCase() === name.toLowerCase())
+    items.push({
+      name,
+      color: current?.color ?? nextClassColor([...existing, ...items], name),
+      parent: current?.parent,
+    })
   }
-  return next
+  return mergeClassItems(items)
 }
 
 function frameDimensionsFromMeta(meta: BackendTaskDataMeta | null, frame: number): FrameDimensions | null {

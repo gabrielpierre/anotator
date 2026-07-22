@@ -24,8 +24,9 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/ca
 import { Button } from "@/components/ui/button"
 import { StatRow, Meter } from "@/components/app/primitives"
 import { SparkLineChart } from "@/components/app/charts"
-import { createTrainingRun } from "@/lib/api/client"
+import { createTrainingRun, fetchDatasetRelease, fetchJobCapacity } from "@/lib/api/client"
 import { cn } from "@/lib/utils"
+import type { BackendComputeDevice, BackendDatasetRelease, BackendJobCapacity } from "@/lib/api/types"
 
 const STEPS = [
   { key: "dataset", label: "Dataset" },
@@ -46,13 +47,36 @@ export function TrainingWizard({ release }: { release: string }) {
     batchSize: "16",
     imageSize: "640",
     workers: "8",
-    device: "auto",
+    device: "cpu",
     patience: "30",
     seed: "42",
   })
+  const [capacity, setCapacity] = React.useState<BackendJobCapacity | null>(null)
+  const [datasetRelease, setDatasetRelease] = React.useState<BackendDatasetRelease | null>(null)
   const [starting, setStarting] = React.useState(false)
   const [startError, setStartError] = React.useState<string | null>(null)
-  const validation = useSplitValidation(cfg)
+  const datasetStats = React.useMemo(() => datasetStatsFromRelease(datasetRelease), [datasetRelease])
+  const validation = useSplitValidation(cfg, datasetStats)
+  const deviceOptions = React.useMemo(() => deviceOptionsFromCapacity(capacity), [capacity])
+  const selectedDeviceLabel = deviceLabel(deviceOptions, trainingCfg.device)
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    fetchJobCapacity(controller.signal).then(setCapacity).catch(() => setCapacity(null))
+    return () => controller.abort()
+  }, [])
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    fetchDatasetRelease(release, controller.signal).then(setDatasetRelease).catch(() => setDatasetRelease(null))
+    return () => controller.abort()
+  }, [release])
+
+  React.useEffect(() => {
+    if (!deviceOptions.some((option) => optionValue(option) === trainingCfg.device)) {
+      setTrainingCfg((current) => ({ ...current, device: deviceOptions[0] ? optionValue(deviceOptions[0]) : "cpu" }))
+    }
+  }, [deviceOptions, trainingCfg.device])
 
   const nextBlocked = step === 0 && validation.status === "invalid"
   const nextBlockedReason =
@@ -68,6 +92,7 @@ export function TrainingWizard({ release }: { release: string }) {
     setStarting(true)
     setStartError(null)
     try {
+      const backendDevice = toBackendDevice(trainingCfg.device)
       const run = await createTrainingRun({
         dataset_release_id: release,
         base_model: toUltralyticsWeight(trainingCfg.baseModel),
@@ -75,7 +100,7 @@ export function TrainingWizard({ release }: { release: string }) {
         epochs: intOr(trainingCfg.epochs, 100),
         image_size: intOr(trainingCfg.imageSize, 640),
         batch_size: intOr(trainingCfg.batchSize, 16),
-        device: toBackendDevice(trainingCfg.device),
+        device: backendDevice,
         workers: intOr(trainingCfg.workers, 8),
         patience: intOr(trainingCfg.patience, 30),
         seed: intOr(trainingCfg.seed, 42),
@@ -83,7 +108,8 @@ export function TrainingWizard({ release }: { release: string }) {
           model_name: trainingCfg.baseModel,
           split: cfg,
           resource_policy: {
-            device: trainingCfg.device,
+            device: backendDevice ?? "auto",
+            device_label: selectedDeviceLabel,
             workers: intOr(trainingCfg.workers, 8),
           },
           ultralytics: {
@@ -178,18 +204,21 @@ export function TrainingWizard({ release }: { release: string }) {
       </Card>
 
       {step === 0 ? (
-        <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_340px]">
-          <div className="min-w-0">
-            <DatasetStep cfg={cfg} setCfg={setCfg} validation={validation} />
-          </div>
-          <DatasetSummary release={release} cfg={cfg} validation={validation} />
+        <div className="min-w-0">
+          <DatasetStep cfg={cfg} setCfg={setCfg} validation={validation} stats={datasetStats} />
         </div>
       ) : (
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
         <div className="flex min-w-0 flex-col gap-6">
           {step === 1 && <ModelStep selected={trainingCfg.baseModel} onSelect={(baseModel) => setTrainingCfg((current) => ({ ...current, baseModel }))} />}
           {step === 2 && <ParametersStep trainingCfg={trainingCfg} setTrainingCfg={setTrainingCfg} />}
-          {step === 3 && <ResourcesStep trainingCfg={trainingCfg} setTrainingCfg={setTrainingCfg} />}
+          {step === 3 && (
+            <ResourcesStep
+              trainingCfg={trainingCfg}
+              setTrainingCfg={setTrainingCfg}
+              deviceOptions={deviceOptions}
+            />
+          )}
           {step >= 4 && <ReviewStep onStart={startTraining} starting={starting} />}
           {startError && (
             <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{startError}</p>
@@ -242,8 +271,8 @@ export function TrainingWizard({ release }: { release: string }) {
         </div>
 
         {/* Right rail — resumo */}
-        <aside className="flex flex-col gap-6">
-          <Card>
+        <aside className="flex min-w-0 flex-col gap-6">
+          <Card className="min-w-0 overflow-hidden">
             <CardHeader>
               <CardTitle>Resumo da configuração</CardTitle>
             </CardHeader>
@@ -251,7 +280,11 @@ export function TrainingWizard({ release }: { release: string }) {
               <div className="rounded-xl bg-surface-subtle p-4">
                 <div className="divide-y divide-border">
                   <StatRow label="Modelo" value={trainingCfg.baseModel} />
-                  <StatRow label="Dataset" value={release} />
+                  <StatRow
+                    label="Dataset"
+                    value={<span title={release}>{compactId(release)}</span>}
+                    valueClassName="inline-block max-w-[150px] truncate font-mono text-xs leading-5"
+                  />
                 </div>
               </div>
               <div>
@@ -260,6 +293,7 @@ export function TrainingWizard({ release }: { release: string }) {
                   <StatRow label="Épocas" value={trainingCfg.epochs} />
                   <StatRow label="Batch size" value={trainingCfg.batchSize} />
                   <StatRow label="Imagem (imgsz)" value={trainingCfg.imageSize} />
+                  <StatRow label="Dispositivo" value={selectedDeviceLabel} />
                   <StatRow label="Optimizer" value="AdamW" />
                   <StatRow label="LR inicial" value="0.001" />
                   <StatRow label="Scheduler" value="Cosine" />
@@ -273,7 +307,12 @@ export function TrainingWizard({ release }: { release: string }) {
               <CardTitle>Recursos estimados</CardTitle>
             </CardHeader>
             <CardContent className="flex flex-col gap-3">
-              <Meter label="GPU" value={0} detail="Definido pela configuração enviada ao backend" color="bg-brand-green" />
+              <Meter
+                label="GPU"
+                value={trainingCfg.device === "cpu" ? 0 : 100}
+                detail={trainingCfg.device === "cpu" ? "CPU selecionada" : selectedDeviceLabel}
+                color="bg-brand-green"
+              />
               <Meter label="Memória RAM" value={66} detail="~ 15.8 GB" color="bg-brand-blue" />
               <Meter label="CPU" value={54} detail="~ 6.5 cores" color="bg-brand-lavender" />
             </CardContent>
@@ -320,10 +359,77 @@ function toUltralyticsWeight(model: string) {
   return `${model.toLowerCase()}.pt`
 }
 
+function compactId(value: string) {
+  if (value.length <= 18) return value
+  return `${value.slice(0, 8)}...${value.slice(-6)}`
+}
+
 function toBackendDevice(device: string) {
-  if (device.startsWith("CPU")) return "cpu"
-  if (device.startsWith("1x")) return "0"
-  return "0,1"
+  const normalized = device.trim().toLowerCase()
+  if (!normalized || normalized === "auto") return null
+  if (normalized === "cpu" || normalized.startsWith("cpu")) return "cpu"
+  if (normalized === "0" || normalized.startsWith("1x")) return "0"
+  if (normalized === "0,1" || normalized.startsWith("2x")) return "0,1"
+  return device
+}
+
+type SelectOption = string | { value: string; label: string; disabled?: boolean }
+
+function deviceOptionsFromCapacity(capacity: BackendJobCapacity | null): SelectOption[] {
+  const devices = Array.isArray(capacity?.gpu?.device_options) ? capacity.gpu.device_options : []
+  const available = devices.filter((device) => device.available !== false)
+  const availableValues = new Set(available.map((device) => String(device.id)))
+  const detected = Array.isArray(capacity?.gpu?.detected_devices) ? capacity.gpu.detected_devices : []
+  const unavailableDetected = detected
+    .filter((device) => !availableValues.has(String(device.id)))
+    .map((device) => ({
+      value: `unavailable-${String(device.id)}`,
+      label: `${deviceOptionLabel(device)} indisponível no Docker`,
+      disabled: true,
+    }))
+  if (!available.length) {
+    return [{ value: "cpu", label: cpuLabelFromCapacity(capacity) }, ...unavailableDetected]
+  }
+  return [
+    ...available.map((device) => ({
+      value: String(device.id),
+      label: deviceOptionLabel(device),
+    })),
+    ...unavailableDetected,
+  ]
+}
+
+function deviceOptionLabel(device: BackendComputeDevice) {
+  if (device.type === "cpu") return device.label ?? device.name ?? "CPU"
+  const memory = typeof device.memory_total_bytes === "number" ? ` (${formatBytes(device.memory_total_bytes)})` : ""
+  return device.label ?? `GPU ${device.index ?? device.id} - ${device.name}${memory}`
+}
+
+function cpuLabelFromCapacity(capacity: BackendJobCapacity | null) {
+  return capacity?.cpu_count ? `CPU (${capacity.cpu_count} cores)` : "CPU"
+}
+
+function deviceLabel(options: SelectOption[], value: string) {
+  const option = options.find((entry) => optionValue(entry) === value)
+  return option ? optionLabel(option) : value
+}
+
+function optionValue(option: SelectOption) {
+  return typeof option === "string" ? option : option.value
+}
+
+function optionLabel(option: SelectOption) {
+  return typeof option === "string" ? option : option.label
+}
+
+function formatBytes(value: number) {
+  if (value >= 1024 * 1024 * 1024) {
+    return `${(value / 1024 / 1024 / 1024).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} GB`
+  }
+  if (value >= 1024 * 1024) {
+    return `${Math.round(value / 1024 / 1024).toLocaleString("pt-BR")} MB`
+  }
+  return `${Math.round(value / 1024).toLocaleString("pt-BR")} KB`
 }
 
 function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
@@ -367,7 +473,7 @@ function SelectField({
   value,
   onChange,
 }: {
-  options: string[]
+  options: SelectOption[]
   defaultValue?: string
   value?: string
   onChange?: (v: string) => void
@@ -380,9 +486,9 @@ function SelectField({
       onChange={(e) => onChange?.(e.target.value)}
       className="h-9 rounded-lg bg-muted px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring/50"
     >
-      {options.map((o) => (
-        <option key={o} value={o}>
-          {o}
+      {options.map((option) => (
+        <option key={optionValue(option)} value={optionValue(option)} disabled={typeof option !== "string" && option.disabled}>
+          {optionLabel(option)}
         </option>
       ))}
     </select>
@@ -736,12 +842,25 @@ export const defaultSplitConfig: SplitConfig = {
   augMode: "Online durante treinamento",
 }
 
-const BASE_IMAGES = 0
-const BASE_OBJECTS = 0
-const BASE_VIDEOS = 0
-const BASE_MINUTES = 0
+type DatasetClassStat = { name: string; total: number }
 
-const BASE_CLASSES: { name: string; total: number }[] = []
+type DatasetStats = {
+  loaded: boolean
+  images: number
+  objects: number
+  videos: number
+  minutes: number
+  classes: DatasetClassStat[]
+}
+
+const EMPTY_DATASET_STATS: DatasetStats = {
+  loaded: false,
+  images: 0,
+  objects: 0,
+  videos: 0,
+  minutes: 0,
+  classes: [],
+}
 
 export type SplitRow = {
   key: "train" | "val" | "test" | "total"
@@ -771,11 +890,16 @@ function formatDuration(min: number) {
   return `${String(h).padStart(2, "0")}h ${String(m).padStart(2, "0")}min`
 }
 
-function computeValidation(cfg: SplitConfig): ValidationResult {
+function computeValidation(cfg: SplitConfig, stats: DatasetStats = EMPTY_DATASET_STATS): ValidationResult {
   const train = Number(cfg.train) || 0
   const val = Number(cfg.val) || 0
   const test = Number(cfg.test) || 0
   const sum = train + val + test
+  const weights = [train, val, test]
+  const imageCounts = distributeCount(stats.images, weights)
+  const objectCounts = distributeCount(stats.objects, weights)
+  const videoCounts = distributeCount(stats.videos, weights)
+  const minuteCounts = distributeCount(stats.minutes, weights)
 
   const rows: SplitRow[] = [
     {
@@ -783,44 +907,44 @@ function computeValidation(cfg: SplitConfig): ValidationResult {
       label: "Train",
       dot: "bg-brand-green",
       pct: train,
-      images: Math.round((BASE_IMAGES * train) / 100),
-      objects: Math.round((BASE_OBJECTS * train) / 100),
-      videos: Math.round((BASE_VIDEOS * train) / 100),
-      minutes: Math.round((BASE_MINUTES * train) / 100),
+      images: imageCounts[0],
+      objects: objectCounts[0],
+      videos: videoCounts[0],
+      minutes: minuteCounts[0],
     },
     {
       key: "val",
       label: "Validação",
       dot: "bg-brand-blue",
       pct: val,
-      images: Math.round((BASE_IMAGES * val) / 100),
-      objects: Math.round((BASE_OBJECTS * val) / 100),
-      videos: Math.round((BASE_VIDEOS * val) / 100),
-      minutes: Math.round((BASE_MINUTES * val) / 100),
+      images: imageCounts[1],
+      objects: objectCounts[1],
+      videos: videoCounts[1],
+      minutes: minuteCounts[1],
     },
     {
       key: "test",
       label: "Teste",
       dot: "bg-brand-lavender",
       pct: test,
-      images: Math.round((BASE_IMAGES * test) / 100),
-      objects: Math.round((BASE_OBJECTS * test) / 100),
-      videos: Math.round((BASE_VIDEOS * test) / 100),
-      minutes: Math.round((BASE_MINUTES * test) / 100),
+      images: imageCounts[2],
+      objects: objectCounts[2],
+      videos: videoCounts[2],
+      minutes: minuteCounts[2],
     },
     {
       key: "total",
       label: "Total",
       dot: "",
       pct: sum,
-      images: BASE_IMAGES,
-      objects: BASE_OBJECTS,
-      videos: BASE_VIDEOS,
-      minutes: BASE_MINUTES,
+      images: stats.images,
+      objects: stats.objects,
+      videos: stats.videos,
+      minutes: stats.minutes,
     },
   ]
 
-  const classes: ClassRow[] = BASE_CLASSES.map((c) => ({
+  const classes: ClassRow[] = stats.classes.map((c) => ({
     name: c.name,
     train: Math.round((c.total * train) / 100),
     val: Math.round((c.total * val) / 100),
@@ -864,19 +988,104 @@ function computeValidation(cfg: SplitConfig): ValidationResult {
   return { status, rows, classes, checks, warnings, errors }
 }
 
+function distributeCount(total: number, weights: number[]) {
+  const integerTotal = Math.max(0, Math.round(total))
+  const normalizedWeights = weights.map((weight) => (Number.isFinite(weight) && weight > 0 ? weight : 0))
+  const weightTotal = normalizedWeights.reduce((sum, weight) => sum + weight, 0)
+  if (integerTotal === 0 || weightTotal === 0) return normalizedWeights.map(() => 0)
+
+  const exactCounts = normalizedWeights.map((weight) => (integerTotal * weight) / weightTotal)
+  const counts = exactCounts.map(Math.floor)
+  let remaining = integerTotal - counts.reduce((sum, count) => sum + count, 0)
+  const order = exactCounts
+    .map((value, index) => ({ index, remainder: value - Math.floor(value) }))
+    .sort((a, b) => b.remainder - a.remainder)
+
+  for (let i = 0; remaining > 0 && order.length > 0; i += 1, remaining -= 1) {
+    counts[order[i % order.length].index] += 1
+  }
+
+  return counts
+}
+
 /** Recalcula a validação do split com debounce a cada alteração de configuração. */
-function useSplitValidation(cfg: SplitConfig, delay = 500): ValidationResult {
-  const [result, setResult] = React.useState<ValidationResult>(() => computeValidation(cfg))
-  const key = JSON.stringify(cfg)
+function useSplitValidation(cfg: SplitConfig, stats: DatasetStats, delay = 500): ValidationResult {
+  const [result, setResult] = React.useState<ValidationResult>(() => computeValidation(cfg, stats))
+  const key = JSON.stringify({ cfg, stats })
 
   React.useEffect(() => {
     setResult((prev) => ({ ...prev, status: "loading" }))
-    const t = setTimeout(() => setResult(computeValidation(cfg)), delay)
+    const t = setTimeout(() => setResult(computeValidation(cfg, stats)), delay)
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, delay])
 
   return result
+}
+
+function datasetStatsFromRelease(release: BackendDatasetRelease | null): DatasetStats {
+  if (!release) return EMPTY_DATASET_STATS
+  const snapshot = objectRecord(release.snapshot)
+  const counts = objectRecord(snapshot.counts)
+  const prepared = objectRecord(snapshot.prepared_dataset)
+  const manifest = objectRecord(prepared.manifest)
+  const manifestImages = arrayOfRecords(manifest.images)
+  const manifestClasses = stringArray(manifest.classes)
+  const labelNames = arrayOfRecords(snapshot.labels)
+    .map((label) => stringValue(label.name))
+    .filter((name): name is string => Boolean(name))
+  const classNames = uniqueStrings(manifestClasses.length ? manifestClasses : labelNames)
+  const manifestObjectCount = manifestImages.reduce(
+    (total, image) => total + (numberValue(image.boxes) ?? 0),
+    0,
+  )
+  const imageCount = manifestImages.length || numberValue(counts.images) || 0
+  const objectCount =
+    manifestObjectCount || numberValue(counts.annotations) || numberValue(counts.objects) || 0
+  const classes =
+    classNames.length === 1 && objectCount > 0
+      ? [{ name: classNames[0], total: objectCount }]
+      : classNames.map((name) => ({ name, total: 0 }))
+
+  return {
+    loaded: true,
+    images: imageCount,
+    objects: objectCount,
+    videos: numberValue(counts.videos) || 0,
+    minutes: numberValue(counts.minutes) || 0,
+    classes,
+  }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
+
+function arrayOfRecords(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    : []
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(stringValue).filter((item): item is string => Boolean(item)) : []
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null
+}
+
+function numberValue(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string") {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values))
 }
 
 export const splitStatusMeta = {
@@ -890,10 +1099,12 @@ function DatasetStep({
   cfg,
   setCfg,
   validation,
+  stats,
 }: {
   cfg: SplitConfig
   setCfg: React.Dispatch<React.SetStateAction<SplitConfig>>
   validation: ValidationResult
+  stats: DatasetStats
 }) {
   const set = <K extends keyof SplitConfig>(k: K, v: SplitConfig[K]) => setCfg((c) => ({ ...c, [k]: v }))
   const [detailsOpen, setDetailsOpen] = React.useState(false)
@@ -1025,7 +1236,11 @@ function DatasetStep({
       </SectionCard>
 
       {/* 3. Divisão de dados */}
-      <SectionCard n={3} title="Divisão de dados">
+      <SectionCard
+        n={3}
+        title="Divisão de dados"
+        action={<SplitStatusChip validation={validation} onClick={() => setDetailsOpen(true)} />}
+      >
         <div className="mb-4 inline-flex rounded-lg bg-muted p-1">
           {splitTabs.map((t) => (
             <button
@@ -1087,9 +1302,7 @@ function DatasetStep({
             onCheckedChange={(v) => set("lockTest", v)}
           />
         </div>
-
-        {/* Status compacto da divisão */}
-        <SplitStatusBlock validation={validation} onOpenDetails={() => setDetailsOpen(true)} />
+        <SplitDistributionPreview cfg={cfg} stats={stats} />
       </SectionCard>
 
       {/* 4. Augmentation */}
@@ -1164,61 +1377,37 @@ function DatasetStep({
 
 /* ---------- Compact split status ---------- */
 
-function SplitStatusBlock({
+function SplitStatusChip({
   validation,
-  onOpenDetails,
+  onClick,
 }: {
   validation: ValidationResult
-  onOpenDetails: () => void
+  onClick: () => void
 }) {
   const { status } = validation
-  const meta = splitStatusMeta[status]
-
-  const StatusIcon =
-    status === "loading" ? Loader2 : status === "valid" ? CheckCircle2 : status === "warning" ? AlertTriangle : XCircle
+  const isInvalid = status === "invalid"
+  const isLoading = status === "loading"
+  const label = isLoading ? "Calculando" : isInvalid ? "Divisão inválida" : "Divisão válida"
+  const Icon = isLoading ? Loader2 : isInvalid ? XCircle : CheckCircle2
 
   return (
-    <div className="mt-4 rounded-lg border border-border bg-surface-subtle p-3">
-      <div className="flex items-center justify-between gap-3">
-        <span className={cn("inline-flex items-center gap-2 text-sm font-medium", meta.text)}>
-          <StatusIcon className={cn("size-4", status === "loading" && "animate-spin")} />
-          {status === "loading" ? "Calculando divisão..." : `Status da divisão: ${meta.label}`}
-        </span>
-        {status !== "loading" && (
-          <Button variant="outline" size="sm" onClick={onOpenDetails}>
-            Ver detalhes
-          </Button>
-        )}
-      </div>
-
-      {status !== "loading" && (
-        <div className="mt-3 flex flex-col gap-1.5">
-          {status === "invalid" ? (
-            validation.errors.map((e) => (
-              <div key={e} className="flex items-start gap-2 text-xs text-destructive">
-                <XCircle className="size-3.5 shrink-0" />
-                {e}
-              </div>
-            ))
-          ) : (
-            <>
-              {validation.checks.map((c) => (
-                <div key={c} className="flex items-start gap-2 text-xs text-muted-foreground">
-                  <CheckCircle2 className="size-3.5 shrink-0 text-brand-green" />
-                  {c}
-                </div>
-              ))}
-              {validation.warnings.map((w) => (
-                <div key={w} className="flex items-start gap-2 text-xs text-warning">
-                  <AlertTriangle className="size-3.5 shrink-0" />
-                  {w}
-                </div>
-              ))}
-            </>
-          )}
-        </div>
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={isLoading}
+      className={cn(
+        "inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-xs font-medium transition-colors",
+        isInvalid
+          ? "border-destructive/25 bg-destructive/10 text-destructive hover:bg-destructive/15"
+          : "border-brand-green/25 bg-brand-green/10 text-brand-green hover:bg-brand-green/15",
+        isLoading && "cursor-default border-border bg-muted text-muted-foreground hover:bg-muted",
       )}
-    </div>
+      aria-label={isLoading ? "Calculando divisão" : "Abrir detalhes da divisão"}
+      title={isLoading ? "Calculando divisão" : "Ver detalhes da divisão"}
+    >
+      <Icon className={cn("size-3.5", isLoading && "animate-spin")} />
+      {label}
+    </button>
   )
 }
 
@@ -1380,105 +1569,63 @@ function SplitDetailsModal({
   )
 }
 
-function DatasetSummary({
-  release,
+function SplitDistributionPreview({
   cfg,
-  validation,
+  stats,
 }: {
-  release: string
   cfg: SplitConfig
-  validation: ValidationResult
+  stats: DatasetStats
 }) {
-  const dataTypeLabel =
-    cfg.dataType === "imagens" ? "Imagens independentes" : cfg.dataType === "misto" ? "Dataset misto" : "Vídeo / temporal"
-  const temporal = cfg.dataType !== "imagens"
-  const statusMeta = splitStatusMeta[validation.status]
-  const rowByKey = (k: SplitRow["key"]) => validation.rows.find((r) => r.key === k)
+  const liveRows = React.useMemo(() => computeValidation(cfg, stats).rows, [cfg, stats])
+  const rows = [
+    { key: "train", label: "Treino", color: "bg-brand-green", text: "text-brand-green" },
+    { key: "val", label: "Validação", color: "bg-brand-blue", text: "text-brand-blue" },
+    { key: "test", label: "Teste", color: "bg-brand-lavender", text: "text-brand-lavender" },
+  ] as const
+  const splitRows = rows.map((item) => ({
+    ...item,
+    row: liveRows.find((row) => row.key === item.key),
+  }))
+  const totalPct = splitRows.reduce((total, item) => total + (item.row?.pct ?? 0), 0)
+  const countLabel = (value: number | undefined, suffix: string) =>
+    stats.loaded ? `${(value ?? 0).toLocaleString("pt-BR")} ${suffix}` : `-- ${suffix}`
 
   return (
-    <aside className="flex flex-col gap-6">
-      <Card>
-        <CardHeader>
-          <CardTitle>Resumo do dataset</CardTitle>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-4 text-sm">
-          <div>
-            <p className="text-xs text-muted-foreground">Release</p>
-            <p className="font-medium text-foreground">{release}</p>
-          </div>
-          <div>
-            <p className="text-xs text-muted-foreground">Tipo de dados</p>
-            <p className="mt-0.5 inline-flex items-center gap-2 font-medium text-foreground">
-              {temporal ? <Film className="size-4 text-brand-blue" /> : <ImageIcon className="size-4 text-brand-blue" />}
-              {dataTypeLabel}
+    <div className="mt-5 border-t border-border pt-4">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <span className="text-xs font-medium text-muted-foreground">Distribuição estimada</span>
+        <span className="text-xs tabular-nums text-muted-foreground">
+          {stats.loaded ? `${stats.images.toLocaleString("pt-BR")} imagens` : "Carregando dados"}
+        </span>
+      </div>
+      <div className="flex h-3 overflow-hidden rounded-full bg-muted">
+        {splitRows.map(({ key, color, row }) => {
+          const pct = row?.pct ?? 0
+          const width = totalPct > 0 ? (pct / totalPct) * 100 : 0
+          return (
+            <span
+              key={key}
+              className={cn("h-full min-w-0", color)}
+              style={{ width: `${Math.max(0, width)}%` }}
+            />
+          )
+        })}
+      </div>
+      <div className="mt-3 grid grid-cols-3 gap-3 text-xs">
+        {splitRows.map(({ key, label, color, text, row }) => (
+          <div key={key} className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <span className={cn("size-2 rounded-full", color)} />
+              <span className={cn("font-medium", text)}>{label}</span>
+            </div>
+            <p className="mt-1 tabular-nums text-foreground">{countLabel(row?.images, "img")}</p>
+            <p className="mt-0.5 tabular-nums text-muted-foreground">
+              {countLabel(row?.objects, "anotações")}
             </p>
           </div>
-          {temporal && (
-            <div>
-              <p className="mb-1 text-xs text-muted-foreground">Temporalidade</p>
-              <ul className="flex flex-col gap-1 text-xs text-muted-foreground">
-                <li className="inline-flex items-center gap-2">
-                  <Check className="size-3.5 text-brand-green" /> Vídeos preservados
-                </li>
-                <li className="inline-flex items-center gap-2">
-                  {cfg.keepTracks ? (
-                    <Check className="size-3.5 text-brand-green" />
-                  ) : (
-                    <X className="size-3.5 text-muted-foreground" />
-                  )}
-                  Tracks {cfg.keepTracks ? "preservados" : "não preservados"}
-                </li>
-                <li className="inline-flex items-center gap-2">
-                  <Check className="size-3.5 text-brand-green" /> Embargo: {cfg.embargo || "0"} segundos
-                </li>
-              </ul>
-            </div>
-          )}
-          <div>
-            <p className="mb-1 text-xs text-muted-foreground">Split</p>
-            <div className="divide-y divide-border">
-              <StatRow
-                label="Train"
-                value={`${cfg.train || 0}% · ${(rowByKey("train")?.images ?? 0).toLocaleString("pt-BR")} img`}
-              />
-              <StatRow
-                label="Validação"
-                value={`${cfg.val || 0}% · ${(rowByKey("val")?.images ?? 0).toLocaleString("pt-BR")} img`}
-              />
-              <StatRow
-                label="Teste"
-                value={`${cfg.test || 0}% · ${(rowByKey("test")?.images ?? 0).toLocaleString("pt-BR")} img`}
-              />
-            </div>
-          </div>
-          <div>
-            <p className="text-xs text-muted-foreground">Seed</p>
-            <p className="font-medium tabular-nums text-foreground">{cfg.seed || "—"}</p>
-          </div>
-          <div>
-            <p className="text-xs text-muted-foreground">Augmentation</p>
-            <p className="font-medium text-foreground">{cfg.augPreset}</p>
-            <p className="text-xs text-muted-foreground">{cfg.augApplyIn || "Somente treino"}</p>
-          </div>
-          <div>
-            <p className="text-xs text-muted-foreground">Status</p>
-            <p className={cn("mt-0.5 inline-flex items-center gap-2 font-medium", statusMeta.text)}>
-              <span className={cn("size-1.5 rounded-full", statusMeta.dot)} />
-              {statusMeta.label}
-            </p>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card tone="blue">
-        <div className="flex gap-3">
-          <Info className="size-5 shrink-0 text-brand-blue" />
-          <p className="text-xs leading-relaxed text-muted-foreground">
-            O conjunto de teste será bloqueado após a criação do split e não poderá ser alterado.
-          </p>
-        </div>
-      </Card>
-    </aside>
+        ))}
+      </div>
+    </div>
   )
 }
 
@@ -1529,9 +1676,11 @@ function ModelStep({ selected, onSelect }: { selected: string; onSelect: (model:
 function ResourcesStep({
   trainingCfg,
   setTrainingCfg,
+  deviceOptions,
 }: {
   trainingCfg: TrainingConfig
   setTrainingCfg: React.Dispatch<React.SetStateAction<TrainingConfig>>
+  deviceOptions: SelectOption[]
 }) {
   return (
     <Card>
@@ -1541,7 +1690,7 @@ function ResourcesStep({
       <CardContent className="flex flex-col gap-4">
         <Field label="Dispositivo">
           <SelectField
-            options={["auto", "0", "CPU"]}
+            options={deviceOptions}
             value={trainingCfg.device}
             onChange={(device) => setTrainingCfg((current) => ({ ...current, device }))}
           />

@@ -40,6 +40,12 @@ class ArtifactStore:
     def presign(self, uri: str, *, expires_in_seconds: int = 900) -> str:
         raise NotImplementedError
 
+    def delete(self, uri: str) -> None:
+        raise NotImplementedError
+
+    def delete_prefix(self, uri_prefix: str) -> int:
+        raise NotImplementedError
+
 
 class S3ArtifactStore(ArtifactStore):
     def __init__(self, settings: Settings):
@@ -94,6 +100,32 @@ class S3ArtifactStore(ArtifactStore):
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=expires_in_seconds,
         )
+
+    def delete(self, uri: str) -> None:
+        bucket, key = parse_s3_uri(uri)
+        self._client().delete_object(Bucket=bucket, Key=key)
+
+    def delete_prefix(self, uri_prefix: str) -> int:
+        bucket, prefix = parse_s3_uri(uri_prefix)
+        if not prefix or len(prefix.strip("/")) < 8:
+            raise ValueError("Artifact prefix is too broad to delete")
+
+        client = self._client()
+        deleted = 0
+        continuation_token = None
+        while True:
+            kwargs = {"Bucket": bucket, "Prefix": prefix}
+            if continuation_token:
+                kwargs["ContinuationToken"] = continuation_token
+            response = client.list_objects_v2(**kwargs)
+            objects = [{"Key": item["Key"]} for item in response.get("Contents", [])]
+            if objects:
+                client.delete_objects(Bucket=bucket, Delete={"Objects": objects, "Quiet": True})
+                deleted += len(objects)
+            if not response.get("IsTruncated"):
+                break
+            continuation_token = response.get("NextContinuationToken")
+        return deleted
 
     def _client(self):
         import boto3

@@ -204,7 +204,10 @@ class CvatSyncService:
             labels = self._task_labels(external_id, enriched.get("labels"))
             row.labels = self._normalized_labels(labels, task_external_id=external_id)
             row.preview_url = f"/api/v1/tasks/{external_id}/preview"
-            row.raw = enriched
+            local_raw = {
+                key: value for key, value in (row.raw or {}).items() if isinstance(key, str) and key.startswith("local_")
+            }
+            row.raw = {**enriched, **local_raw}
             self.db.add(row)
             counts.tasks += 1
             counts.labels += self._sync_labels(

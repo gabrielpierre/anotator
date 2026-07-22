@@ -4,6 +4,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+ARG TORCH_VERSION=2.13.0+cpu
+ARG TORCHVISION_VERSION=0.28.0+cpu
+
 WORKDIR /app/backend
 
 RUN apt-get update \
@@ -19,9 +23,9 @@ RUN apt-get update \
 COPY backend/pyproject.toml ./pyproject.toml
 RUN pip install --upgrade pip \
     && pip install \
-        --index-url https://download.pytorch.org/whl/cpu \
-        "torch==2.13.0+cpu" \
-        "torchvision==0.28.0+cpu" \
+        --index-url "${TORCH_INDEX_URL}" \
+        "torch==${TORCH_VERSION}" \
+        "torchvision==${TORCHVISION_VERSION}" \
     && pip install -e .
 
 COPY backend/ .

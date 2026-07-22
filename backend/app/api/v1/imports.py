@@ -1,13 +1,19 @@
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, db_session
 from app.core.config import get_settings
-from app.models import AuditEvent, JobRecord, User
+from app.models import AuditEvent, JobRecord, Project, User
 from app.schemas import ImportJobRead, ImportTaskCreate, JobRead
 from app.services.artifacts import S3ArtifactStore
-from app.services.imports import validate_import_quota
-from app.services.jobs import attach_celery_task, create_job
+from app.services.imports import (
+    DuplicateImportImagesError,
+    build_import_file_manifest,
+    validate_import_file_manifest_unique,
+    validate_import_quota,
+)
+from app.services.jobs import attach_celery_task, create_job, fail_job
 from app.tasks import import_task_job_task
 
 router = APIRouter()
@@ -19,6 +25,9 @@ def create_import_task(
     db: Session = Depends(db_session),
     actor: User = Depends(current_user),
 ) -> ImportJobRead:
+    payload = _normalize_import_project(db, payload)
+    payload = _normalize_import_assignee(payload, actor)
+    _validate_assignee(db, payload, actor)
     store = S3ArtifactStore(get_settings())
     try:
         store.verify_available()
@@ -36,7 +45,11 @@ def create_import_task(
         kind="import",
         name=f"Import CVAT task {payload.name}",
         detail="Queued import job." if payload.source_path else "Waiting for upload files.",
-        raw={"operation": "import_task", "payload": payload.model_dump(mode="json")},
+        raw={
+            "operation": "import_task",
+            "payload": payload.model_dump(mode="json"),
+            "created_by": _actor_payload(actor),
+        },
     )
     db.add(
         AuditEvent(
@@ -54,6 +67,45 @@ def create_import_task(
     return ImportJobRead(job=JobRead.model_validate(job))
 
 
+def _validate_assignee(db: Session, payload: ImportTaskCreate, actor: User) -> None:
+    if not payload.assignee_user_id:
+        return
+    if actor.role != "admin":
+        if actor.role != "anotador" or payload.assignee_user_id != actor.id:
+            raise HTTPException(status_code=403, detail="Admin role required to assign annotators")
+    assignee = db.get(User, payload.assignee_user_id)
+    if assignee is None or assignee.status != "active":
+        raise HTTPException(status_code=404, detail="Active annotator not found")
+    if assignee.role != "anotador":
+        raise HTTPException(status_code=400, detail="Only annotators can be assigned to a task")
+
+
+def _normalize_import_assignee(payload: ImportTaskCreate, actor: User) -> ImportTaskCreate:
+    if actor.role == "anotador" and not payload.assignee_user_id:
+        return payload.model_copy(update={"assignee_user_id": actor.id})
+    return payload
+
+
+def _normalize_import_project(db: Session, payload: ImportTaskCreate) -> ImportTaskCreate:
+    if payload.project_id:
+        return payload
+    active_projects = list(
+        db.scalars(select(Project).where(Project.status == "active").order_by(Project.created_at)).all()
+    )
+    if len(active_projects) != 1:
+        return payload
+    return payload.model_copy(update={"project_id": active_projects[0].id})
+
+
+def _actor_payload(actor: User) -> dict[str, str]:
+    return {
+        "user_id": actor.id,
+        "name": actor.name,
+        "email": actor.email,
+        "role": actor.role,
+    }
+
+
 @router.post("/tasks/{job_id}/files", response_model=ImportJobRead)
 async def upload_import_task_files(
     job_id: str,
@@ -67,6 +119,14 @@ async def upload_import_task_files(
     if job.status not in {"queued", "failed"}:
         raise HTTPException(status_code=409, detail="Import job is not accepting files")
     payload = ImportTaskCreate.model_validate((job.raw or {}).get("payload") or {})
+    duplicate_names = _duplicate_upload_filenames(files)
+    if duplicate_names:
+        detail = f"Arquivos com nomes repetidos no lote: {', '.join(duplicate_names)}"
+        fail_job(db, job.id, reason=detail)
+        raise HTTPException(
+            status_code=409,
+            detail=detail,
+        )
     store = S3ArtifactStore(get_settings())
     try:
         store.verify_available()
@@ -87,20 +147,39 @@ async def upload_import_task_files(
             status_code=503,
             detail="Storage de artefatos indisponivel. Inicie MinIO/Docker antes de importar imagens.",
         ) from exc
-    uploaded = []
+    prepared_files: list[tuple[str, bytes, str]] = []
     total_bytes = 0
     for file in files:
         content = await file.read()
         total_bytes += len(content)
         filename = file.filename or "upload.bin"
-        key = f"imports/{job.id}/uploads/{filename}"
-        uri = store.put_bytes(key, content, file.content_type or "application/octet-stream")
+        content_type = file.content_type or "application/octet-stream"
+        prepared_files.append((filename, content, content_type))
+    manifest = build_import_file_manifest(prepared_files)
+    try:
+        validate_import_file_manifest_unique(
+            db,
+            payload,
+            manifest,
+            artifact_store=store,
+            current_job_id=job.id,
+        )
+    except DuplicateImportImagesError as exc:
+        fail_job(
+            db,
+            job.id,
+            reason=str(exc),
+            raw_update={"duplicate_import_conflicts": exc.conflicts},
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    uploaded = []
+    for (filename, content, content_type), metadata in zip(prepared_files, manifest, strict=True):
+        key = f"imports/{job.id}/uploads/{metadata['filename']}"
+        uri = store.put_bytes(key, content, content_type)
         uploaded.append(
             {
-                "filename": filename,
+                **metadata,
                 "uri": uri,
-                "content_type": file.content_type or "application/octet-stream",
-                "size_bytes": len(content),
             }
         )
     try:
@@ -123,6 +202,19 @@ async def upload_import_task_files(
     attach_celery_task(db, job.id, task.id)
     db.refresh(job)
     return ImportJobRead(job=JobRead.model_validate(job))
+
+
+def _duplicate_upload_filenames(files: list[UploadFile]) -> list[str]:
+    seen: dict[str, str] = {}
+    duplicates: dict[str, str] = {}
+    for file in files:
+        filename = (file.filename or "upload.bin").strip() or "upload.bin"
+        key = filename.casefold()
+        if key in seen:
+            duplicates[key] = seen[key]
+        else:
+            seen[key] = filename
+    return sorted(duplicates.values(), key=str.casefold)
 
 
 @router.get("/{job_id}", response_model=ImportJobRead)

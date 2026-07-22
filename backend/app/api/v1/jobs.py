@@ -2,37 +2,41 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, db_session
+from app.api.deps import current_admin, current_user, db_session
 from app.core.celery_app import celery_app
 from app.core.database import SessionLocal
-from app.models import JobRecord, User
+from app.models import JobRecord, Project, ProjectMember, Task, User
 from app.schemas import JobCapacityRead, JobMetricsRead, JobPriorityUpdate, JobRead
+from app.services.compute import gpu_snapshot
 from app.services.jobs import attach_celery_task, cancel_job, create_job
 
 router = APIRouter()
+PROCESSING_JOB_KINDS_EXCLUDED = {"cvat_job"}
 
 
 @router.get("", response_model=list[JobRead])
 def list_jobs(
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[JobRecord]:
-    return list(db.scalars(select(JobRecord).order_by(JobRecord.updated_at.desc())).all())
+    return _visible_jobs(db, user)
 
 
 @router.get("/events")
-async def job_events() -> StreamingResponse:
+async def job_events(user: User = Depends(current_user)) -> StreamingResponse:
+    viewer_id = user.id
+
     async def event_stream() -> AsyncIterator[str]:
         while True:
             with SessionLocal() as db:
-                jobs = list(db.scalars(select(JobRecord).order_by(JobRecord.updated_at.desc())).all())
+                viewer = db.get(User, viewer_id)
+                jobs = _visible_jobs(db, viewer) if viewer is not None else []
                 payload = {"jobs": [_serialize_job(job) for job in jobs]}
             yield f"event: jobs\ndata: {json.dumps(payload)}\n\n"
             await asyncio.sleep(1)
@@ -43,10 +47,11 @@ async def job_events() -> StreamingResponse:
 @router.get("/capacity", response_model=JobCapacityRead)
 def job_capacity(
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> JobCapacityRead:
-    queued = db.scalar(select(func.count(JobRecord.id)).where(JobRecord.status == "queued")) or 0
-    running = db.scalar(select(func.count(JobRecord.id)).where(JobRecord.status == "running")) or 0
+    jobs = _visible_jobs(db, user, order=False)
+    queued = sum(1 for job in jobs if job.status == "queued")
+    running = sum(1 for job in jobs if job.status == "running")
     memory = _memory_snapshot()
     return JobCapacityRead(
         queued=queued,
@@ -55,7 +60,7 @@ def job_capacity(
         cpu_count=os.cpu_count() or 1,
         memory_total_bytes=memory.get("total"),
         memory_available_bytes=memory.get("available"),
-        gpu=_gpu_snapshot(),
+        gpu=gpu_snapshot(),
     )
 
 
@@ -63,9 +68,9 @@ def job_capacity(
 def get_job(
     job_id: str,
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> JobRecord:
-    job = db.get(JobRecord, job_id)
+    job = _visible_job_or_none(db, user, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
@@ -76,7 +81,7 @@ def update_job_priority(
     job_id: str,
     payload: JobPriorityUpdate,
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    _: User = Depends(current_admin),
 ) -> JobRecord:
     job = db.get(JobRecord, job_id)
     if job is None:
@@ -92,7 +97,7 @@ def update_job_priority(
 def retry_job(
     job_id: str,
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    _: User = Depends(current_admin),
 ) -> JobRecord:
     original = db.get(JobRecord, job_id)
     if original is None:
@@ -118,9 +123,9 @@ def retry_job(
 def job_metrics(
     job_id: str,
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> JobMetricsRead:
-    job = db.get(JobRecord, job_id)
+    job = _visible_job_or_none(db, user, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     metrics = job.resource_metrics if isinstance(job.resource_metrics, dict) else {}
@@ -132,7 +137,7 @@ def job_metrics(
 def cancel_job_endpoint(
     job_id: str,
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    _: User = Depends(current_admin),
 ) -> JobRecord:
     try:
         return cancel_job(db, job_id, celery_app=celery_app)
@@ -141,11 +146,14 @@ def cancel_job_endpoint(
 
 
 @router.get("/{job_id}/events")
-async def job_detail_events(job_id: str) -> StreamingResponse:
+async def job_detail_events(job_id: str, user: User = Depends(current_user)) -> StreamingResponse:
+    viewer_id = user.id
+
     async def event_stream() -> AsyncIterator[str]:
         while True:
             with SessionLocal() as db:
-                job = db.get(JobRecord, job_id)
+                viewer = db.get(User, viewer_id)
+                job = _visible_job_or_none(db, viewer, job_id) if viewer is not None else None
                 if job is None:
                     yield f"event: error\ndata: {json.dumps({'detail': 'Job not found'})}\n\n"
                     return
@@ -158,6 +166,93 @@ async def job_detail_events(job_id: str) -> StreamingResponse:
 
 def _serialize_job(job: JobRecord) -> dict:
     return JobRead.model_validate(job).model_dump(mode="json")
+
+
+def _visible_job_or_none(db: Session, user: User, job_id: str) -> JobRecord | None:
+    job = db.get(JobRecord, job_id)
+    if job is None or job.kind in PROCESSING_JOB_KINDS_EXCLUDED:
+        return None
+    if user.role == "admin":
+        return job
+    return job if _job_matches_user_projects(db, job, user) else None
+
+
+def _visible_jobs(db: Session, user: User, order: bool = True) -> list[JobRecord]:
+    query = select(JobRecord).where(JobRecord.kind.notin_(PROCESSING_JOB_KINDS_EXCLUDED))
+    if order:
+        query = query.order_by(JobRecord.updated_at.desc())
+    jobs = list(db.scalars(query).all())
+    if user.role == "admin":
+        return jobs
+    return [job for job in jobs if _job_matches_user_projects(db, job, user)]
+
+
+def _job_matches_user_projects(db: Session, job: JobRecord, user: User) -> bool:
+    project_values = _accessible_project_values(db, user)
+    if not project_values:
+        return False
+    task_project_values = _task_project_values(db, job)
+    return any(value in project_values for value in _job_project_values(job, task_project_values))
+
+
+def _accessible_project_values(db: Session, user: User) -> set[str]:
+    projects = db.scalars(
+        select(Project)
+        .join(ProjectMember, ProjectMember.project_id == Project.id)
+        .where(ProjectMember.user_id == user.id)
+    ).all()
+    values: set[str] = set()
+    for project in projects:
+        values.add(project.id)
+        values.add(project.external_id)
+    return values
+
+
+def _task_project_values(db: Session, job: JobRecord) -> set[str]:
+    task_ids = {
+        value
+        for value in {
+            job.task_external_id,
+            _raw_value(job.raw, "task_external_id"),
+            _nested_raw_value(job.raw, "payload", "task_external_id"),
+            _nested_raw_value(job.raw, "lineage", "task_external_id"),
+        }
+        if value
+    }
+    if not task_ids:
+        return set()
+    tasks = db.scalars(select(Task).where(Task.external_id.in_(task_ids))).all()
+    return {task.project_external_id for task in tasks if task.project_external_id}
+
+
+def _job_project_values(job: JobRecord, task_project_values: set[str]) -> set[str]:
+    values = {
+        _raw_value(job.raw, "project_id"),
+        _raw_value(job.raw, "project_external_id"),
+        _nested_raw_value(job.raw, "payload", "project_id"),
+        _nested_raw_value(job.raw, "payload", "project_external_id"),
+        _nested_raw_value(job.raw, "lineage", "project_id"),
+        _nested_raw_value(job.raw, "lineage", "project_external_id"),
+        *task_project_values,
+    }
+    return {str(value) for value in values if value}
+
+
+def _raw_value(raw: dict | None, key: str) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get(key)
+    return str(value) if value is not None else None
+
+
+def _nested_raw_value(raw: dict | None, parent: str, key: str) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    node = raw.get(parent)
+    if not isinstance(node, dict):
+        return None
+    value = node.get(key)
+    return str(value) if value is not None else None
 
 
 def _dispatch_retry(job: JobRecord) -> str | None:
@@ -198,7 +293,3 @@ def _memory_snapshot() -> dict[str, int]:
         return values
     except OSError:
         return {}
-
-
-def _gpu_snapshot() -> dict[str, Any]:
-    return {"available": False, "provider": None}

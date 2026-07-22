@@ -1,4 +1,6 @@
+import csv
 import io
+import math
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -11,8 +13,9 @@ from app.core.config import Settings
 from app.models import AuditEvent, DatasetRelease, ModelVersion, TrainingRun
 from app.schemas import TrainingRunCreate
 from app.services.artifacts import S3ArtifactStore
+from app.services.compute import available_training_device_ids
 
-ProgressCallback = Callable[[float, str | None], None]
+ProgressCallback = Callable[[float, str | None, dict[str, Any] | None], None]
 TrainingRunner = Callable[[dict[str, Any], ProgressCallback | None], dict[str, Any]]
 
 
@@ -34,6 +37,11 @@ def run_training(
         raise ValueError("Training requires an immutable ready DatasetRelease with exported artifacts")
 
     payload = _payload_from_run(run)
+    _update_run(db, run, status="running", progress=5, metrics={"stage": "preparing"})
+    _report(progress_callback, 5, "Preparing training dataset.")
+    if runner is None:
+        release = ensure_prepared_training_dataset(db, release, settings)
+
     train_context = {
         "run_id": run.id,
         "dataset_release": release,
@@ -42,9 +50,6 @@ def run_training(
         "payload": payload,
         "settings": settings,
     }
-
-    _update_run(db, run, status="running", progress=5, metrics={"stage": "preparing"})
-    _report(progress_callback, 5, "Preparing training dataset.")
     result = (runner or ultralytics_training_runner)(train_context, progress_callback)
 
     metrics = _normalize_metrics(result.get("metrics") or {})
@@ -52,7 +57,7 @@ def run_training(
     run.mlflow_run_id = result.get("mlflow_run_id")
     run.status = "succeeded"
     run.progress = 100
-    run.metrics = {**(run.metrics or {}), **metrics, "status": "completed"}
+    run.metrics = {**(run.metrics or {}), **metrics, "stage": "completed", "status": "completed"}
     run.artifacts = artifacts
     db.add(run)
 
@@ -106,8 +111,10 @@ def ultralytics_training_runner(
             "name": f"train-{context['run_id']}",
             "exist_ok": True,
         }
-        if payload.device:
-            train_args["device"] = payload.device
+        device = normalize_training_device(payload.device)
+        if device:
+            ensure_training_device_available(device)
+            train_args["device"] = device
         if payload.patience is not None:
             train_args["patience"] = payload.patience
         train_args.update(payload.config.get("ultralytics", {}))
@@ -116,17 +123,33 @@ def ultralytics_training_runner(
             mlflow.log_params(params)
             mlflow.log_param("dataset_release_id", release.id)
             mlflow.log_param("dataset_release_name", release.name)
-            _report(progress_callback, 20, "Starting Ultralytics training.")
+            _report(
+                progress_callback,
+                20,
+                "Starting Ultralytics training.",
+                {"stage": "training", "mlflow_run_id": mlflow_run.info.run_id},
+            )
             model = YOLO(payload.base_model)
+            _attach_ultralytics_progress_callbacks(
+                model,
+                epochs=payload.epochs,
+                progress_callback=progress_callback,
+                mlflow_run_id=mlflow_run.info.run_id,
+                artifact_base_uri=mlflow_run.info.artifact_uri,
+            )
             results = model.train(**train_args)
             _report(progress_callback, 90, "Collecting training metrics and artifacts.")
             metrics = extract_ultralytics_metrics(results)
             if metrics:
-                mlflow.log_metrics(metrics)
+                mlflow.log_metrics(mlflow_safe_metrics(metrics))
             save_dir = getattr(results, "save_dir", None)
             artifacts: list[dict[str, Any]] = []
             if save_dir:
                 save_path = Path(save_dir)
+                history = training_history_from_results_csv(save_path / "results.csv")
+                if history:
+                    metrics["history"] = history
+                    metrics["epoch"] = int(history[-1]["epoch"])
                 mlflow.log_artifacts(str(save_path), artifact_path="ultralytics")
                 artifacts = _artifact_rows(save_path, mlflow_run.info.artifact_uri)
             return {
@@ -155,6 +178,7 @@ def prepare_training_dataset(context: dict[str, Any], tmp_path: Path) -> Path:
             if matches:
                 data_yaml = matches[0]
         if data_yaml.exists():
+            _rewrite_data_yaml_path(data_yaml)
             return data_yaml
 
     labels = snapshot.get("labels") if isinstance(snapshot.get("labels"), list) else []
@@ -218,7 +242,7 @@ def training_params(payload: TrainingRunCreate, release: DatasetRelease) -> dict
         "workers": payload.workers,
         "patience": payload.patience,
         "seed": payload.seed,
-        "device": payload.device or "auto",
+        "device": normalize_training_device(payload.device) or "auto",
         "dataset_release_id": release.id,
         "dataset_artifact_uri": release.artifact_uri,
     }
@@ -240,6 +264,229 @@ def extract_ultralytics_metrics(results: Any) -> dict[str, float]:
     return metrics
 
 
+def training_history_from_results_csv(path: Path) -> list[dict[str, float]]:
+    if not path.exists():
+        return []
+    return training_history_from_results_csv_text(path.read_text(encoding="utf-8"))
+
+
+def training_history_from_results_csv_text(content: str) -> list[dict[str, float]]:
+    rows: list[dict[str, float]] = []
+    reader = csv.DictReader(io.StringIO(content))
+    for raw_row in reader:
+        source = {str(key).strip(): value for key, value in raw_row.items() if key is not None}
+        row: dict[str, float] = {}
+        _put_alias(row, "epoch", source, "epoch")
+        _put_alias(row, "time", source, "time")
+        _put_alias(row, "precision", source, "metrics/precision(B)", "precision")
+        _put_alias(row, "recall", source, "metrics/recall(B)", "recall")
+        _put_alias(row, "map50", source, "metrics/mAP50(B)", "map50", "mAP50")
+        _put_alias(row, "map5095", source, "metrics/mAP50-95(B)", "map5095", "mAP50-95")
+        _put_alias(row, "learning_rate", source, "lr/pg0", "lr/pg1", "lr/pg2")
+        _put_float(row, "train_box_loss", source.get("train/box_loss"))
+        _put_float(row, "train_cls_loss", source.get("train/cls_loss"))
+        _put_float(row, "train_dfl_loss", source.get("train/dfl_loss"))
+        _put_float(row, "val_box_loss", source.get("val/box_loss"))
+        _put_float(row, "val_cls_loss", source.get("val/cls_loss"))
+        _put_float(row, "val_dfl_loss", source.get("val/dfl_loss"))
+        train_losses = [row.get("train_box_loss"), row.get("train_cls_loss"), row.get("train_dfl_loss")]
+        if all(value is not None for value in train_losses):
+            row["loss"] = float(sum(value for value in train_losses if value is not None))
+        if "epoch" in row:
+            rows.append(row)
+    return rows
+
+
+def _attach_ultralytics_progress_callbacks(
+    model: Any,
+    *,
+    epochs: int,
+    progress_callback: ProgressCallback | None,
+    mlflow_run_id: str | None,
+    artifact_base_uri: str | None,
+) -> None:
+    history: list[dict[str, float]] = []
+    visual_artifact_state: dict[str, str] = {}
+    visual_artifact_rows: dict[str, dict[str, Any]] = {}
+
+    def enable_live_validation_plots(validator: Any) -> None:
+        # Ultralytics disables validation plots during normal epoch validation and
+        # only enables them near early stopping or at final validation. The UI
+        # expects validation examples and confusion matrices while training runs.
+        args = getattr(validator, "args", None)
+        if args is not None:
+            try:
+                args.plots = True
+            except AttributeError:
+                pass
+
+    def report_epoch(trainer: Any) -> None:
+        epoch = _trainer_epoch(trainer)
+        progress = 20 + (min(epoch, max(epochs, 1)) / max(epochs, 1)) * 70
+        metrics = _trainer_metrics(trainer)
+        metrics.update({"stage": "training", "epoch": epoch, "epochs": epochs})
+        if mlflow_run_id:
+            metrics["mlflow_run_id"] = mlflow_run_id
+        row = {"epoch": float(epoch)}
+        row.update({key: value for key, value in metrics.items() if isinstance(value, (int, float))})
+        history.append(row)
+        metrics["history"] = history[-200:]
+        save_dir = getattr(trainer, "save_dir", None)
+        if save_dir and artifact_base_uri:
+            visual_artifacts = _log_live_visual_artifacts(
+                Path(save_dir),
+                artifact_base_uri,
+                visual_artifact_state,
+                visual_artifact_rows,
+            )
+            if visual_artifacts:
+                metrics["artifacts"] = visual_artifacts
+        _report(progress_callback, progress, f"Epoch {epoch}/{epochs} completed.", metrics)
+
+    try:
+        model.add_callback("on_val_start", enable_live_validation_plots)
+        model.add_callback("on_fit_epoch_end", report_epoch)
+    except AttributeError:
+        return
+
+
+def _trainer_epoch(trainer: Any) -> int:
+    epoch = getattr(trainer, "epoch", None)
+    try:
+        return max(int(epoch) + 1, 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _trainer_metrics(trainer: Any) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    source = getattr(trainer, "metrics", None)
+    if isinstance(source, dict):
+        for key, value in source.items():
+            _put_float(metrics, str(key), value)
+    _put_float(metrics, "learning_rate", _trainer_learning_rate(trainer))
+    _put_loss_metrics(metrics, trainer)
+    return metrics
+
+
+def _log_live_visual_artifacts(
+    save_dir: Path,
+    artifact_base_uri: str,
+    visual_artifact_state: dict[str, str],
+    visual_artifact_rows: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not save_dir.exists():
+        return list(visual_artifact_rows.values())
+
+    import mlflow
+
+    for file in sorted(save_dir.rglob("*")):
+        if not file.is_file() or not _is_training_visual_artifact(file):
+            continue
+        try:
+            stat = file.stat()
+        except OSError:
+            continue
+        relative_path = file.relative_to(save_dir).as_posix()
+        state = f"{stat.st_size}:{stat.st_mtime_ns}"
+        if visual_artifact_state.get(relative_path) != state:
+            parent_path = file.parent.relative_to(save_dir).as_posix()
+            artifact_path = "ultralytics" if parent_path == "." else f"ultralytics/{parent_path}"
+            try:
+                mlflow.log_artifact(str(file), artifact_path=artifact_path)
+            except Exception:
+                continue
+            visual_artifact_state[relative_path] = state
+            visual_artifact_rows[relative_path] = {
+                "name": file.name,
+                "path": relative_path,
+                "uri": f"{artifact_base_uri.rstrip('/')}/ultralytics/{relative_path}",
+                "size_bytes": stat.st_size,
+            }
+    return list(visual_artifact_rows.values())
+
+
+def _is_training_visual_artifact(file: Path) -> bool:
+    name = file.name.lower()
+    if file.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+        return False
+    if name.startswith("confusion_matrix"):
+        return True
+    return name.startswith("val_batch") and ("_pred" in name or "_labels" in name)
+
+
+def _trainer_learning_rate(trainer: Any) -> Any:
+    lr = getattr(trainer, "lr", None)
+    if isinstance(lr, dict):
+        values = [value for value in lr.values() if isinstance(value, (int, float))]
+        return values[0] if values else None
+    if isinstance(lr, (list, tuple)):
+        values = [value for value in lr if isinstance(value, (int, float))]
+        return values[0] if values else None
+    return lr
+
+
+def _put_loss_metrics(metrics: dict[str, float], trainer: Any) -> None:
+    losses = getattr(trainer, "tloss", None)
+    if losses is None:
+        losses = getattr(trainer, "loss_items", None)
+    names = getattr(trainer, "loss_names", None)
+    if losses is None:
+        return
+    try:
+        raw_values = losses.detach().cpu().tolist()
+    except AttributeError:
+        raw_values = losses
+    if not isinstance(raw_values, (list, tuple)):
+        return
+    loss_names = list(names) if isinstance(names, (list, tuple)) else []
+    for index, value in enumerate(raw_values):
+        key = str(loss_names[index]) if index < len(loss_names) else f"loss_{index + 1}"
+        _put_float(metrics, key, value)
+
+
+def _put_alias(
+    target: dict[str, float],
+    key: str,
+    source: dict[str, Any],
+    *aliases: str,
+) -> None:
+    for alias in aliases:
+        before = key in target
+        _put_float(target, key, source.get(alias))
+        if key in target and not before:
+            return
+
+
+def mlflow_safe_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+    safe: dict[str, float] = {}
+    for key, value in metrics.items():
+        try:
+            metric_value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(metric_value):
+            continue
+        metric_key = _mlflow_safe_metric_key(str(key))
+        unique_key = metric_key
+        suffix = 2
+        while unique_key in safe:
+            suffix_text = f"_{suffix}"
+            unique_key = f"{metric_key[: 250 - len(suffix_text)]}{suffix_text}"
+            suffix += 1
+        safe[unique_key] = metric_value
+    return safe
+
+
+def _mlflow_safe_metric_key(key: str) -> str:
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-. /:")
+    cleaned = "".join(char if char in allowed else "_" for char in key.strip())
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    cleaned = cleaned.strip()
+    return cleaned[:250] or "metric"
+
+
 def _payload_from_run(run: TrainingRun) -> TrainingRunCreate:
     return TrainingRunCreate(
         dataset_release_id=run.dataset_release_id,
@@ -248,12 +495,97 @@ def _payload_from_run(run: TrainingRun) -> TrainingRunCreate:
         epochs=int(run.config.get("epochs", 100)),
         image_size=int(run.config.get("image_size", run.config.get("imgsz", 640))),
         batch_size=int(run.config.get("batch_size", run.config.get("batch", 16))),
-        device=run.config.get("device"),
+        device=_device_from_run_config(run.config),
         workers=int(run.config.get("workers", 8)),
         patience=run.config.get("patience", 30),
         seed=int(run.config.get("seed", 42)),
         config=run.config,
     )
+
+
+def _device_from_run_config(config: dict[str, Any]) -> str | None:
+    resource_policy = config.get("resource_policy")
+    if isinstance(resource_policy, dict) and "device" in resource_policy:
+        return normalize_training_device(resource_policy.get("device"))
+    return normalize_training_device(config.get("device"))
+
+
+def normalize_training_device(device: Any) -> str | None:
+    if device is None:
+        return None
+    value = str(device).strip()
+    if not value or value.lower() == "auto":
+        return None
+    if value.lower().startswith("cpu"):
+        return "cpu"
+    return value
+
+
+def ensure_training_device_available(device: Any) -> str | None:
+    normalized = normalize_training_device(device)
+    if normalized in {None, "cpu"}:
+        return normalized
+
+    available = available_training_device_ids()
+    requested = {part.strip() for part in normalized.split(",") if part.strip()}
+    if requested and requested.issubset(available):
+        return normalized
+
+    available_text = ", ".join(sorted(available)) or "nenhum"
+    raise ValueError(
+        f"Device {normalized} nao esta disponivel para treinamento. "
+        f"Dispositivos disponiveis: {available_text}."
+    )
+
+
+def ensure_prepared_training_dataset(
+    db: Session,
+    release: DatasetRelease,
+    settings: Settings,
+) -> DatasetRelease:
+    snapshot = release.snapshot if isinstance(release.snapshot, dict) else {}
+    prepared = snapshot.get("prepared_dataset") if isinstance(snapshot.get("prepared_dataset"), dict) else {}
+    if _prepared_dataset_usable_for_training(prepared):
+        return release
+
+    from app.services.datasets import prepare_yolo_dataset
+
+    prepare_yolo_dataset(db, release_id=release.id, artifact_store=S3ArtifactStore(settings))
+    refreshed = db.get(DatasetRelease, release.id)
+    return refreshed or release
+
+
+def _prepared_dataset_usable_for_training(prepared: dict[str, Any]) -> bool:
+    if prepared.get("status") != "ready" or not prepared.get("artifact_uri"):
+        return False
+    manifest = prepared.get("manifest") if isinstance(prepared.get("manifest"), dict) else {}
+    splits = manifest.get("splits") if isinstance(manifest.get("splits"), dict) else {}
+    data_yaml = prepared.get("data_yaml") if isinstance(prepared.get("data_yaml"), dict) else {}
+    train_count = _positive_int(splits.get("train"))
+    val_count = _positive_int(splits.get("val"))
+    val_path = str(data_yaml.get("val") or "")
+    return train_count > 0 and (val_count > 0 or val_path == "images/train")
+
+
+def _rewrite_data_yaml_path(data_yaml: Path) -> None:
+    absolute_path = data_yaml.parent.as_posix().replace('"', '\\"')
+    path_line = f'path: "{absolute_path}"'
+    lines = data_yaml.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().startswith("path:"):
+            lines[index] = path_line
+            break
+    else:
+        lines.insert(0, path_line)
+    data_yaml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(parsed, 0)
 
 
 def _update_run(
@@ -312,6 +644,14 @@ def _put_float(metrics: dict[str, float], key: str, value: Any) -> None:
         return
 
 
-def _report(callback: ProgressCallback | None, progress: float, detail: str) -> None:
+def _report(
+    callback: ProgressCallback | None,
+    progress: float,
+    detail: str,
+    metrics: dict[str, Any] | None = None,
+) -> None:
     if callback is not None:
-        callback(progress, detail)
+        try:
+            callback(progress, detail, metrics)
+        except TypeError:
+            callback(progress, detail)  # type: ignore[misc]

@@ -35,7 +35,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CVAT_BASE_URL: http://host.docker.internal:8080
       CVAT_ACCESS_TOKEN: ${CVAT_ACCESS_TOKEN:-}
-      CVAT_AUTH_SCHEME: ${CVAT_AUTH_SCHEME:-Bearer}
+      CVAT_AUTH_SCHEME: ${CVAT_AUTH_SCHEME:-Token}
       CVAT_HOST_HEADER: ${CVAT_HOST_HEADER:-localhost}
       ANNOTATION_FRAME_MAX_SIDE: ${ANNOTATION_FRAME_MAX_SIDE:-1920}
       ANNOTATION_FRAME_JPEG_QUALITY: ${ANNOTATION_FRAME_JPEG_QUALITY:-84}
@@ -46,12 +46,17 @@ services:
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
       DEFAULT_ADMIN_NAME: ${DEFAULT_ADMIN_NAME:-Administrador}
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: anotator-artifacts
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
       CORS_ORIGINS: http://localhost:3000
       AUTO_CREATE_TABLES: "false"
+      ANOTATOR_DOCKER_GPU_ENABLED: ${ANOTATOR_DOCKER_GPU_ENABLED:-false}
+      HOST_NVIDIA_GPUS: ${HOST_NVIDIA_GPUS:-}
     ports:
       - "${BACKEND_PORT:-8020}:8000"
     volumes:
@@ -89,18 +94,23 @@ services:
       REDIS_URL: redis://redis:6379/0
       CVAT_BASE_URL: http://host.docker.internal:8080
       CVAT_ACCESS_TOKEN: ${CVAT_ACCESS_TOKEN:-}
-      CVAT_AUTH_SCHEME: ${CVAT_AUTH_SCHEME:-Bearer}
+      CVAT_AUTH_SCHEME: ${CVAT_AUTH_SCHEME:-Token}
       CVAT_HOST_HEADER: ${CVAT_HOST_HEADER:-localhost}
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
       DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL:-admin@cvat.plus}
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
       DEFAULT_ADMIN_NAME: ${DEFAULT_ADMIN_NAME:-Administrador}
       MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
       S3_ENDPOINT: http://minio:9000
       S3_BUCKET: anotator-artifacts
       S3_ACCESS_KEY_ID: minioadmin
       S3_SECRET_ACCESS_KEY: minioadmin
       AUTO_CREATE_TABLES: "false"
+      ANOTATOR_DOCKER_GPU_ENABLED: ${ANOTATOR_DOCKER_GPU_ENABLED:-false}
+      HOST_NVIDIA_GPUS: ${HOST_NVIDIA_GPUS:-}
     volumes:
       - ../backend:/app/backend
       - worker_artifacts:/artifacts

@@ -99,9 +99,9 @@ export function StatRow({
   valueClassName?: string
 }) {
   return (
-    <div className="flex items-center justify-between gap-4 py-2 text-sm">
-      <span className="text-muted-foreground">{label}</span>
-      <span className={cn("text-right font-medium tabular-nums text-foreground", valueClassName)}>
+    <div className="flex min-w-0 items-center justify-between gap-4 py-2 text-sm">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <span className={cn("min-w-0 text-right font-medium tabular-nums text-foreground", valueClassName)}>
         {value}
       </span>
     </div>

@@ -17,7 +17,7 @@ import type { BackendJob, BackendJobCapacity } from "@/lib/api/types"
 export function JobsView() {
   const searchParams = useSearchParams()
   const projectId = searchParams.get("project")
-  const { projects } = useCurrentUser()
+  const { isAdmin, projects } = useCurrentUser()
   const [backendJobs, setBackendJobs] = React.useState<BackendJob[] | null>(null)
   const [capacity, setCapacity] = React.useState<BackendJobCapacity | null>(null)
   const [cancelingIds, setCancelingIds] = React.useState<Set<string>>(new Set())
@@ -90,16 +90,18 @@ export function JobsView() {
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">
-            {isProjectScoped ? `Jobs do projeto ${scopedProject?.name ?? "selecionado"}` : "Jobs gerais"}
+            {isProjectScoped ? `Jobs do projeto ${scopedProject?.name ?? "selecionado"}` : isAdmin ? "Jobs gerais" : "Meus jobs"}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             {isProjectScoped
               ? "Acompanhe importacoes, syncs, releases, treinos e pipelines deste projeto."
-              : "Visao administrativa dos jobs de todos os projetos."}
+              : isAdmin
+                ? "Visao administrativa dos jobs de todos os projetos."
+                : "Acompanhe os processamentos vinculados aos seus projetos."}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {isProjectScoped && (
+          {isProjectScoped && isAdmin && (
             <Button variant="outline" nativeButton={false} render={<Link href="/jobs" />}>
               Ver jobs gerais
             </Button>
@@ -141,16 +143,18 @@ export function JobsView() {
                       </span>
                       <StatusBadge status={job.status} />
                     </div>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="text-destructive hover:bg-destructive/10"
-                      disabled={cancelingIds.has(job.id)}
-                      onClick={() => handleCancel(job.id)}
-                    >
-                      <Square className="size-3.5" />
-                      {cancelingIds.has(job.id) ? "Cancelando..." : "Cancelar"}
-                    </Button>
+                    {isAdmin && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="text-destructive hover:bg-destructive/10"
+                        disabled={cancelingIds.has(job.id)}
+                        onClick={() => handleCancel(job.id)}
+                      >
+                        <Square className="size-3.5" />
+                        {cancelingIds.has(job.id) ? "Cancelando..." : "Cancelar"}
+                      </Button>
+                    )}
                   </div>
                   <p className="mt-1 text-xs text-muted-foreground">{job.detail}</p>
                   <div className="mt-3 flex items-center gap-3">
@@ -187,14 +191,16 @@ export function JobsView() {
                     </p>
                   </div>
                   <span className="shrink-0 text-xs text-muted-foreground">{job.position}</span>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={cancelingIds.has(job.id)}
-                    onClick={() => handleCancel(job.id)}
-                  >
-                    {cancelingIds.has(job.id) ? "Cancelando..." : "Cancelar"}
-                  </Button>
+                  {isAdmin && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={cancelingIds.has(job.id)}
+                      onClick={() => handleCancel(job.id)}
+                    >
+                      {cancelingIds.has(job.id) ? "Cancelando..." : "Cancelar"}
+                    </Button>
+                  )}
                 </div>
               ))}
               {!queuedItems.length ? <p className="py-3 text-sm text-muted-foreground">Fila vazia.</p> : null}
@@ -326,12 +332,38 @@ function memoryUsage(capacity: BackendJobCapacity | null) {
 
 function gpuSummary(gpu: Record<string, unknown> | undefined) {
   const available = gpu?.available === true
+  const devices = Array.isArray(gpu?.devices) ? gpu.devices : []
+  const detectedDevices = Array.isArray(gpu?.detected_devices) ? gpu.detected_devices : []
+  const primary = objectValue(devices[0] ?? detectedDevices[0])
+  const name = stringFromUnknown(primary.name) ?? stringFromUnknown(primary.label)
   const utilization = numberFromUnknown(gpu?.utilization_percent) ?? 0
-  return {
-    value: available ? `${utilization}%` : "--",
-    hint: available ? "reportada pelo backend" : "indisponível",
-    utilization,
+  const memoryTotal = numberFromUnknown(gpu?.memory_total_bytes)
+  const memoryUsed = numberFromUnknown(gpu?.memory_used_bytes)
+  const memoryText =
+    memoryTotal && memoryUsed !== null ? `${formatBytes(memoryUsed)} / ${formatBytes(memoryTotal)}` : null
+  if (available) {
+    return {
+      value: name ? compactGpuName(name) : `${utilization}%`,
+      hint: memoryText ? `${utilization}% · ${memoryText}` : "disponível para treino",
+      utilization,
+    }
   }
+  if (detectedDevices.length) {
+    return {
+      value: name ? compactGpuName(name) : "GPU",
+      hint: "detectada no host; Docker sem GPU",
+      utilization: 0,
+    }
+  }
+  return {
+    value: "--",
+    hint: "indisponível",
+    utilization: 0,
+  }
+}
+
+function compactGpuName(name: string) {
+  return name.replace(/^NVIDIA\s+/i, "").replace(/^GeForce\s+/i, "")
 }
 
 function formatBytes(bytes: number) {
@@ -348,4 +380,8 @@ function numberFromUnknown(value: unknown) {
     return Number.isFinite(parsed) ? parsed : null
   }
   return null
+}
+
+function stringFromUnknown(value: unknown) {
+  return typeof value === "string" && value.trim() ? value : null
 }

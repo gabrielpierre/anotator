@@ -3,7 +3,7 @@ from typing import Any
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.database import SessionLocal
-from app.models import DatasetRelease, PipelineRun, TrainingRun
+from app.models import DatasetRelease, PipelineRun, TrainingRun, utcnow
 from app.schemas import DatasetReleaseCreate, InferenceRunCreate
 from app.services.artifacts import S3ArtifactStore
 from app.services.cvat_client import CvatClient
@@ -78,7 +78,12 @@ def build_dataset_release_task(job_id: str) -> dict[str, Any]:
         release_id = str((job.raw or {}).get("dataset_release_id"))
         payload = DatasetReleaseCreate.model_validate((job.raw or {}).get("payload") or {})
 
-        def report_progress(progress: float, detail: str | None = None) -> None:
+        def report_progress(
+            progress: float,
+            detail: str | None = None,
+            metrics: dict[str, Any] | None = None,
+        ) -> None:
+            del metrics
             ensure_not_canceled(db, job_id)
             update_job_progress(db, job_id, progress, detail=detail)
 
@@ -128,9 +133,37 @@ def training_run_task(job_id: str) -> dict[str, Any]:
         if run is None:
             raise LookupError(f"TrainingRun {run_id} not found")
 
-        def report_progress(progress: float, detail: str | None = None) -> None:
+        def report_progress(
+            progress: float,
+            detail: str | None = None,
+            metrics: dict[str, Any] | None = None,
+        ) -> None:
             ensure_not_canceled(db, job_id)
             update_job_progress(db, job_id, progress, detail=detail)
+            live_run = db.get(TrainingRun, run_id)
+            if live_run is not None:
+                existing_metrics = live_run.metrics if isinstance(live_run.metrics, dict) else {}
+                incoming_metrics = dict(metrics or {})
+                incoming_artifacts = incoming_metrics.pop("artifacts", None)
+                logs = existing_metrics.get("logs") if isinstance(existing_metrics.get("logs"), list) else []
+                if detail:
+                    incoming_metrics["logs"] = [
+                        *logs,
+                        _training_log_entry(progress, detail, incoming_metrics),
+                    ][-500:]
+                if isinstance(incoming_artifacts, list):
+                    live_run.artifacts = _merge_training_artifacts(live_run.artifacts, incoming_artifacts)
+                if progress >= 100:
+                    live_run.progress = 100
+                else:
+                    live_run.status = "running"
+                    live_run.progress = min(99, max(0, progress))
+                mlflow_run_id = incoming_metrics.get("mlflow_run_id")
+                if isinstance(mlflow_run_id, str) and mlflow_run_id:
+                    live_run.mlflow_run_id = mlflow_run_id
+                live_run.metrics = {**existing_metrics, **incoming_metrics}
+                db.add(live_run)
+                db.commit()
 
         completed = run_training(
             db,
@@ -228,7 +261,13 @@ def _mark_training_failed(db, job_id: str, reason: str) -> None:
         run = db.get(TrainingRun, str(run_id))
         if run is not None:
             run.status = "failed"
-            run.metrics = {**(run.metrics or {}), "error": reason}
+            existing_metrics = run.metrics if isinstance(run.metrics, dict) else {}
+            logs = existing_metrics.get("logs") if isinstance(existing_metrics.get("logs"), list) else []
+            run.metrics = {
+                **existing_metrics,
+                "error": reason,
+                "logs": [*logs, _training_log_entry(run.progress, f"Training failed: {reason}", {"level": "ERROR"})][-500:],
+            }
             db.add(run)
             db.commit()
 
@@ -269,6 +308,67 @@ def _mark_pipeline_failed(db, job_id: str, reason: str) -> None:
                     release.snapshot = {**(release.snapshot or {}), "error": reason}
                     db.add(release)
             db.commit()
+
+
+def _training_log_entry(
+    progress: float,
+    detail: str,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = metrics or {}
+    epoch = _number_from_metrics(payload, "epoch")
+    epochs = _number_from_metrics(payload, "epochs")
+    parts = [_training_log_metric(payload, "mAP50-95", "map5095", "metrics/mAP50-95(B)", "box_map", "fitness")]
+    parts.append(_training_log_metric(payload, "mAP50", "map50", "metrics/mAP50(B)", "box_map50"))
+    parts.append(_training_log_metric(payload, "precision", "precision", "metrics/precision(B)"))
+    parts.append(_training_log_metric(payload, "recall", "recall", "metrics/recall(B)"))
+    parts.append(_training_log_metric(payload, "loss", "loss", "train_loss"))
+    metric_summary = " ".join(part for part in parts if part)
+    message = detail
+    if metric_summary:
+        message = f"{message} | {metric_summary}"
+
+    return {
+        "t": utcnow().isoformat(),
+        "lvl": str(payload.get("level") or "INFO"),
+        "msg": message,
+        "progress": round(float(progress), 2),
+        "epoch": epoch,
+        "epochs": epochs,
+    }
+
+
+def _training_log_metric(payload: dict[str, Any], label: str, *keys: str) -> str | None:
+    value = _number_from_metrics(payload, *keys)
+    if value is None:
+        return None
+    return f"{label}={value:.4f}"
+
+
+def _number_from_metrics(payload: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                continue
+    return None
+
+
+def _merge_training_artifacts(existing: Any, incoming: list[Any]) -> list[dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for source in (existing if isinstance(existing, list) else []):
+        if isinstance(source, dict):
+            key = str(source.get("path") or source.get("uri") or source.get("name") or len(rows))
+            rows[key] = source
+    for source in incoming:
+        if isinstance(source, dict):
+            key = str(source.get("path") or source.get("uri") or source.get("name") or len(rows))
+            rows[key] = source
+    return list(rows.values())
 
 
 @celery_app.task(name="app.tasks.inference_run")

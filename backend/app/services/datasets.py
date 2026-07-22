@@ -8,13 +8,15 @@ from typing import Any
 from xml.etree import ElementTree
 
 from PIL import Image
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import AuditEvent, DatasetRelease
+from app.models import AnnotationRecord, AuditEvent, DatasetRelease
 from app.services.artifacts import ArtifactStore, proxy_download_url
 
 DEFAULT_SPLITS = {"train": 0.8, "val": 0.1, "test": 0.1}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+EXCLUDED_REVIEW_STATES = {"deleted_by_reviewer", "rejected", "incorrect", "needs_annotation"}
 
 
 def prepare_yolo_dataset(
@@ -42,10 +44,12 @@ def prepare_yolo_dataset(
 
         class_names = _snapshot_class_names(snapshot)
         class_index = {name: index for index, name in enumerate(class_names)}
-        manifest_images: list[dict[str, Any]] = []
+        source_images: list[dict[str, Any]] = []
+        local_annotations = _local_annotations_by_frame(db, _release_task_external_ids(release, artifacts))
 
         for artifact in artifacts:
             uri = str(artifact["uri"])
+            task_external_id = str(artifact.get("task_external_id") or "")
             blob = artifact_store.get(uri)
             extracted = _read_cvat_zip(blob.content)
             for name in extracted.class_names:
@@ -53,47 +57,82 @@ def prepare_yolo_dataset(
                     class_index[name] = len(class_index)
                     class_names.append(name)
             for item in extracted.images:
-                split = _split_for_name(item.name, splits)
                 image_member = _find_image_member(extracted.files, item.name)
                 if image_member is None:
                     continue
-                image_bytes = extracted.files[image_member]
                 extension = Path(image_member).suffix.lower() or ".jpg"
-                safe_stem = _safe_stem(f"{artifact.get('task_external_id', 'task')}_{item.name}")
-                image_target = dataset_dir / "images" / split / f"{safe_stem}{extension}"
-                label_target = dataset_dir / "labels" / split / f"{safe_stem}.txt"
-                image_target.write_bytes(image_bytes)
-
-                labels = []
-                for box in item.boxes:
-                    if box.label not in class_index:
-                        class_index[box.label] = len(class_index)
-                        class_names.append(box.label)
-                    labels.append(_yolo_label_line(class_index[box.label], box, item.width, item.height))
-                label_target.write_text("\n".join(labels) + ("\n" if labels else ""), encoding="utf-8")
-                manifest_images.append(
+                stable_key = f"{artifact.get('task_external_id', 'task')}:{item.name}:{len(source_images)}"
+                boxes = [
+                    *item.boxes,
+                    *_local_boxes_for_image(
+                        local_annotations.get((task_external_id, item.frame), []),
+                        item.width,
+                        item.height,
+                    ),
+                ]
+                source_images.append(
                     {
+                        "stable_key": stable_key,
                         "name": item.name,
-                        "split": split,
-                        "image": str(image_target.relative_to(dataset_dir)),
-                        "label": str(label_target.relative_to(dataset_dir)),
+                        "image_bytes": extracted.files[image_member],
+                        "extension": extension,
                         "width": item.width,
                         "height": item.height,
-                        "boxes": len(labels),
+                        "frame": item.frame,
+                        "boxes": boxes,
                         "source_artifact_uri": uri,
                     }
                 )
 
-        if not manifest_images:
+        if not source_images:
             raise ValueError("No images with annotations were found in release artifacts")
         if not class_names:
             class_names.append("object")
 
+        assignments = _balanced_split_assignments(source_images, splits)
+        manifest_images: list[dict[str, Any]] = []
+        for source_image in source_images:
+            split = assignments[str(source_image["stable_key"])]
+            safe_stem = _safe_stem(str(source_image["stable_key"]))
+            image_target = dataset_dir / "images" / split / f"{safe_stem}{source_image['extension']}"
+            label_target = dataset_dir / "labels" / split / f"{safe_stem}.txt"
+            image_target.write_bytes(source_image["image_bytes"])
+
+            labels = []
+            for box in source_image["boxes"]:
+                if box.label not in class_index:
+                    class_index[box.label] = len(class_index)
+                    class_names.append(box.label)
+                labels.append(
+                    _yolo_label_line(
+                        class_index[box.label],
+                        box,
+                        source_image["width"],
+                        source_image["height"],
+                    )
+                )
+            label_target.write_text("\n".join(labels) + ("\n" if labels else ""), encoding="utf-8")
+            manifest_images.append(
+                {
+                    "name": source_image["name"],
+                    "split": split,
+                    "image": str(image_target.relative_to(dataset_dir)),
+                    "label": str(label_target.relative_to(dataset_dir)),
+                    "width": source_image["width"],
+                    "height": source_image["height"],
+                    "boxes": len(labels),
+                    "source_artifact_uri": source_image["source_artifact_uri"],
+                }
+            )
+
+        split_counts = _count_splits(manifest_images)
+        val_path = "images/val" if split_counts["val"] else "images/train"
+        test_path = "images/test" if split_counts["test"] else val_path
         data_yaml_dict = {
             "path": ".",
             "train": "images/train",
-            "val": "images/val",
-            "test": "images/test",
+            "val": val_path,
+            "test": test_path,
             "names": {index: name for index, name in enumerate(class_names)},
         }
         (dataset_dir / "data.yaml").write_text(_data_yaml(data_yaml_dict), encoding="utf-8")
@@ -101,7 +140,7 @@ def prepare_yolo_dataset(
             "format": "yolo",
             "release_id": release.id,
             "release_name": release.name,
-            "splits": _count_splits(manifest_images),
+            "splits": split_counts,
             "classes": class_names,
             "images": manifest_images,
             "source_artifacts": artifacts,
@@ -141,10 +180,11 @@ def prepare_yolo_dataset(
 
 
 class CvatImage:
-    def __init__(self, name: str, width: int, height: int, boxes: list["CvatBox"]):
+    def __init__(self, name: str, width: int, height: int, frame: int, boxes: list["CvatBox"]):
         self.name = name
         self.width = width
         self.height = height
+        self.frame = frame
         self.boxes = boxes
 
 
@@ -177,14 +217,23 @@ def _read_cvat_zip(content: bytes) -> CvatZip:
             if (label.findtext("name") or "").strip()
         ]
         images = []
-        for image in root.findall(".//image"):
+        for index, image in enumerate(root.findall(".//image")):
             name = str(image.attrib.get("name") or "").strip()
             if not name:
                 continue
+            frame = _int(image.attrib.get("id"))
             width = _int(image.attrib.get("width")) or _image_dimension(files, name, 0)
             height = _int(image.attrib.get("height")) or _image_dimension(files, name, 1)
             boxes = _boxes_for_image(image)
-            images.append(CvatImage(name=name, width=width, height=height, boxes=boxes))
+            images.append(
+                CvatImage(
+                    name=name,
+                    width=width,
+                    height=height,
+                    frame=frame if frame is not None else index,
+                    boxes=boxes,
+                )
+            )
         return CvatZip(class_names=class_names, images=images, files=files)
 
 
@@ -227,6 +276,123 @@ def _release_artifacts(release: DatasetRelease) -> list[dict[str, Any]]:
     return rows
 
 
+def _release_task_external_ids(release: DatasetRelease, artifacts: list[dict[str, Any]]) -> list[str]:
+    ids = []
+    snapshot_ids = release.task_external_ids if isinstance(release.task_external_ids, list) else []
+    for value in snapshot_ids:
+        if value is not None:
+            ids.append(str(value))
+    for artifact in artifacts:
+        value = artifact.get("task_external_id")
+        if value is not None:
+            ids.append(str(value))
+    return sorted(set(ids))
+
+
+def _local_annotations_by_frame(
+    db: Session,
+    task_external_ids: list[str],
+) -> dict[tuple[str, int], list[AnnotationRecord]]:
+    if not task_external_ids:
+        return {}
+    rows = db.scalars(
+        select(AnnotationRecord).where(
+            AnnotationRecord.task_external_id.in_(task_external_ids),
+            AnnotationRecord.frame.is_not(None),
+        )
+    ).all()
+    grouped: dict[tuple[str, int], list[AnnotationRecord]] = {}
+    for row in rows:
+        task_external_id = str(row.task_external_id or "")
+        if not task_external_id or row.frame is None:
+            continue
+        if (row.review_state or "").lower() in EXCLUDED_REVIEW_STATES:
+            continue
+        if (row.shape_type or "").lower() not in {"rectangle", "polygon"}:
+            continue
+        grouped.setdefault((task_external_id, int(row.frame)), []).append(row)
+    return grouped
+
+
+def _local_boxes_for_image(
+    annotations: list[AnnotationRecord],
+    width: int,
+    height: int,
+) -> list[CvatBox]:
+    boxes = []
+    for annotation in annotations:
+        box = _local_annotation_box(annotation, width, height)
+        if box is not None:
+            boxes.append(box)
+    return boxes
+
+
+def _local_annotation_box(annotation: AnnotationRecord, width: int, height: int) -> CvatBox | None:
+    label = annotation.label_name or _raw_label_name(annotation.raw)
+    if not label:
+        return None
+
+    points = _numeric_points(annotation.points)
+    if len(points) >= 4:
+        points = _absolute_points(points, width, height)
+        if (annotation.shape_type or "").lower() == "polygon":
+            xs = points[0::2]
+            ys = points[1::2]
+            xtl, ytl, xbr, ybr = min(xs), min(ys), max(xs), max(ys)
+        else:
+            xtl, ytl, xbr, ybr = points[:4]
+        return _validated_box(label, xtl, ytl, xbr, ybr, width, height)
+
+    raw = annotation.raw if isinstance(annotation.raw, dict) else {}
+    bbox_norm = raw.get("bbox_norm") if isinstance(raw.get("bbox_norm"), dict) else None
+    if bbox_norm:
+        x = _float(bbox_norm.get("x"))
+        y = _float(bbox_norm.get("y"))
+        w = _float(bbox_norm.get("w"))
+        h = _float(bbox_norm.get("h"))
+        if x is not None and y is not None and w is not None and h is not None:
+            return _validated_box(label, x * width, y * height, (x + w) * width, (y + h) * height, width, height)
+    return None
+
+
+def _raw_label_name(raw: Any) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    value = raw.get("label_name") or raw.get("label")
+    return str(value).strip() if value else None
+
+
+def _numeric_points(points: Any) -> list[float]:
+    if not isinstance(points, list):
+        return []
+    values = [_float(value) for value in points]
+    return [value for value in values if value is not None]
+
+
+def _absolute_points(points: list[float], width: int, height: int) -> list[float]:
+    if points and all(0 <= value <= 1 for value in points):
+        return [value * (width if index % 2 == 0 else height) for index, value in enumerate(points)]
+    return points
+
+
+def _validated_box(
+    label: str,
+    xtl: float,
+    ytl: float,
+    xbr: float,
+    ybr: float,
+    width: int,
+    height: int,
+) -> CvatBox | None:
+    left = _clamp_to_dimension(min(xtl, xbr), width)
+    right = _clamp_to_dimension(max(xtl, xbr), width)
+    top = _clamp_to_dimension(min(ytl, ybr), height)
+    bottom = _clamp_to_dimension(max(ytl, ybr), height)
+    if right <= left or bottom <= top:
+        return None
+    return CvatBox(label, left, top, right, bottom)
+
+
 def _snapshot_class_names(snapshot: dict[str, Any]) -> list[str]:
     labels = snapshot.get("labels") if isinstance(snapshot.get("labels"), list) else []
     names = []
@@ -258,13 +424,111 @@ def _ratio(value: Any, fallback: float) -> float:
     return parsed / 100 if parsed > 1 else parsed
 
 
-def _split_for_name(name: str, splits: dict[str, float]) -> str:
-    bucket = int(hashlib.sha1(name.encode("utf-8")).hexdigest()[:8], 16) / 0xFFFFFFFF
-    if bucket < splits["train"]:
-        return "train"
-    if bucket < splits["train"] + splits["val"]:
-        return "val"
-    return "test"
+def _balanced_split_assignments(items: list[dict[str, Any]], splits: dict[str, float]) -> dict[str, str]:
+    counts = _balanced_split_counts(len(items), splits)
+    assignments: dict[str, str] = {}
+    positive_items = [item for item in items if item.get("boxes")]
+    background_items = [item for item in items if not item.get("boxes")]
+
+    positive_counts = _bounded_positive_split_counts(len(positive_items), counts, splits)
+    remaining_counts = dict(counts)
+    positive_keys = _stable_ordered_keys(positive_items)
+    cursor = _assign_ordered_keys(assignments, positive_keys, positive_counts, 0)
+    if cursor < len(positive_keys):
+        for key in positive_keys[cursor:]:
+            split = max(remaining_counts, key=remaining_counts.get)
+            assignments[key] = split
+            remaining_counts[split] = max(0, remaining_counts[split] - 1)
+    else:
+        for split, count in positive_counts.items():
+            remaining_counts[split] = max(0, remaining_counts[split] - count)
+
+    background_keys = _stable_ordered_keys(background_items)
+    _assign_ordered_keys(assignments, background_keys, remaining_counts, 0)
+    return assignments
+
+
+def _stable_ordered_keys(items: list[dict[str, Any]]) -> list[str]:
+    return sorted(
+        [str(item["stable_key"]) for item in items],
+        key=lambda value: hashlib.sha1(value.encode("utf-8")).hexdigest(),
+    )
+
+
+def _assign_ordered_keys(
+    assignments: dict[str, str],
+    ordered_keys: list[str],
+    counts: dict[str, int],
+    cursor: int,
+) -> int:
+    for split in ("train", "val", "test"):
+        for key in ordered_keys[cursor : cursor + counts[split]]:
+            assignments[key] = split
+        cursor += counts[split]
+    return cursor
+
+
+def _bounded_positive_split_counts(
+    total: int,
+    split_capacity: dict[str, int],
+    splits: dict[str, float],
+) -> dict[str, int]:
+    counts = _balanced_split_counts(total, splits)
+    for split in ("train", "val", "test"):
+        counts[split] = min(counts[split], split_capacity.get(split, 0))
+
+    remaining = total - sum(counts.values())
+    if remaining <= 0:
+        return counts
+
+    candidates = sorted(
+        ("train", "val", "test"),
+        key=lambda split: (split_capacity.get(split, 0) - counts[split], splits.get(split, 0)),
+        reverse=True,
+    )
+    while remaining > 0:
+        progressed = False
+        for split in candidates:
+            if remaining <= 0:
+                break
+            if counts[split] >= split_capacity.get(split, 0):
+                continue
+            counts[split] += 1
+            remaining -= 1
+            progressed = True
+        if not progressed:
+            break
+    return counts
+
+
+def _balanced_split_counts(total: int, splits: dict[str, float]) -> dict[str, int]:
+    counts = {"train": 0, "val": 0, "test": 0}
+    if total <= 0:
+        return counts
+
+    enabled = [split for split in ("train", "val", "test") if splits.get(split, 0) > 0]
+    if "train" not in enabled:
+        enabled.insert(0, "train")
+    enabled = enabled[:total]
+
+    for split in enabled:
+        counts[split] = 1
+    remaining = total - len(enabled)
+    if remaining <= 0:
+        return counts
+
+    total_weight = sum(splits.get(split, 0) for split in enabled) or len(enabled)
+    raw = {split: (remaining * splits.get(split, 0) / total_weight) for split in enabled}
+    floors = {split: int(raw[split]) for split in enabled}
+    for split, value in floors.items():
+        counts[split] += value
+    leftover = remaining - sum(floors.values())
+    for split in sorted(enabled, key=lambda item: (raw[item] - floors[item], splits.get(item, 0)), reverse=True):
+        if leftover <= 0:
+            break
+        counts[split] += 1
+        leftover -= 1
+    return counts
 
 
 def _find_image_member(files: dict[str, bytes], image_name: str) -> str | None:
@@ -349,3 +613,7 @@ def _float(value: Any) -> float | None:
 
 def _clamp(value: float) -> float:
     return min(1.0, max(0.0, value))
+
+
+def _clamp_to_dimension(value: float, dimension: int) -> float:
+    return min(float(max(dimension, 1)), max(0.0, value))

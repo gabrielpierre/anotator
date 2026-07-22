@@ -98,6 +98,41 @@ export type BackendTask = {
   updated_at: string
 }
 
+export type BackendTaskDeleteBlockingJob = {
+  id: string
+  kind: string
+  status: string
+  name: string
+  detail: string | null
+}
+
+export type BackendTaskDeleteImpact = {
+  task_id: string
+  task_external_id: string
+  task_name: string
+  image_count: number
+  annotations: number
+  inference_suggestions: number
+  labels: number
+  cvat_jobs: number
+  dataset_releases: number
+  derived_assets: number
+  pipeline_runs: number
+  active_jobs: BackendTaskDeleteBlockingJob[]
+  warnings: string[]
+  blocking: boolean
+}
+
+export type BackendTaskDeleteResult = {
+  task_id: string
+  task_external_id: string
+  task_name: string
+  cvat_deleted: boolean
+  deleted: Record<string, number>
+  preserved: Record<string, number>
+  warnings: string[]
+}
+
 export type BackendCvatLabel = {
   id: string
   external_id: string
@@ -109,6 +144,13 @@ export type BackendCvatLabel = {
   raw: Record<string, unknown>
   created_at: string
   updated_at: string
+}
+
+export type BackendLabelColorUpdate = {
+  name: string
+  color: string
+  project_external_id?: string | null
+  task_external_id?: string | null
 }
 
 export type BackendTaskDataMeta = {
@@ -174,6 +216,7 @@ export type BackendManualAnnotationShape = {
   client_id: string
   shape_type: "rectangle" | "polygon" | "points"
   label_name: string
+  label_color?: string | null
   points: number[]
   bbox_norm?: Record<string, number> | null
 }
@@ -248,7 +291,25 @@ export type BackendJobCapacity = {
   cpu_count: number
   memory_total_bytes: number | null
   memory_available_bytes: number | null
-  gpu: Record<string, unknown>
+  gpu: {
+    available?: boolean
+    provider?: string | null
+    devices?: BackendComputeDevice[]
+    device_options?: BackendComputeDevice[]
+    detected_devices?: BackendComputeDevice[]
+    [key: string]: unknown
+  }
+}
+
+export type BackendComputeDevice = {
+  id: string
+  type: "cpu" | "cuda" | string
+  name: string
+  label?: string
+  available?: boolean
+  index?: number | null
+  memory_total_bytes?: number | null
+  provider?: string | null
 }
 
 export type BackendJobMetrics = {
@@ -520,6 +581,7 @@ export type BackendAuditEventPage = {
 export type BackendImportTaskCreate = {
   project_id?: string | null
   name: string
+  assignee_user_id?: string | null
   labels?: Record<string, unknown>[]
   source_path?: string | null
   estimated_bytes?: number | null

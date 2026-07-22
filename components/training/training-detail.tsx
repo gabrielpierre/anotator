@@ -1,19 +1,25 @@
 "use client"
 
 import * as React from "react"
-import { Pause, Square, MoreHorizontal, Settings2, ChevronRight } from "lucide-react"
+import { useRouter } from "next/navigation"
+import { AlertTriangle, Pause, Square, MoreHorizontal, Settings2, ChevronRight } from "lucide-react"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { StatusBadge, ProgressBar, StatRow, Meter } from "@/components/app/primitives"
 import { TabNav } from "@/components/app/tab-nav"
 import { MetricLineChart } from "@/components/app/charts"
 import {
+  artifactAssetUrlFromUri,
   artifactDownloadPathFromUri,
+  deleteTrainingRun,
   downloadBackendFile,
   fetchTrainingRun,
+  pauseTrainingRun,
+  stopTrainingRun,
   trainingRunEventsUrl,
 } from "@/lib/api/client"
 import { formatDateTimePt, toUiJobStatus } from "@/lib/api/status"
+import { cn } from "@/lib/utils"
 import type { BackendTrainingRun } from "@/lib/api/types"
 
 const TABS = [
@@ -34,9 +40,55 @@ const chartSeries = [
   { key: "loss", label: "Loss", color: "var(--destructive)" },
 ]
 
+const metricDefinitions = [
+  {
+    key: "map50",
+    label: "mAP@0.5",
+    aliases: ["map50", "box_map50", "metrics/mAP50(B)", "metrics_mAP50_B_"],
+  },
+  {
+    key: "map5095",
+    label: "mAP@0.5:0.95",
+    aliases: ["map5095", "box_map", "metrics/mAP50-95(B)", "metrics_mAP50-95_B_", "fitness"],
+  },
+  {
+    key: "precision",
+    label: "Precision",
+    aliases: ["precision", "metrics/precision(B)", "metrics_precision_B_"],
+  },
+  {
+    key: "recall",
+    label: "Recall",
+    aliases: ["recall", "metrics/recall(B)", "metrics_recall_B_"],
+  },
+  {
+    key: "loss",
+    label: "Loss",
+    aliases: ["loss", "train_loss", "train/box_loss"],
+  },
+] as const
+
+type MetricRow = {
+  key: string
+  label: string
+  value: string
+  color: string
+}
+
+type TrainingImageArtifact = {
+  name: string
+  path: string
+  uri: string
+  label: string
+}
+
 export function TrainingDetail({ id }: { id: string }) {
+  const router = useRouter()
   const [tab, setTab] = React.useState("overview")
   const [run, setRun] = React.useState<BackendTrainingRun | null>(null)
+  const [actionMenuOpen, setActionMenuOpen] = React.useState(false)
+  const [actionBusy, setActionBusy] = React.useState<"pause" | "stop" | "delete" | null>(null)
+  const [actionError, setActionError] = React.useState<string | null>(null)
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -49,7 +101,9 @@ export function TrainingDetail({ id }: { id: string }) {
       const payload = JSON.parse((event as MessageEvent).data) as Partial<BackendTrainingRun>
       setRun((current) => (current ? { ...current, ...payload } : current))
     })
-    events.onerror = () => events.close()
+    events.onerror = () => {
+      fetchTrainingRun(id).then(setRun).catch(() => undefined)
+    }
     return () => {
       controller.abort()
       events.close()
@@ -69,9 +123,57 @@ export function TrainingDetail({ id }: { id: string }) {
     )
   }
 
-  const progress = Math.round(run.progress)
-  const displayKpis = kpisFromRun(run)
-  const displayConfig = configFromRun(run)
+  const currentRun = run
+  const progress = Math.round(currentRun.progress)
+  const displayKpis = kpisFromRun(currentRun)
+  const failureMessage = failureMessageFromRun(currentRun)
+  const canPause = currentRun.status === "queued" || currentRun.status === "running"
+  const canStop = canPause || currentRun.status === "paused"
+
+  async function handlePause() {
+    if (!canPause || actionBusy) return
+    setActionBusy("pause")
+    setActionError(null)
+    try {
+      setRun(await pauseTrainingRun(currentRun.id))
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Não foi possível pausar o treinamento.")
+    } finally {
+      setActionBusy(null)
+    }
+  }
+
+  async function handleStop() {
+    if (!canStop || actionBusy) return
+    const confirmed = window.confirm("Parar este treinamento agora? O job ativo será cancelado.")
+    if (!confirmed) return
+    setActionBusy("stop")
+    setActionError(null)
+    try {
+      setRun(await stopTrainingRun(currentRun.id))
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Não foi possível parar o treinamento.")
+    } finally {
+      setActionBusy(null)
+    }
+  }
+
+  async function handleDelete() {
+    if (actionBusy) return
+    const confirmed = window.confirm(
+      "Excluir este treinamento definitivamente? Isso cancela jobs ativos e apaga modelos e artefatos gerados por ele.",
+    )
+    if (!confirmed) return
+    setActionBusy("delete")
+    setActionError(null)
+    try {
+      await deleteTrainingRun(currentRun.id)
+      router.push("/treinar")
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Não foi possível excluir o treinamento.")
+      setActionBusy(null)
+    }
+  }
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -82,20 +184,58 @@ export function TrainingDetail({ id }: { id: string }) {
           <StatusBadge status={toUiJobStatus(run.status)} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline">
-            <Pause className="size-4" />
-            Pausar
-          </Button>
-          <Button variant="outline" className="border-destructive/40 text-destructive hover:bg-destructive/10">
-            <Square className="size-4" />
-            Parar
-          </Button>
-          <Button variant="ghost" aria-label="Mais ações">
-            <MoreHorizontal className="size-4" />
-            Mais ações
-          </Button>
+          {canPause && (
+            <Button variant="outline" disabled={actionBusy !== null} onClick={() => void handlePause()}>
+              <Pause className="size-4" />
+              {actionBusy === "pause" ? "Pausando..." : "Pausar"}
+            </Button>
+          )}
+          {canStop && (
+            <Button
+              variant="outline"
+              disabled={actionBusy !== null}
+              className="border-destructive/40 text-destructive hover:bg-destructive/10 disabled:opacity-45"
+              onClick={() => void handleStop()}
+            >
+              <Square className="size-4" />
+              {actionBusy === "stop" ? "Parando..." : "Parar"}
+            </Button>
+          )}
+          <div className="relative">
+            <Button
+              variant="ghost"
+              aria-label="Mais ações"
+              aria-expanded={actionMenuOpen}
+              onClick={() => setActionMenuOpen((open) => !open)}
+            >
+              <MoreHorizontal className="size-4" />
+              Mais ações
+            </Button>
+            {actionMenuOpen && (
+              <div className="absolute right-0 top-full z-20 mt-2 w-56 overflow-hidden rounded-xl border border-border bg-card p-1 shadow-lg">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setActionMenuOpen(false)
+                    void handleDelete()
+                  }}
+                  disabled={actionBusy !== null}
+                  className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm font-medium text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                >
+                  Excluir treinamento
+                  <span className="text-xs text-destructive/70">apagar tudo</span>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
+
+      {actionError && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {actionError}
+        </div>
+      )}
 
       {/* KPI strip */}
       <Card className="p-0">
@@ -116,7 +256,17 @@ export function TrainingDetail({ id }: { id: string }) {
         </div>
       </Card>
 
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_320px]">
+      {failureMessage && (
+        <div className="flex gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+          <div className="min-w-0">
+            <p className="font-medium">Motivo da falha</p>
+            <p className="mt-1 whitespace-pre-wrap break-words text-destructive/90">{failureMessage}</p>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
         {/* Main column */}
         <div className="flex min-w-0 flex-col gap-6">
           <TabNav tabs={TABS} value={tab} onChange={setTab} />
@@ -132,38 +282,8 @@ export function TrainingDetail({ id }: { id: string }) {
 
         {/* Right rail */}
         <aside className="flex flex-col gap-6">
-          <Card>
-            <CardHeader>
-              <CardTitle>Configuração do treinamento</CardTitle>
-              <button className="flex items-center gap-1 text-xs text-brand-blue hover:underline">
-                <Settings2 className="size-3.5" />
-                Editar
-              </button>
-            </CardHeader>
-            <CardContent className="divide-y divide-border">
-              {displayConfig.slice(0, 9).map((c) => (
-                <StatRow key={c.label} label={c.label} value={c.value} />
-              ))}
-              <button className="pt-3 text-xs font-medium text-brand-blue hover:underline">
-                Ver todas as configurações
-              </button>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Recursos da máquina</CardTitle>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4">
-              <div className="flex flex-col gap-2 border-t border-border pt-3">
-                <Meter label="Progresso reportado" value={progress} color="bg-brand-lavender" />
-                <div className="flex items-center justify-between text-xs text-muted-foreground">
-                  <span>Device</span>
-                  <span className="tabular-nums text-foreground">{String(run.config.device ?? "auto")}</span>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+          <TrainingConfigCard run={run} onShowConfig={() => setTab("config")} />
+          <MachineResourcesCard run={run} progress={progress} />
         </aside>
       </div>
     </div>
@@ -183,18 +303,154 @@ function kpisFromRun(run: BackendTrainingRun) {
   ]
 }
 
-function configFromRun(run: BackendTrainingRun) {
-  return [
-    { label: "Modelo base", value: run.base_model },
-    { label: "Dataset", value: run.dataset_release_id },
-    { label: "Épocas", value: String(numberParam(run.config, "epochs", 100)) },
-    { label: "Imagem (imgsz)", value: String(numberParam(run.config, "image_size", 640)) },
-    { label: "Batch size", value: String(numberParam(run.config, "batch_size", 16)) },
-    { label: "Workers", value: String(numberParam(run.config, "workers", 8)) },
-    { label: "Device", value: String(run.config.device ?? "auto") },
-    { label: "Seed", value: String(numberParam(run.config, "seed", 42)) },
-    { label: "MLflow run", value: run.mlflow_run_id ?? "--" },
-  ]
+function TrainingConfigCard({
+  run,
+  onShowConfig,
+}: {
+  run: BackendTrainingRun
+  onShowConfig: () => void
+}) {
+  const modelName = String(run.config.model_name ?? run.base_model)
+  return (
+    <Card className="overflow-hidden p-0">
+      <CardHeader className="mb-0 border-b border-border px-5 py-4">
+        <CardTitle>Configuração</CardTitle>
+        <button
+          type="button"
+          className="inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-xs font-medium text-brand-blue hover:bg-brand-blue/10"
+        >
+          <Settings2 className="size-3.5" />
+          Editar
+        </button>
+      </CardHeader>
+      <CardContent className="space-y-5 p-5">
+        <div className="grid grid-cols-2 gap-2">
+          <ConfigMetric label="Modelo" value={modelName} />
+          <ConfigMetric label="Device" value={String(run.config.device ?? "auto")} />
+          <ConfigMetric label="Épocas" value={String(numberParam(run.config, "epochs", 100))} />
+          <ConfigMetric label="Imagem" value={`${numberParam(run.config, "image_size", 640)} px`} />
+          <ConfigMetric label="Batch" value={String(numberParam(run.config, "batch_size", 16))} />
+          <ConfigMetric label="Workers" value={String(numberParam(run.config, "workers", 8))} />
+        </div>
+
+        <div className="space-y-2">
+          <CompactIdRow label="Dataset" value={run.dataset_release_id} />
+          <CompactIdRow label="MLflow" value={run.mlflow_run_id} />
+          <CompactIdRow label="Seed" value={String(numberParam(run.config, "seed", 42))} plain />
+        </div>
+
+        <button
+          type="button"
+          onClick={onShowConfig}
+          className="w-full rounded-full border border-border px-3 py-2 text-xs font-medium text-foreground hover:bg-muted"
+        >
+          Ver configuração completa
+        </button>
+      </CardContent>
+    </Card>
+  )
+}
+
+function MachineResourcesCard({
+  run,
+  progress,
+}: {
+  run: BackendTrainingRun
+  progress: number
+}) {
+  const resourcePolicy = objectRecord(run.config.resource_policy)
+  const device = String(run.config.device ?? resourcePolicy?.device ?? "auto")
+  const deviceLabel = String(resourcePolicy?.device_label ?? (device === "cpu" ? "CPU" : device))
+  const workers = numberParam(run.config, "workers", 0)
+  const batch = numberParam(run.config, "batch_size", 0)
+
+  return (
+    <Card className="overflow-hidden p-0">
+      <CardHeader className="mb-0 border-b border-border px-5 py-4">
+        <CardTitle>Recursos</CardTitle>
+        <span className="rounded-full bg-muted px-2 py-1 text-xs font-medium text-muted-foreground">
+          {run.status === "running" ? "Em uso" : "Snapshot"}
+        </span>
+      </CardHeader>
+      <CardContent className="space-y-5 p-5">
+        <div className="rounded-xl bg-muted/50 p-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-xs text-muted-foreground">Dispositivo</p>
+              <p className="mt-1 truncate text-sm font-semibold text-foreground" title={deviceLabel}>
+                {deviceLabel}
+              </p>
+            </div>
+            <span className="shrink-0 rounded-full bg-background px-2.5 py-1 text-xs font-semibold uppercase text-foreground ring-1 ring-border">
+              {device}
+            </span>
+          </div>
+        </div>
+
+        <Meter label="Progresso reportado" value={progress} color="bg-brand-lavender" />
+
+        <div className="grid grid-cols-2 gap-2">
+          <ResourceMetric label="Workers" value={workers ? String(workers) : "--"} />
+          <ResourceMetric label="Batch" value={batch ? String(batch) : "--"} />
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ConfigMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-xl bg-muted/45 px-3 py-2.5">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="mt-1 truncate text-sm font-semibold tabular-nums text-foreground" title={value}>
+        {value}
+      </p>
+    </div>
+  )
+}
+
+function ResourceMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-border px-3 py-2.5">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="mt-1 text-sm font-semibold tabular-nums text-foreground">{value}</p>
+    </div>
+  )
+}
+
+function CompactIdRow({
+  label,
+  value,
+  plain = false,
+}: {
+  label: string
+  value: string | null
+  plain?: boolean
+}) {
+  const display = value ? (plain ? value : compactId(value)) : "--"
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-border pb-2.5 last:border-b-0 last:pb-0">
+      <span className="text-sm text-muted-foreground">{label}</span>
+      <span
+        className={cn(
+          "min-w-0 max-w-[210px] truncate text-right text-sm font-medium text-foreground",
+          !plain && "font-mono text-xs tracking-normal",
+        )}
+        title={value ?? undefined}
+      >
+        {display}
+      </span>
+    </div>
+  )
+}
+
+function compactId(value: string) {
+  if (value.length <= 18) return value
+  return `${value.slice(0, 8)}...${value.slice(-6)}`
+}
+
+function objectRecord(value: unknown) {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null
 }
 
 function numberParam(record: Record<string, unknown>, key: string, fallback: number) {
@@ -223,6 +479,15 @@ function metricText(value: number | null) {
   return value === null ? "--" : value.toFixed(3)
 }
 
+function failureMessageFromRun(run: BackendTrainingRun) {
+  if (run.status !== "failed" && run.status !== "canceled") return null
+  for (const key of ["error", "reason", "message", "detail"]) {
+    const value = run.metrics[key]
+    if (typeof value === "string" && value.trim()) return value.trim()
+  }
+  return null
+}
+
 function numberValue(value: unknown) {
   if (typeof value === "number" && Number.isFinite(value)) return value
   if (typeof value === "string") {
@@ -234,27 +499,75 @@ function numberValue(value: unknown) {
 
 function metricRows(metrics: Record<string, unknown>) {
   const colors = ["var(--brand-sky)", "var(--brand-green)", "var(--brand-lavender)", "var(--warning)"]
-  return Object.entries(metrics)
-    .filter(([, value]) => numberValue(value) !== null)
+  const canonicalRows: MetricRow[] = []
+  for (const definition of metricDefinitions) {
+    const value = metricValue(metrics, definition.aliases)
+    const series = chartSeries.find((item) => item.key === definition.key)
+    if (value !== null) {
+      canonicalRows.push({
+        key: definition.key,
+        label: definition.label,
+        value: metricText(value),
+        color: series?.color ?? colors[0],
+      })
+    }
+  }
+  const reserved = new Set([
+    "epoch",
+    "epochs",
+    "history",
+    "learning_rate",
+    "mlflow_run_id",
+    "stage",
+    "status",
+    "time",
+    ...metricDefinitions.flatMap((definition) => [definition.key, ...definition.aliases]),
+  ])
+  const extraRows: MetricRow[] = Object.entries(metrics)
+    .filter(([key, value]) => !reserved.has(key) && numberValue(value) !== null)
     .map(([key, value], index) => ({
       key,
       label: key,
       value: metricText(numberValue(value)),
-      color: colors[index % colors.length],
+      color: colors[(canonicalRows.length + index) % colors.length],
     }))
+
+  return [...canonicalRows, ...extraRows]
 }
 
 function chartDataFromMetrics(metrics: Record<string, unknown>) {
   const history = metrics.history
   if (Array.isArray(history)) {
-    return history.filter((item): item is Record<string, number | string> => Boolean(item) && typeof item === "object")
+    return history
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+      .map(normalizeChartRow)
+      .filter(hasChartMetric)
   }
-  const row: Record<string, number | string> = { epoch: numberValue(metrics.epoch) ?? 0 }
-  for (const metric of metricRows(metrics)) {
-    const value = numberValue(metrics[metric.key])
-    if (value !== null) row[metric.key] = value
+  const row = normalizeChartRow(metrics)
+  return hasChartMetric(row) ? [row] : []
+}
+
+function normalizeChartRow(record: Record<string, unknown>) {
+  const row: Record<string, number | string> = {
+    epoch: metricValue(record, ["epoch"]) ?? 0,
   }
-  return Object.keys(row).length > 1 ? [row] : []
+  for (const definition of metricDefinitions) {
+    const value = metricValue(record, definition.aliases)
+    if (value !== null) row[definition.key] = value
+  }
+  return row
+}
+
+function hasChartMetric(row: Record<string, number | string>) {
+  return chartSeries.slice(0, 4).some((series) => numberValue(row[series.key]) !== null)
+}
+
+function metricValue(record: Record<string, unknown>, aliases: readonly string[]) {
+  for (const alias of aliases) {
+    const value = numberValue(record[alias])
+    if (value !== null) return value
+  }
+  return null
 }
 
 function perClassRows(metrics: Record<string, unknown>) {
@@ -270,6 +583,58 @@ function perClassRows(metrics: Record<string, unknown>) {
       map: metricText(numberValue(row.map5095 ?? row.map ?? row["mAP50-95"])),
     }
   })
+}
+
+function trainingImageArtifacts(run: BackendTrainingRun) {
+  return run.artifacts
+    .map((artifact): TrainingImageArtifact | null => {
+      const row = artifact && typeof artifact === "object" ? (artifact as Record<string, unknown>) : {}
+      const uri = typeof row.uri === "string" ? row.uri : null
+      if (!uri?.startsWith("s3://")) return null
+      const name = String(row.name ?? row.path ?? "artifact")
+      const path = String(row.path ?? name)
+      if (!/\.(jpe?g|png)$/i.test(name) && !/\.(jpe?g|png)$/i.test(path)) return null
+      return {
+        name,
+        path,
+        uri,
+        label: visualArtifactLabel(path || name),
+      }
+    })
+    .filter((artifact): artifact is TrainingImageArtifact => artifact !== null)
+}
+
+function confusionMatrixArtifacts(run: BackendTrainingRun) {
+  const artifacts = trainingImageArtifacts(run).filter((artifact) =>
+    artifact.path.toLowerCase().includes("confusion_matrix"),
+  )
+  return artifacts.sort((left, right) => {
+    const leftNormalized = left.path.toLowerCase().includes("normalized") ? 0 : 1
+    const rightNormalized = right.path.toLowerCase().includes("normalized") ? 0 : 1
+    return leftNormalized - rightNormalized || left.path.localeCompare(right.path)
+  })
+}
+
+function validationExampleArtifacts(run: BackendTrainingRun) {
+  return trainingImageArtifacts(run)
+    .filter((artifact) => {
+      const path = artifact.path.toLowerCase()
+      return path.includes("val_batch") && (path.includes("_pred") || path.includes("_labels"))
+    })
+    .sort((left, right) => {
+      const leftPred = left.path.toLowerCase().includes("_pred") ? 0 : 1
+      const rightPred = right.path.toLowerCase().includes("_pred") ? 0 : 1
+      return leftPred - rightPred || left.path.localeCompare(right.path)
+    })
+}
+
+function visualArtifactLabel(path: string) {
+  const name = path.split("/").pop() ?? path
+  if (name === "confusion_matrix_normalized.png") return "Matriz normalizada"
+  if (name === "confusion_matrix.png") return "Matriz absoluta"
+  const match = name.match(/^val_batch(\d+)_(pred|labels)\./i)
+  if (match) return `Batch ${Number(match[1]) + 1} - ${match[2] === "pred" ? "predições" : "rótulos"}`
+  return name
 }
 
 function OverviewTab({ run }: { run: BackendTrainingRun }) {
@@ -335,17 +700,144 @@ function OverviewTab({ run }: { run: BackendTrainingRun }) {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Matriz de confusão (validação)</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm text-muted-foreground">Nenhuma matriz de confusão reportada pelo backend.</p>
-          </CardContent>
-        </Card>
+        <ValidationArtifactsCard run={run} />
       </div>
     </div>
   )
+}
+
+function ValidationArtifactsCard({ run }: { run: BackendTrainingRun }) {
+  const [mode, setMode] = React.useState<"matrix" | "examples">("matrix")
+  const [exampleIndex, setExampleIndex] = React.useState(0)
+  const matrixArtifacts = confusionMatrixArtifacts(run)
+  const exampleArtifacts = validationExampleArtifacts(run)
+  const selectedExample = exampleArtifacts[Math.min(exampleIndex, Math.max(exampleArtifacts.length - 1, 0))]
+  const epoch = numberParam(run.metrics, "epoch", 0)
+
+  React.useEffect(() => {
+    if (exampleIndex >= exampleArtifacts.length) setExampleIndex(0)
+  }, [exampleArtifacts.length, exampleIndex])
+
+  return (
+    <Card className="overflow-hidden p-0">
+      <CardHeader className="mb-0 border-b border-border px-5 py-4">
+        <div className="min-w-0">
+          <CardTitle>Validação</CardTitle>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {epoch > 0 ? `Época ${epoch}` : "Aguardando primeira época"} ·{" "}
+            {mode === "matrix" ? pluralCount(matrixArtifacts.length, "matriz", "matrizes") : pluralCount(exampleArtifacts.length, "exemplo", "exemplos")}
+          </p>
+        </div>
+        <div className="flex shrink-0 rounded-full border border-border bg-muted/60 p-0.5 text-xs">
+          <button
+            type="button"
+            onClick={() => setMode("matrix")}
+            className={cn(
+              "rounded-full px-3 py-1.5 font-medium transition",
+              mode === "matrix" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            Matriz
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("examples")}
+            className={cn(
+              "rounded-full px-3 py-1.5 font-medium transition",
+              mode === "examples" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            Exemplos
+          </button>
+        </div>
+      </CardHeader>
+      <CardContent className="p-5">
+        {mode === "matrix" ? (
+          <ValidationMediaViewer
+            artifact={matrixArtifacts[0]}
+            variant="matrix"
+            emptyText="Nenhuma matriz de confusão reportada pelo backend."
+          />
+        ) : (
+          <div className="flex flex-col gap-3">
+            <ValidationMediaViewer
+              artifact={selectedExample}
+              variant="example"
+              emptyText="Nenhum exemplo de validação reportado pelo backend."
+            />
+            {exampleArtifacts.length > 1 && (
+              <div className="grid grid-cols-2 gap-2">
+                {exampleArtifacts.map((artifact, index) => (
+                  <button
+                    key={artifact.path}
+                    type="button"
+                    onClick={() => setExampleIndex(index)}
+                    className={cn(
+                      "group overflow-hidden rounded-lg border bg-background text-left transition",
+                      index === exampleIndex ? "border-brand-blue ring-2 ring-brand-blue/20" : "border-border hover:border-foreground/20",
+                    )}
+                  >
+                    <div className="aspect-video overflow-hidden bg-muted/20">
+                      <img
+                        src={artifactAssetUrlFromUri(artifact.uri)}
+                        alt={artifact.label}
+                        className="h-full w-full object-cover transition-transform group-hover:scale-[1.02]"
+                      />
+                    </div>
+                    <div className="truncate px-2.5 py-1.5 text-xs font-medium text-foreground">
+                      {artifact.label}
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function ValidationMediaViewer({
+  artifact,
+  emptyText = "Nenhuma imagem reportada pelo backend.",
+  variant,
+}: {
+  artifact?: TrainingImageArtifact
+  emptyText?: string
+  variant: "matrix" | "example"
+}) {
+  if (!artifact) {
+    return (
+      <div className="rounded-xl border border-dashed border-border px-4 py-10 text-center text-sm text-muted-foreground">
+        {emptyText}
+      </div>
+    )
+  }
+  return (
+    <figure className="overflow-hidden rounded-xl border border-border bg-background">
+      <div
+        className={cn(
+          "flex w-full items-center justify-center overflow-hidden",
+          variant === "matrix" ? "aspect-[4/3] max-h-[380px] bg-white p-3" : "aspect-video bg-muted/20",
+        )}
+      >
+        <img
+          src={artifactAssetUrlFromUri(artifact.uri)}
+          alt={artifact.label}
+          className={cn("h-full w-full", variant === "matrix" ? "object-contain" : "object-cover")}
+        />
+      </div>
+      <figcaption className="flex items-center justify-between gap-3 border-t border-border px-3 py-2 text-xs">
+        <span className="font-medium text-foreground">{artifact.label}</span>
+        <span className="truncate text-muted-foreground">{artifact.name}</span>
+      </figcaption>
+    </figure>
+  )
+}
+
+function pluralCount(count: number, singular: string, plural: string) {
+  return `${count} ${count === 1 ? singular : plural}`
 }
 
 function MetricsTab({ run }: { run: BackendTrainingRun }) {
@@ -440,13 +932,20 @@ function ResourcesTab({ run }: { run: BackendTrainingRun }) {
 
 function LogsTab({ run }: { run: BackendTrainingRun }) {
   const logs = Array.isArray(run.metrics.logs) ? run.metrics.logs : []
+  const live = run.status === "queued" || run.status === "running"
+  const endRef = React.useRef<HTMLDivElement | null>(null)
+
+  React.useEffect(() => {
+    endRef.current?.scrollIntoView({ block: "end" })
+  }, [logs.length])
+
   return (
     <Card className="p-0">
       <div className="flex items-center justify-between border-b border-border px-5 py-3">
         <CardTitle>Logs em tempo real</CardTitle>
-        <span className="flex items-center gap-1.5 text-xs text-brand-green">
-          <span className="size-1.5 animate-pulse rounded-full bg-brand-green" />
-          Ao vivo
+        <span className={cn("flex items-center gap-1.5 text-xs", live ? "text-brand-green" : "text-muted-foreground")}>
+          <span className={cn("size-1.5 rounded-full", live && "animate-pulse", live ? "bg-brand-green" : "bg-muted-foreground")} />
+          {live ? "Ao vivo" : "Finalizado"}
         </span>
       </div>
       <div className="max-h-[480px] overflow-auto p-4 font-mono text-xs leading-relaxed">
@@ -469,6 +968,7 @@ function LogsTab({ run }: { run: BackendTrainingRun }) {
           </div>
           )
         })}
+        <div ref={endRef} />
         {logs.length === 0 && <p className="text-muted-foreground">Nenhum log reportado pelo backend.</p>}
       </div>
     </Card>
@@ -537,19 +1037,174 @@ function ArtifactsTab({ run }: { run: BackendTrainingRun | null }) {
 }
 
 function ConfigTab({ run }: { run: BackendTrainingRun | null }) {
-  const rows = run ? configFromRun(run) : []
+  const sections = run ? configSectionsFromRun(run) : []
   return (
-    <Card>
-      <CardHeader>
+    <Card className="overflow-hidden p-0">
+      <CardHeader className="mb-0 border-b border-border px-5 py-4">
         <CardTitle>Configuração completa</CardTitle>
+        {run ? (
+          <span className="text-xs text-muted-foreground">
+            {sectionRowCount(sections)} parâmetros
+          </span>
+        ) : null}
       </CardHeader>
-      <CardContent className="grid grid-cols-1 gap-x-8 sm:grid-cols-2">
-        <div className="divide-y divide-border">
-          {rows.map((c) => (
-            <StatRow key={c.label} label={c.label} value={c.value} />
-          ))}
-        </div>
+      <CardContent className="flex flex-col gap-5 p-5">
+        {sections.map((section) => (
+          <ParamSection key={section.title} title={section.title} rows={section.rows} />
+        ))}
+        {run && (
+          <div className="rounded-xl border border-border bg-muted/20">
+            <div className="border-b border-border px-4 py-3">
+              <h3 className="text-sm font-semibold text-foreground">JSON bruto</h3>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                Espelho literal do `config` salvo no backend.
+              </p>
+            </div>
+            <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-relaxed text-foreground">
+              {JSON.stringify(run.config, null, 2)}
+            </pre>
+          </div>
+        )}
       </CardContent>
     </Card>
   )
+}
+
+type ConfigRow = { label: string; value: React.ReactNode; raw?: string }
+type ConfigSection = { title: string; rows: ConfigRow[] }
+
+function configSectionsFromRun(run: BackendTrainingRun): ConfigSection[] {
+  const config = objectRecord(run.config) ?? {}
+  const knownTopLevel = new Set(["split", "resource_policy", "ultralytics"])
+  const directConfigRows = Object.entries(config)
+    .filter(([, value]) => !isPlainObject(value) && !Array.isArray(value))
+    .map(([key, value]) => configRow(key, value))
+
+  const sections: ConfigSection[] = [
+    {
+      title: "Execução",
+      rows: [
+        configRow("training_run_id", run.id),
+        configRow("status", run.status),
+        configRow("progress", `${Math.round(run.progress)}%`),
+        configRow("model_family", run.model_family),
+        configRow("base_model", run.base_model),
+        configRow("dataset_release_id", run.dataset_release_id),
+        configRow("mlflow_run_id", run.mlflow_run_id),
+        configRow("created_at", formatDateTimePt(run.created_at)),
+        configRow("updated_at", formatDateTimePt(run.updated_at)),
+      ],
+    },
+    { title: "Parâmetros principais", rows: directConfigRows },
+  ]
+
+  const resourceRows = configRowsFromObject(config.resource_policy)
+  if (resourceRows.length) sections.push({ title: "Recursos", rows: resourceRows })
+
+  const ultralyticsRows = configRowsFromObject(config.ultralytics)
+  if (ultralyticsRows.length) sections.push({ title: "Ultralytics", rows: ultralyticsRows })
+
+  const splitRows = configRowsFromObject(config.split)
+  if (splitRows.length) sections.push({ title: "Dataset e divisão", rows: splitRows })
+
+  const extraRows = Object.entries(config)
+    .filter(([key, value]) => !knownTopLevel.has(key) && (isPlainObject(value) || Array.isArray(value)))
+    .flatMap(([key, value]) => configRowsFromObject(value, key))
+  if (extraRows.length) sections.push({ title: "Outros", rows: extraRows })
+
+  return sections.filter((section) => section.rows.length)
+}
+
+function configRowsFromObject(value: unknown, prefix = ""): ConfigRow[] {
+  if (Array.isArray(value)) {
+    return value.map((item, index) => configRow(`${prefix}[${index}]`, item))
+  }
+  if (!isPlainObject(value)) return []
+  return Object.entries(value).flatMap(([key, child]) => {
+    const label = prefix ? `${prefix}.${key}` : key
+    if (isPlainObject(child) || Array.isArray(child)) return configRowsFromObject(child, label)
+    return [configRow(label, child)]
+  })
+}
+
+function configRow(label: string, value: unknown): ConfigRow {
+  const formatted = formatConfigValue(value)
+  return { label: humanizeConfigKey(label), value: formatted, raw: typeof formatted === "string" ? formatted : undefined }
+}
+
+function ParamSection({ title, rows }: { title: string; rows: ConfigRow[] }) {
+  return (
+    <section className="rounded-xl border border-border">
+      <div className="border-b border-border px-4 py-3">
+        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+      </div>
+      <div className="divide-y divide-border">
+        {rows.map((row) => (
+          <ParamRow key={`${title}-${row.label}`} row={row} />
+        ))}
+      </div>
+    </section>
+  )
+}
+
+function ParamRow({ row }: { row: ConfigRow }) {
+  return (
+    <div className="grid grid-cols-1 gap-1 px-4 py-3 text-sm sm:grid-cols-[220px_minmax(0,1fr)] sm:gap-4">
+      <span className="text-muted-foreground">{row.label}</span>
+      <span className="min-w-0 break-words font-medium tabular-nums text-foreground" title={row.raw}>
+        {row.value}
+      </span>
+    </div>
+  )
+}
+
+function sectionRowCount(sections: ConfigSection[]) {
+  return sections.reduce((total, section) => total + section.rows.length, 0)
+}
+
+function formatConfigValue(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "--"
+  if (typeof value === "boolean") return value ? "true" : "false"
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "--"
+  if (typeof value === "string") return value
+  return JSON.stringify(value)
+}
+
+function humanizeConfigKey(key: string) {
+  const labels: Record<string, string> = {
+    model_name: "Modelo",
+    epochs: "Épocas",
+    image_size: "Imagem (imgsz)",
+    batch_size: "Batch size",
+    workers: "Workers",
+    device: "Device",
+    seed: "Seed",
+    patience: "Patience",
+    optimizer: "Optimizer",
+    cos_lr: "Cosine LR",
+    amp: "AMP",
+    resource_policy: "Resource policy",
+    device_label: "Device label",
+    training_run_id: "Training run",
+    model_family: "Família",
+    base_model: "Modelo base",
+    dataset_release_id: "Dataset release",
+    mlflow_run_id: "MLflow run",
+    created_at: "Criado em",
+    updated_at: "Atualizado em",
+    dataType: "Tipo de dados",
+    groupBy: "Agrupar por",
+    minDistance: "Distância mínima",
+    keepTracks: "Manter tracks",
+    preserveGroups: "Preservar grupos",
+    lockTest: "Bloquear test",
+    augPreset: "Augmentation preset",
+    augApplyIn: "Augmentation aplicar em",
+    augMode: "Augmentation modo",
+  }
+  return labels[key] ?? labels[key.split(".").pop() ?? key] ?? key
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value)
 }

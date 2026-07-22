@@ -143,6 +143,45 @@ class TaskRead(OrmModel):
     updated_at: datetime
 
 
+class TaskAssigneeUpdate(BaseModel):
+    user_id: str | None = None
+
+
+class TaskDeleteBlockingJob(BaseModel):
+    id: str
+    kind: str
+    status: str
+    name: str
+    detail: str | None = None
+
+
+class TaskDeleteImpactRead(BaseModel):
+    task_id: str
+    task_external_id: str
+    task_name: str
+    image_count: int
+    annotations: int
+    inference_suggestions: int
+    labels: int
+    cvat_jobs: int
+    dataset_releases: int
+    derived_assets: int
+    pipeline_runs: int
+    active_jobs: list[TaskDeleteBlockingJob] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    blocking: bool = False
+
+
+class TaskDeleteResultRead(BaseModel):
+    task_id: str
+    task_external_id: str
+    task_name: str
+    cvat_deleted: bool
+    deleted: dict[str, int] = Field(default_factory=dict)
+    preserved: dict[str, int] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class CvatLabelRead(OrmModel):
     id: str
     external_id: str
@@ -154,6 +193,13 @@ class CvatLabelRead(OrmModel):
     raw: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
+
+
+class LabelColorUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    color: str = Field(min_length=1, max_length=64)
+    project_external_id: str | None = Field(default=None, max_length=64)
+    task_external_id: str | None = Field(default=None, max_length=64)
 
 
 class TaskDataMetaRead(OrmModel):
@@ -242,6 +288,7 @@ class ManualAnnotationShape(BaseModel):
     client_id: str
     shape_type: Literal["rectangle", "polygon", "points"]
     label_name: str
+    label_color: str | None = Field(default=None, max_length=64)
     points: list[float] = Field(default_factory=list)
     bbox_norm: dict[str, float] | None = None
 
@@ -645,6 +692,7 @@ class AuditEventPage(BaseModel):
 class ImportTaskCreate(BaseModel):
     project_id: str | None = None
     name: str = Field(min_length=1, max_length=255)
+    assignee_user_id: str | None = None
     labels: list[dict[str, Any]] = Field(default_factory=list)
     source_path: str | None = Field(default=None, max_length=2048)
     estimated_bytes: int | None = Field(default=None, ge=0)

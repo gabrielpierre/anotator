@@ -76,6 +76,7 @@ def apply_review_decision(
     action = _action_for_decision(decision_value)
     cvat_synced = False
     cvat_error: str | None = None
+    frame_annotations_sent_to_annotation = 0
 
     if annotation is not None:
         if decision_value == "accepted":
@@ -85,6 +86,16 @@ def apply_review_decision(
             after["review_status"] = "needs_annotation"
             after["needs_annotation"] = True
             after["release_ready"] = False
+            after["sent_to_annotation"] = True
+            after["sent_to_annotation_by"] = payload.actor
+            if payload.reason:
+                after["sent_to_annotation_reason"] = payload.reason
+            frame_annotations_sent_to_annotation = _mark_frame_annotations_for_rework(
+                db,
+                annotation,
+                actor=payload.actor,
+                reason=payload.reason,
+            )
         elif decision_value == "corrected":
             label_error = _apply_corrected_label(db, annotation, payload, after)
             if label_error:
@@ -122,6 +133,7 @@ def apply_review_decision(
             "annotation_type": payload.annotation_type or (annotation.annotation_type if annotation else None),
             "action": action,
             "review_state": decision_value,
+            "frame_annotations_sent_to_annotation": frame_annotations_sent_to_annotation,
         },
         cvat_synced=cvat_synced,
         cvat_error=cvat_error,
@@ -150,12 +162,50 @@ def apply_review_decision(
                 "cvat_error": cvat_error,
                 "action": action,
                 "review_state": decision_value,
+                "frame_annotations_sent_to_annotation": frame_annotations_sent_to_annotation,
             },
         )
     )
     db.commit()
     db.refresh(decision)
     return decision
+
+
+def _mark_frame_annotations_for_rework(
+    db: Session,
+    annotation: AnnotationRecord,
+    *,
+    actor: str,
+    reason: str | None,
+) -> int:
+    if annotation.task_external_id is None or annotation.frame is None:
+        return 1
+    rows = list(
+        db.scalars(
+            select(AnnotationRecord).where(
+                AnnotationRecord.task_external_id == annotation.task_external_id,
+                AnnotationRecord.frame == annotation.frame,
+                AnnotationRecord.review_state.not_in(["deleted_by_reviewer", "needs_annotation"]),
+            )
+        ).all()
+    )
+    for row in rows:
+        raw = dict(row.raw or {})
+        raw.update(
+            {
+                "review_status": "needs_annotation",
+                "needs_annotation": True,
+                "release_ready": False,
+                "sent_to_annotation": True,
+                "sent_to_annotation_by": actor,
+            }
+        )
+        if reason:
+            raw["sent_to_annotation_reason"] = reason
+        row.review_state = "needs_annotation"
+        row.raw = raw
+        db.add(row)
+    return len(rows)
 
 
 def save_manual_annotations(
@@ -197,7 +247,7 @@ def save_manual_annotations(
             continue
         label_id = _label_id_for_name(db, label_name, payload.task_external_id)
         if label_id is None:
-            _ensure_local_label(db, task, label_name)
+            _ensure_local_label(db, task, label_name, shape.label_color)
             missing_labels.add(label_name)
 
         points = _absolute_points(shape, frame_width, frame_height)
@@ -209,6 +259,7 @@ def save_manual_annotations(
             "frame": payload.frame,
             "label_id": label_id,
             "label_name": label_name,
+            "label_color": _clean_label_color(shape.label_color),
             "source": "manual",
             "points": points,
             "attributes": [],
@@ -382,26 +433,118 @@ def _manual_external_id(task_external_id: str, frame: int, client_id: str) -> st
     return f"manual:{task_external_id}:{frame}:{safe_client_id or digest}-{digest}"
 
 
-def _ensure_local_label(db: Session, task: Task, name: str) -> None:
+def _ensure_local_label(db: Session, task: Task, name: str, color: str | None = None) -> None:
+    label_color = _clean_label_color(color)
+    if task.project_external_id:
+        existing_project_label = db.scalar(
+            select(CvatLabel).where(
+                CvatLabel.project_external_id == task.project_external_id,
+                CvatLabel.task_external_id.is_(None),
+                CvatLabel.name == name,
+            )
+        )
+        if existing_project_label is None:
+            digest = hashlib.sha1(f"{task.project_external_id}:label:{name}".encode()).hexdigest()[:16]
+            label_color = label_color or "#4f8cff"
+            db.add(
+                CvatLabel(
+                    external_id=f"manual:project:{task.project_external_id}:label:{digest}",
+                    name=name,
+                    color=label_color,
+                    project_external_id=task.project_external_id,
+                    task_external_id=None,
+                    raw={
+                        "origin": "cvat-plus",
+                        "manual": True,
+                        "scope": "project",
+                        "color": label_color,
+                        "project_external_id": task.project_external_id,
+                    },
+                )
+            )
+        else:
+            label_color = label_color or existing_project_label.color
+            if label_color and existing_project_label.color != label_color:
+                existing_project_label.color = label_color
+                existing_project_label.raw = {**(existing_project_label.raw or {}), "color": label_color}
+                db.add(existing_project_label)
+
     existing = db.scalar(
         select(CvatLabel).where(CvatLabel.task_external_id == task.external_id, CvatLabel.name == name)
     )
     if existing is None:
         digest = hashlib.sha1(f"{task.external_id}:{name}".encode()).hexdigest()[:16]
+        label_color = label_color or "#4f8cff"
         label = CvatLabel(
             external_id=f"manual:{task.external_id}:label:{digest}",
             name=name,
-            color="#4f8cff",
+            color=label_color,
+            project_external_id=task.project_external_id,
             task_external_id=task.external_id,
-            raw={"origin": "cvat-plus", "manual": True},
+            raw={
+                "origin": "cvat-plus",
+                "manual": True,
+                "scope": "task",
+                "color": label_color,
+                "project_external_id": task.project_external_id,
+            },
         )
         db.add(label)
+    else:
+        label_color = label_color or existing.color or "#4f8cff"
+        if existing.color != label_color:
+            existing.color = label_color
+            existing.raw = {**(existing.raw or {}), "color": label_color}
+            db.add(existing)
 
-    labels = list(task.labels or [])
-    if not any(isinstance(item, dict) and item.get("name") == name for item in labels):
-        labels.append({"name": name, "color": "#4f8cff", "raw": {"origin": "cvat-plus", "manual": True}})
-        task.labels = labels
-        db.add(task)
+    tasks_to_update = [task]
+    if task.project_external_id:
+        tasks_to_update = list(
+            db.scalars(select(Task).where(Task.project_external_id == task.project_external_id)).all()
+        )
+    for row_task in tasks_to_update:
+        labels = list(row_task.labels or [])
+        next_labels = []
+        changed = False
+        found = False
+        for item in labels:
+            if isinstance(item, dict) and item.get("name") == name:
+                found = True
+                if label_color and item.get("color") != label_color:
+                    item = {
+                        **item,
+                        "color": label_color,
+                        "raw": {**(item.get("raw") if isinstance(item.get("raw"), dict) else {}), "color": label_color},
+                    }
+                    changed = True
+            next_labels.append(item)
+        if found:
+            if changed:
+                row_task.labels = next_labels
+                db.add(row_task)
+            continue
+        labels.append(
+            {
+                "name": name,
+                "color": label_color or "#4f8cff",
+                "raw": {
+                    "origin": "cvat-plus",
+                    "manual": True,
+                    "scope": "project" if task.project_external_id else "task",
+                    "color": label_color or "#4f8cff",
+                    "project_external_id": task.project_external_id,
+                },
+            }
+        )
+        row_task.labels = labels
+        db.add(row_task)
+
+
+def _clean_label_color(color: str | None) -> str | None:
+    if not color:
+        return None
+    value = color.strip()
+    return value if 0 < len(value) <= 64 else None
 
 
 def _canonical_review_decision(decision: str) -> str:
@@ -633,13 +776,24 @@ def _label_name_for_id(db: Session, label_id: int | None, task_external_id: str 
 def _label_id_for_name(db: Session, name: str | None, task_external_id: str | None) -> int | None:
     if not name:
         return None
+    task = db.scalar(select(Task).where(Task.external_id == task_external_id))
+    project_external_id = task.project_external_id if task else None
     labels = list(db.scalars(select(CvatLabel).where(CvatLabel.name == name)).all())
     for label in labels:
-        if label.task_external_id in {task_external_id, None}:
-            return _int_or_none(label.raw.get("id"))
-    if labels:
-        return _int_or_none(labels[0].raw.get("id"))
-    task = db.scalar(select(Task).where(Task.external_id == task_external_id))
+        if label.task_external_id == task_external_id:
+            label_id = _int_or_none(label.raw.get("id"))
+            if label_id is not None:
+                return label_id
+    for label in labels:
+        if label.task_external_id is None and label.project_external_id == project_external_id:
+            label_id = _int_or_none(label.raw.get("id"))
+            if label_id is not None:
+                return label_id
+    for label in labels:
+        if label.task_external_id is None and label.project_external_id is None:
+            label_id = _int_or_none(label.raw.get("id"))
+            if label_id is not None:
+                return label_id
     for raw in task.labels if task else []:
         if isinstance(raw, dict) and raw.get("name") == name:
             return _int_or_none(raw.get("raw", {}).get("id") or raw.get("id"))

@@ -33,6 +33,7 @@ type Box = { x: number; y: number; w: number; h: number }
 type EditSnapshot = { id: number; box?: Box }
 type FrameDimensions = { width: number; height: number }
 type Handle = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
+type SizeFilter = "all" | "small" | "medium" | "large" | "custom"
 type ReviewAnnotation = {
   id: number
   cls: string
@@ -82,11 +83,11 @@ const confOptions: { label: string; value: number }[] = [
   { label: "≥ 0.50", value: 0.5 },
 ]
 
-const sizeOptions: { label: string; value: "all" | "small" | "medium" | "large" }[] = [
+const sizeOptions: { label: string; value: SizeFilter }[] = [
   { label: "Todos", value: "all" },
-  { label: "Pequenas", value: "small" },
-  { label: "Médias", value: "medium" },
-  { label: "Grandes", value: "large" },
+  { label: "Pequenas (< 2%)", value: "small" },
+  { label: "Médias (2-6%)", value: "medium" },
+  { label: "Grandes (> 6%)", value: "large" },
 ]
 
 function clsColor(name: string) {
@@ -273,7 +274,10 @@ export function ReviewWorkspace() {
   const [onlyUnreviewed, setOnlyUnreviewed] = React.useState(false)
   const [onlyThisClass, setOnlyThisClass] = React.useState(false)
   const [minConf, setMinConf] = React.useState(0)
-  const [sizeFilter, setSizeFilter] = React.useState<"all" | "small" | "medium" | "large">("all")
+  const [confidenceInput, setConfidenceInput] = React.useState("")
+  const [sizeFilter, setSizeFilter] = React.useState<SizeFilter>("all")
+  const [boxAreaMinInput, setBoxAreaMinInput] = React.useState("")
+  const [boxAreaMaxInput, setBoxAreaMaxInput] = React.useState("")
   const [openFilter, setOpenFilter] = React.useState<"conf" | "size" | null>(null)
   const canvasRef = React.useRef<HTMLDivElement>(null)
   const scaleRef = React.useRef(scale)
@@ -282,6 +286,7 @@ export function ReviewWorkspace() {
   // ---- Correcao de objeto ----
   const [clsOverride, setClsOverride] = React.useState<Record<number, string>>({})
   const [correcting, setCorrecting] = React.useState(false)
+  const [classEditorOpen, setClassEditorOpen] = React.useState(false)
   const [editSnapshot, setEditSnapshot] = React.useState<EditSnapshot | null>(null)
   const [classQuery, setClassQuery] = React.useState("")
   const correctInputRef = React.useRef<HTMLInputElement>(null)
@@ -323,8 +328,8 @@ export function ReviewWorkspace() {
     [clsOverride],
   )
 
-  const openCorrection = React.useCallback(
-    (id?: number) => {
+  const startCorrection = React.useCallback(
+    (id?: number, options: { openClassEditor?: boolean } = {}) => {
       const targetId = id ?? selectedId
       const target = reviewItems.find((item) => item.id === targetId) ?? reviewItems[0]
       if (!target || target.id === emptyAnnotation.id) return
@@ -332,9 +337,19 @@ export function ReviewWorkspace() {
       setClassQuery(clsOf(target))
       setEditSnapshot({ id: target.id, box: boxState[target.id] })
       setCorrecting(true)
-      requestAnimationFrame(() => correctInputRef.current?.focus())
+      setClassEditorOpen(Boolean(options.openClassEditor))
+      if (options.openClassEditor) {
+        requestAnimationFrame(() => correctInputRef.current?.focus())
+      }
     },
     [boxState, clsOf, reviewItems, selectedId],
+  )
+
+  const openClassEditor = React.useCallback(
+    (id?: number) => {
+      startCorrection(id, { openClassEditor: true })
+    },
+    [startCorrection],
   )
 
   const classSuggestions = React.useMemo(() => {
@@ -345,6 +360,10 @@ export function ReviewWorkspace() {
   }, [classCatalog, classQuery])
 
   const selectedCls = reviewItems.find((a) => a.id === selectedId)?.cls
+  const boxAreaMin = parseOptionalDecimal(boxAreaMinInput)
+  const boxAreaMax = parseOptionalDecimal(boxAreaMaxInput)
+  const hasCustomBoxArea = boxAreaMin !== null || boxAreaMax !== null
+  const hasBoxSizeFilter = sizeFilter !== "all" && (sizeFilter !== "custom" || hasCustomBoxArea)
 
   const toggleClass = React.useCallback((name: string) => {
     setCheckedClasses((prev) => {
@@ -363,14 +382,32 @@ export function ReviewWorkspace() {
         if (onlyUnreviewed && decisions[a.id]) return false
         if (onlyThisClass && selectedCls && a.cls !== selectedCls) return false
         if (a.conf < minConf) return false
-        if (sizeFilter !== "all") {
-          const area = b.w * b.h
-          const bucket = area < 200 ? "small" : area <= 600 ? "medium" : "large"
-          if (bucket !== sizeFilter) return false
+        if (hasBoxSizeFilter) {
+          const areaPct = boxAreaPct(b)
+          if (sizeFilter === "custom") {
+            if (boxAreaMin !== null && areaPct < boxAreaMin) return false
+            if (boxAreaMax !== null && areaPct > boxAreaMax) return false
+          } else {
+            const bucket = boxAreaBucket(areaPct)
+            if (bucket !== sizeFilter) return false
+          }
         }
         return true
       }),
-    [boxState, checkedClasses, onlyUnreviewed, onlyThisClass, selectedCls, minConf, sizeFilter, decisions, reviewItems],
+    [
+      boxAreaMax,
+      boxAreaMin,
+      boxState,
+      checkedClasses,
+      decisions,
+      hasBoxSizeFilter,
+      minConf,
+      onlyThisClass,
+      onlyUnreviewed,
+      reviewItems,
+      selectedCls,
+      sizeFilter,
+    ],
   )
   const total = visibleAnnotations.length
   const hasVisibleAnnotations = total > 0
@@ -504,6 +541,7 @@ export function ReviewWorkspace() {
       setBoxState((prev) => ({ ...prev, [editSnapshot.id]: editSnapshot.box as Box }))
     }
     setCorrecting(false)
+    setClassEditorOpen(false)
     setEditSnapshot(null)
     setClassQuery("")
   }, [editSnapshot])
@@ -512,6 +550,7 @@ export function ReviewWorkspace() {
     const name = classQuery.trim() || clsOf(current)
     setClsOverride((prev) => ({ ...prev, [current.id]: name }))
     setCorrecting(false)
+    setClassEditorOpen(false)
     setEditSnapshot(null)
     setClassQuery("")
     void decide("corrigido", name)
@@ -519,6 +558,7 @@ export function ReviewWorkspace() {
 
   const deleteSelectedAnnotation = React.useCallback(() => {
     setCorrecting(false)
+    setClassEditorOpen(false)
     setEditSnapshot(null)
     setClassQuery("")
     void decide("excluido")
@@ -552,7 +592,7 @@ export function ReviewWorkspace() {
         if (correcting) {
           deleteSelectedAnnotation()
         } else {
-          openCorrection(selectedId)
+          startCorrection(selectedId)
         }
         return
       }
@@ -564,12 +604,12 @@ export function ReviewWorkspace() {
         void decide("anotacao")
       } else if (e.key === "ArrowUp") {
         e.preventDefault()
-        openCorrection()
+        startCorrection()
       }
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [correcting, decide, deleteSelectedAnnotation, openCorrection, selectedId, undo])
+  }, [correcting, decide, deleteSelectedAnnotation, selectedId, startCorrection, undo])
 
   const onWheelZoom = React.useCallback((e: React.WheelEvent) => {
     e.preventDefault()
@@ -633,13 +673,16 @@ export function ReviewWorkspace() {
 
           <div className="flex items-center justify-between px-4 pb-2 pt-6">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">Filtros rápidos</p>
-            {(onlyUnreviewed || onlyThisClass || minConf > 0 || sizeFilter !== "all") && (
+            {(onlyUnreviewed || onlyThisClass || minConf > 0 || hasBoxSizeFilter) && (
               <button
                 onClick={() => {
                   setOnlyUnreviewed(false)
                   setOnlyThisClass(false)
                   setMinConf(0)
+                  setConfidenceInput("")
                   setSizeFilter("all")
+                  setBoxAreaMinInput("")
+                  setBoxAreaMaxInput("")
                 }}
                 className="text-[11px] font-medium text-brand-blue hover:underline"
               >
@@ -660,7 +703,7 @@ export function ReviewWorkspace() {
             />
             <FilterSelect
               label="Confiança"
-              value={confOptions.find((o) => o.value === minConf)?.label ?? "Todas"}
+              value={confidenceFilterLabel(minConf)}
               active={minConf > 0}
               open={openFilter === "conf"}
               onToggle={() => setOpenFilter((o) => (o === "conf" ? null : "conf"))}
@@ -672,15 +715,33 @@ export function ReviewWorkspace() {
                   selected={o.value === minConf}
                   onClick={() => {
                     setMinConf(o.value)
+                    setConfidenceInput(o.value ? formatConfidenceInput(o.value) : "")
                     setOpenFilter(null)
                   }}
                 />
               ))}
+              <div className="mt-1 border-t border-border px-3 py-2">
+                <label className="text-[11px] font-medium text-muted-foreground">Mínimo personalizado</label>
+                <input
+                  value={confidenceInput}
+                  inputMode="decimal"
+                  placeholder="Ex.: 0,85"
+                  onClick={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onChange={(event) => {
+                    const value = event.target.value
+                    setConfidenceInput(value)
+                    const parsed = parseOptionalDecimal(value)
+                    setMinConf(parsed === null ? 0 : clampNumber(parsed, 0, 1))
+                  }}
+                  className="mt-1 h-8 w-full rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-brand-blue"
+                />
+              </div>
             </FilterSelect>
             <FilterSelect
               label="Tamanho da caixa"
-              value={sizeOptions.find((o) => o.value === sizeFilter)?.label ?? "Todos"}
-              active={sizeFilter !== "all"}
+              value={boxSizeFilterLabel(sizeFilter, boxAreaMin, boxAreaMax)}
+              active={hasBoxSizeFilter}
               open={openFilter === "size"}
               onToggle={() => setOpenFilter((o) => (o === "size" ? null : "size"))}
             >
@@ -691,10 +752,49 @@ export function ReviewWorkspace() {
                   selected={o.value === sizeFilter}
                   onClick={() => {
                     setSizeFilter(o.value)
+                    if (o.value !== "custom") {
+                      setBoxAreaMinInput("")
+                      setBoxAreaMaxInput("")
+                    }
                     setOpenFilter(null)
                   }}
                 />
               ))}
+              <div className="mt-1 border-t border-border px-3 py-2">
+                <p className="text-[11px] font-medium text-muted-foreground">Área personalizada da imagem</p>
+                <div className="mt-1 grid grid-cols-2 gap-2">
+                  <label className="flex min-w-0 flex-col gap-1 text-[11px] text-muted-foreground">
+                    Mín. %
+                    <input
+                      value={boxAreaMinInput}
+                      inputMode="decimal"
+                      placeholder="Ex.: 1"
+                      onClick={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => event.stopPropagation()}
+                      onChange={(event) => {
+                        setBoxAreaMinInput(event.target.value)
+                        setSizeFilter("custom")
+                      }}
+                      className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-brand-blue"
+                    />
+                  </label>
+                  <label className="flex min-w-0 flex-col gap-1 text-[11px] text-muted-foreground">
+                    Máx. %
+                    <input
+                      value={boxAreaMaxInput}
+                      inputMode="decimal"
+                      placeholder="Ex.: 8"
+                      onClick={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => event.stopPropagation()}
+                      onChange={(event) => {
+                        setBoxAreaMaxInput(event.target.value)
+                        setSizeFilter("custom")
+                      }}
+                      className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-brand-blue"
+                    />
+                  </label>
+                </div>
+              </div>
             </FilterSelect>
           </div>
         </aside>
@@ -784,7 +884,7 @@ export function ReviewWorkspace() {
                     }}
                     onDoubleClick={(e) => {
                       e.stopPropagation()
-                      openCorrection(a.id)
+                      openClassEditor(a.id)
                     }}
                     className={cn("absolute select-none transition-opacity", active ? "z-10" : "z-0")}
                     style={{
@@ -833,17 +933,17 @@ export function ReviewWorkspace() {
             </div>
 
             {/* Correção de objeto */}
-            {correcting && (
+            {classEditorOpen && (
               <div
                 className="absolute left-1/2 top-4 z-20 w-[22rem] -translate-x-1/2 rounded-xl border border-border bg-popover p-3 shadow-xl"
                 role="dialog"
-                aria-label="Corrigir anotação"
+                aria-label="Trocar classe da anotação"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <p className="text-sm font-semibold text-foreground">Corrigir anotação #{current.id}</p>
+                    <p className="text-sm font-semibold text-foreground">Trocar classe #{current.id}</p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      Ajuste a caixa no canvas, troque a classe se precisar, salve ou exclua o objeto.
+                      Troque a classe, ajuste a caixa se precisar, salve ou exclua.
                     </p>
                   </div>
                   <button
@@ -905,7 +1005,7 @@ export function ReviewWorkspace() {
                     onClick={deleteSelectedAnnotation}
                     className="inline-flex h-9 items-center gap-2 rounded-lg border border-destructive/40 px-3 text-sm font-medium text-destructive hover:bg-destructive/10"
                   >
-                    <Trash2 className="size-4" /> Excluir objeto
+                    <Trash2 className="size-4" /> Excluir
                   </button>
                   <button
                     type="button"
@@ -922,6 +1022,32 @@ export function ReviewWorkspace() {
                     <Check className="size-4" /> Salvar
                   </button>
                 </div>
+              </div>
+            )}
+
+            {correcting && !classEditorOpen && (
+              <div className="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/15 bg-black/75 px-2 py-2 text-xs text-white shadow-lg backdrop-blur">
+                <button
+                  type="button"
+                  onClick={deleteSelectedAnnotation}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-full px-3 font-medium text-red-200 hover:bg-red-500/20"
+                >
+                  <Trash2 className="size-3.5" /> Excluir
+                </button>
+                <button
+                  type="button"
+                  onClick={cancelCorrection}
+                  className="inline-flex h-8 items-center rounded-full px-3 font-medium text-white/85 hover:bg-white/10"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={saveCorrection}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-full bg-warning px-3 font-semibold text-white hover:brightness-110"
+                >
+                  <Check className="size-3.5" /> Salvar
+                </button>
               </div>
             )}
 
@@ -1023,7 +1149,7 @@ export function ReviewWorkspace() {
                                 aria-label="Excluir anotação"
                                 onClick={(e) => {
                                   e.stopPropagation()
-                                  openCorrection(a.id)
+                                  startCorrection(a.id)
                                 }}
                                 className="hover:text-destructive"
                               >
@@ -1109,7 +1235,7 @@ export function ReviewWorkspace() {
                 <ArrowRight className="size-4" />
               </DecisionButton>
               <DecisionButton
-                onClick={() => openCorrection()}
+                onClick={() => startCorrection()}
                 className="bg-warning text-white hover:brightness-110"
               >
                 <ArrowUp className="size-4" /> <span className="flex-1 text-center">Corrigir objeto</span>{" "}
@@ -1195,6 +1321,51 @@ function DecisionButton({
       {children}
     </button>
   )
+}
+
+function parseOptionalDecimal(value: string) {
+  const normalized = value.trim().replace(",", ".")
+  if (!normalized) return null
+  const parsed = Number(normalized)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value))
+}
+
+function formatConfidenceInput(value: number) {
+  return value.toLocaleString("pt-BR", { maximumFractionDigits: 2 })
+}
+
+function confidenceFilterLabel(value: number) {
+  const preset = confOptions.find((option) => option.value === value)
+  if (preset) return preset.label
+  return `≥ ${formatConfidenceInput(value)}`
+}
+
+function boxAreaPct(box: Box) {
+  return (box.w * box.h) / 100
+}
+
+function boxAreaBucket(areaPct: number): Exclude<SizeFilter, "all" | "custom"> {
+  if (areaPct < 2) return "small"
+  if (areaPct <= 6) return "medium"
+  return "large"
+}
+
+function boxSizeFilterLabel(sizeFilter: SizeFilter, min: number | null, max: number | null) {
+  if (sizeFilter !== "custom") {
+    return sizeOptions.find((option) => option.value === sizeFilter)?.label ?? "Todos"
+  }
+  if (min !== null && max !== null) return `${formatAreaPct(min)}-${formatAreaPct(max)}`
+  if (min !== null) return `≥ ${formatAreaPct(min)}`
+  if (max !== null) return `≤ ${formatAreaPct(max)}`
+  return "Personalizado"
+}
+
+function formatAreaPct(value: number) {
+  return `${value.toLocaleString("pt-BR", { maximumFractionDigits: 1 })}%`
 }
 
 function FilterToggle({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {

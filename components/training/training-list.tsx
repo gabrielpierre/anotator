@@ -3,25 +3,48 @@
 import * as React from "react"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { Plus, Search, Clock, Cpu, TrendingUp, Database, Check, X, ChevronRight } from "lucide-react"
+import {
+  Plus,
+  Search,
+  Clock,
+  Cpu,
+  TrendingUp,
+  Database,
+  Check,
+  X,
+  ChevronRight,
+  MoreHorizontal,
+  Pause,
+  Square,
+  Trash2,
+  ExternalLink,
+} from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/snowui/input"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { StatusBadge, ProgressBar } from "@/components/app/primitives"
-import { fetchDatasetReleases, fetchTrainingRuns } from "@/lib/api/client"
+import {
+  deleteTrainingRun,
+  fetchDatasetReleases,
+  fetchTrainingRuns,
+  pauseTrainingRun,
+  stopTrainingRun,
+} from "@/lib/api/client"
 import { formatDateTimePt, toUiJobStatus, type UiJobStatus } from "@/lib/api/status"
-import type { BackendDatasetRelease, BackendTrainingRun } from "@/lib/api/types"
+import type { BackendDatasetRelease, BackendJobStatus, BackendTrainingRun } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
 export function TrainingList() {
   const [pickerOpen, setPickerOpen] = React.useState(false)
   const [backendRuns, setBackendRuns] = React.useState<BackendTrainingRun[] | null>(null)
   const [backendReleases, setBackendReleases] = React.useState<BackendDatasetRelease[] | null>(null)
+  const [openActionsId, setOpenActionsId] = React.useState<string | null>(null)
+  const [busyAction, setBusyAction] = React.useState<{ id: string; action: "pause" | "stop" | "delete" } | null>(null)
+  const [actionError, setActionError] = React.useState<string | null>(null)
 
-  React.useEffect(() => {
-    const controller = new AbortController()
-    Promise.all([fetchTrainingRuns(controller.signal), fetchDatasetReleases(controller.signal)])
+  const loadData = React.useCallback((signal?: AbortSignal) => {
+    return Promise.all([fetchTrainingRuns(signal), fetchDatasetReleases(signal)])
       .then(([runs, datasetReleases]) => {
         setBackendRuns(runs)
         setBackendReleases(datasetReleases)
@@ -30,13 +53,58 @@ export function TrainingList() {
         setBackendRuns(null)
         setBackendReleases(null)
       })
+  }, [])
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    void loadData(controller.signal)
     return () => controller.abort()
+  }, [loadData])
+
+  React.useEffect(() => {
+    const onClick = () => setOpenActionsId(null)
+    document.addEventListener("click", onClick)
+    return () => document.removeEventListener("click", onClick)
   }, [])
 
   const items = React.useMemo(() => (backendRuns?.length ? backendRuns.map(toTrainingListItem) : []), [backendRuns])
   const running = items.filter((item) => item.status === "executando" || item.status === "na-fila").length
   const completed = items.filter((item) => item.status === "concluido").length
   const bestMap = items.reduce((best, item) => Math.max(best, item.bestMapValue ?? 0), 0)
+
+  async function runAction(id: string, action: "pause" | "stop" | "delete") {
+    const item = items.find((entry) => entry.id === id)
+    if (!item || busyAction) return
+    if (action === "stop" && !window.confirm("Parar este treinamento agora? O job ativo será cancelado.")) return
+    if (
+      action === "delete" &&
+      !window.confirm(
+        "Excluir este treinamento definitivamente? Isso cancela jobs ativos e apaga modelos e artefatos gerados por ele.",
+      )
+    ) {
+      return
+    }
+    setBusyAction({ id, action })
+    setActionError(null)
+    setOpenActionsId(null)
+    try {
+      if (action === "pause") {
+        const updated = await pauseTrainingRun(id)
+        setBackendRuns((runs) => runs?.map((run) => (run.id === id ? updated : run)) ?? null)
+      } else if (action === "stop") {
+        const updated = await stopTrainingRun(id)
+        setBackendRuns((runs) => runs?.map((run) => (run.id === id ? updated : run)) ?? null)
+      } else {
+        await deleteTrainingRun(id)
+        setBackendRuns((runs) => runs?.filter((run) => run.id !== id) ?? null)
+      }
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Não foi possível executar a ação.")
+      await loadData()
+    } finally {
+      setBusyAction(null)
+    }
+  }
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -59,6 +127,12 @@ export function TrainingList() {
         backendReleases={backendReleases}
       />
 
+      {actionError && (
+        <div className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          {actionError}
+        </div>
+      )}
+
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <MetricCard label="Em execução" value={String(running)} hint="fila local" />
         <MetricCard label="Concluídos" value={String(completed)} hint="histórico local" />
@@ -80,51 +154,62 @@ export function TrainingList() {
         <CardContent className="p-0">
           <div className="divide-y divide-border">
             {items.map((t) => (
-              <Link
+              <div
                 key={t.id}
-                href={t.href}
-                className="flex flex-col gap-4 px-5 py-4 transition-colors hover:bg-muted/40 sm:flex-row sm:items-center"
+                className="flex flex-col transition-colors hover:bg-muted/40 sm:flex-row sm:items-center"
               >
-                <div className="flex min-w-0 flex-1 items-center gap-3">
-                  <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
-                    <TrendingUp className="size-5" />
-                  </div>
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate font-medium text-foreground">{t.name}</span>
-                      <StatusBadge status={t.status} />
+                <Link href={t.href} className="flex min-w-0 flex-1 flex-col gap-4 px-5 py-4 sm:flex-row sm:items-center">
+                  <div className="flex min-w-0 flex-1 items-center gap-3">
+                    <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
+                      <TrendingUp className="size-5" />
                     </div>
-                    <p className="truncate text-xs text-muted-foreground">
-                      {t.model} · {t.dataset} · {t.startedAt}
-                    </p>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="truncate font-medium text-foreground">{t.name}</span>
+                        <StatusBadge status={t.status} />
+                      </div>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {t.model} · {t.dataset} · {t.startedAt}
+                      </p>
+                    </div>
                   </div>
-                </div>
 
-                <div className="grid grid-cols-2 gap-4 sm:flex sm:items-center sm:gap-8">
-                  <div className="min-w-[84px]">
-                    <p className="text-xs text-muted-foreground">Época</p>
-                    <p className="text-sm font-medium text-foreground tabular-nums">
-                      {t.epoch} / {t.epochs}
-                    </p>
+                  <div className="grid grid-cols-2 gap-4 sm:flex sm:items-center sm:gap-8">
+                    <div className="min-w-[84px]">
+                      <p className="text-xs text-muted-foreground">Época</p>
+                      <p className="text-sm font-medium text-foreground tabular-nums">
+                        {t.epoch} / {t.epochs}
+                      </p>
+                    </div>
+                    <div className="min-w-[84px]">
+                      <p className="text-xs text-muted-foreground">mAP50-95</p>
+                      <p className="text-sm font-medium text-foreground tabular-nums">{t.bestMap}</p>
+                    </div>
+                    <div className="hidden min-w-[120px] items-center gap-1.5 text-xs text-muted-foreground sm:flex">
+                      <Clock className="size-3.5" />
+                      {t.elapsed}
+                    </div>
+                    <div className="hidden min-w-[120px] items-center gap-1.5 text-xs text-muted-foreground sm:flex">
+                      <Cpu className="size-3.5" />
+                      {t.device}
+                    </div>
                   </div>
-                  <div className="min-w-[84px]">
-                    <p className="text-xs text-muted-foreground">mAP50-95</p>
-                    <p className="text-sm font-medium text-foreground tabular-nums">{t.bestMap}</p>
-                  </div>
-                  <div className="hidden min-w-[120px] items-center gap-1.5 text-xs text-muted-foreground sm:flex">
-                    <Clock className="size-3.5" />
-                    {t.elapsed}
-                  </div>
-                  <div className="hidden min-w-[120px] items-center gap-1.5 text-xs text-muted-foreground sm:flex">
-                    <Cpu className="size-3.5" />
-                    {t.device}
-                  </div>
-                </div>
 
-                <div className="w-full sm:w-40">
-                  <ProgressBar value={t.progress} />
-                </div>
-              </Link>
+                  <div className="w-full sm:w-40">
+                    <ProgressBar value={t.progress} />
+                  </div>
+                </Link>
+                <TrainingRowActions
+                  item={t}
+                  open={openActionsId === t.id}
+                  busyAction={busyAction}
+                  onToggle={(event) => {
+                    event.stopPropagation()
+                    setOpenActionsId((current) => (current === t.id ? null : t.id))
+                  }}
+                  onAction={(action) => void runAction(t.id, action)}
+                />
+              </div>
             ))}
             {items.length === 0 && (
               <p className="px-5 py-6 text-center text-sm text-muted-foreground">Nenhum treinamento registrado.</p>
@@ -140,6 +225,7 @@ type TrainingListItem = {
   id: string
   href: string
   name: string
+  rawStatus: BackendJobStatus
   status: UiJobStatus
   model: string
   dataset: string
@@ -153,6 +239,84 @@ type TrainingListItem = {
   progress: number
 }
 
+function TrainingRowActions({
+  item,
+  open,
+  busyAction,
+  onToggle,
+  onAction,
+}: {
+  item: TrainingListItem
+  open: boolean
+  busyAction: { id: string; action: "pause" | "stop" | "delete" } | null
+  onToggle: (event: React.MouseEvent<HTMLButtonElement>) => void
+  onAction: (action: "pause" | "stop" | "delete") => void
+}) {
+  const canPause = item.rawStatus === "queued" || item.rawStatus === "running"
+  const canStop = canPause || item.rawStatus === "paused"
+  const busy = busyAction?.id === item.id ? busyAction.action : null
+
+  return (
+    <div className="relative flex items-center justify-end px-5 pb-4 sm:px-4 sm:py-4">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="inline-flex size-9 items-center justify-center rounded-full text-muted-foreground hover:bg-muted hover:text-foreground"
+        aria-label={`Ações do treinamento ${item.name}`}
+        aria-expanded={open}
+      >
+        <MoreHorizontal className="size-4" />
+      </button>
+      {open && (
+        <div
+          className="absolute right-4 top-[calc(100%-0.5rem)] z-20 w-56 overflow-hidden rounded-xl border border-border bg-card p-1 shadow-lg sm:top-[calc(100%-0.25rem)]"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <Link
+            href={item.href}
+            className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-foreground hover:bg-muted"
+          >
+            <ExternalLink className="size-4 text-muted-foreground" />
+            Abrir detalhes
+          </Link>
+          {canPause && (
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => onAction("pause")}
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              <Pause className="size-4 text-muted-foreground" />
+              {busy === "pause" ? "Pausando..." : "Pausar"}
+            </button>
+          )}
+          {canStop && (
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => onAction("stop")}
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              <Square className="size-4 text-muted-foreground" />
+              {busy === "stop" ? "Parando..." : "Parar"}
+            </button>
+          )}
+          {canStop && <div className="my-1 h-px bg-border" />}
+          <button
+            type="button"
+            disabled={busyAction !== null}
+            onClick={() => onAction("delete")}
+            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            <Trash2 className="size-4" />
+            {busy === "delete" ? "Excluindo..." : "Excluir"}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function toTrainingListItem(run: BackendTrainingRun): TrainingListItem {
   const epochs = numberFromRecord(run.config, "epochs", 100)
   const epoch = numberFromRecord(run.metrics, "epoch", Math.round((run.progress / 100) * epochs))
@@ -162,6 +326,7 @@ function toTrainingListItem(run: BackendTrainingRun): TrainingListItem {
     id: run.id,
     href: `/treinar/${run.id}`,
     name: String(run.config.model_name ?? `Training ${model}`),
+    rawStatus: run.status,
     status: toUiJobStatus(run.status),
     model,
     dataset: run.dataset_release_id.slice(0, 8),

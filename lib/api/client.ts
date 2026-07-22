@@ -16,6 +16,7 @@ import type {
   BackendJob,
   BackendJobCapacity,
   BackendJobMetrics,
+  BackendLabelColorUpdate,
   BackendModelVersion,
   BackendModelVersionCreate,
   BackendModelVersionUpdate,
@@ -36,6 +37,8 @@ import type {
   BackendReviewQueueItem,
   BackendTask,
   BackendTaskDataMeta,
+  BackendTaskDeleteImpact,
+  BackendTaskDeleteResult,
   BackendTrainingRun,
   BackendTrainingRunCreate,
   BackendUser,
@@ -111,7 +114,7 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
     signal,
   })
   if (!response.ok) {
-    throw new Error(`Backend request failed: ${response.status} ${response.statusText}`)
+    throw await backendError(response)
   }
   return response.json() as Promise<T>
 }
@@ -125,7 +128,7 @@ async function postJson<T>(path: string, body: unknown, signal?: AbortSignal): P
     body: JSON.stringify(body),
   })
   if (!response.ok) {
-    throw new Error(`Backend request failed: ${response.status} ${response.statusText}`)
+    throw await backendError(response)
   }
   return response.json() as Promise<T>
 }
@@ -139,7 +142,7 @@ async function putJson<T>(path: string, body: unknown, signal?: AbortSignal): Pr
     body: JSON.stringify(body),
   })
   if (!response.ok) {
-    throw new Error(`Backend request failed: ${response.status} ${response.statusText}`)
+    throw await backendError(response)
   }
   return response.json() as Promise<T>
 }
@@ -153,7 +156,7 @@ async function patchJson<T>(path: string, body: unknown, signal?: AbortSignal): 
     body: JSON.stringify(body),
   })
   if (!response.ok) {
-    throw new Error(`Backend request failed: ${response.status} ${response.statusText}`)
+    throw await backendError(response)
   }
   return response.json() as Promise<T>
 }
@@ -166,9 +169,30 @@ async function deleteJson<T>(path: string, signal?: AbortSignal): Promise<T> {
     signal,
   })
   if (!response.ok) {
-    throw new Error(`Backend request failed: ${response.status} ${response.statusText}`)
+    throw await backendError(response)
   }
   return response.json() as Promise<T>
+}
+
+async function backendError(response: Response) {
+  const fallback = `Backend request failed: ${response.status} ${response.statusText}`
+  try {
+    const payload = await response.json()
+    const detail = payload?.detail
+    if (typeof detail === "string" && detail.trim()) {
+      return new Error(detail)
+    }
+    if (detail && typeof detail === "object") {
+      const message = detail.message
+      if (typeof message === "string" && message.trim()) {
+        return new Error(message)
+      }
+      return new Error(JSON.stringify(detail))
+    }
+  } catch {
+    return new Error(fallback)
+  }
+  return new Error(fallback)
 }
 
 export function fetchCvatStatus(signal?: AbortSignal) {
@@ -246,8 +270,25 @@ export function fetchTaskDataMeta(taskId: string, signal?: AbortSignal) {
   return getJson<BackendTaskDataMeta>(`/tasks/${encodeURIComponent(taskId)}/data-meta`, signal)
 }
 
+export function fetchTaskDeleteImpact(taskId: string, signal?: AbortSignal) {
+  return getJson<BackendTaskDeleteImpact>(`/tasks/${encodeURIComponent(taskId)}/delete-impact`, signal)
+}
+
+export function assignTaskAssignee(taskId: string, userId: string | null, signal?: AbortSignal) {
+  return patchJson<BackendTask>(`/tasks/${encodeURIComponent(taskId)}/assignee`, { user_id: userId }, signal)
+}
+
+export function deleteTask(taskId: string, options: { deleteCvat?: boolean } = {}, signal?: AbortSignal) {
+  const query = new URLSearchParams({ delete_cvat: String(options.deleteCvat ?? true) })
+  return deleteJson<BackendTaskDeleteResult>(`/tasks/${encodeURIComponent(taskId)}?${query.toString()}`, signal)
+}
+
 export function fetchLabels(signal?: AbortSignal) {
   return getJson<BackendCvatLabel[]>("/labels", signal)
+}
+
+export function updateLabelColor(payload: BackendLabelColorUpdate, signal?: AbortSignal) {
+  return patchJson<BackendCvatLabel[]>("/labels/color", payload, signal)
 }
 
 export function fetchJobs(signal?: AbortSignal) {
@@ -340,8 +381,26 @@ export function fetchDatasetReleases(signal?: AbortSignal) {
   return getJson<BackendDatasetRelease[]>("/dataset-releases", signal)
 }
 
+export function fetchDatasetRelease(releaseId: string, signal?: AbortSignal) {
+  return getJson<BackendDatasetRelease>(`/dataset-releases/${encodeURIComponent(releaseId)}`, signal)
+}
+
 export function createDatasetRelease(payload: BackendDatasetReleaseCreate, signal?: AbortSignal) {
   return postJson<BackendDatasetRelease>("/dataset-releases", payload, signal)
+}
+
+export function deleteDatasetRelease(releaseId: string, signal?: AbortSignal) {
+  return deleteJson<{
+    id: string
+    deleted: boolean
+    canceled_jobs: string[]
+    deleted_objects: number
+    deleted_artifact_records: number
+    artifact_errors: string[]
+  }>(
+    `/dataset-releases/${encodeURIComponent(releaseId)}`,
+    signal,
+  )
 }
 
 export function fetchDatasetReleaseArtifacts(releaseId: string, signal?: AbortSignal) {
@@ -372,6 +431,29 @@ export function createTrainingRun(payload: BackendTrainingRunCreate, signal?: Ab
   return postJson<BackendTrainingRun>("/training-runs", payload, signal)
 }
 
+export function pauseTrainingRun(runId: string, signal?: AbortSignal) {
+  return postJson<BackendTrainingRun>(`/training-runs/${encodeURIComponent(runId)}/pause`, {}, signal)
+}
+
+export function stopTrainingRun(runId: string, signal?: AbortSignal) {
+  return postJson<BackendTrainingRun>(`/training-runs/${encodeURIComponent(runId)}/stop`, {}, signal)
+}
+
+export function deleteTrainingRun(runId: string, signal?: AbortSignal) {
+  return deleteJson<{
+    id: string
+    deleted: boolean
+    canceled_jobs: string[]
+    deleted_models: number
+    deleted_artifact_records: number
+    deleted_objects: number
+    artifact_errors: string[]
+  }>(
+    `/training-runs/${encodeURIComponent(runId)}`,
+    signal,
+  )
+}
+
 export function trainingRunEventsUrl(runId: string) {
   return withApiKeyQuery(`${apiBaseUrl()}/training-runs/${encodeURIComponent(runId)}/events`)
 }
@@ -394,6 +476,18 @@ export function promoteModelVersion(modelId: string, signal?: AbortSignal) {
 
 export function archiveModelVersion(modelId: string, signal?: AbortSignal) {
   return postJson<BackendModelVersion>(`/models/${encodeURIComponent(modelId)}/archive`, {}, signal)
+}
+
+export function deleteModelVersion(modelId: string, signal?: AbortSignal) {
+  return deleteJson<{
+    model_id: string
+    name: string
+    version: string
+    artifact_objects: number
+    artifact_records: number
+    inference_suggestions: number
+    warnings: string[]
+  }>(`/models/${encodeURIComponent(modelId)}`, signal)
 }
 
 export function modelDownloadPath(modelId: string) {
@@ -441,6 +535,12 @@ export function artifactDownloadPathFromUri(uri: string) {
   return `/artifacts/${encodeURIComponent(encoded)}/download`
 }
 
+export function artifactAssetUrlFromUri(uri: string) {
+  const url = new URL(`${apiBaseUrl()}${artifactDownloadPathFromUri(uri)}`)
+  url.searchParams.set("inline", "true")
+  return withApiKeyQuery(url.toString())
+}
+
 export function createImportTask(payload: BackendImportTaskCreate, signal?: AbortSignal) {
   return postJson<BackendImportJob>("/imports/tasks", payload, signal)
 }
@@ -467,6 +567,7 @@ export function uploadImportTaskFilesWithProgress(
   onProgress: (progress: { loaded: number; total: number; percent: number }) => void,
 ) {
   return new Promise<BackendImportJob>((resolve, reject) => {
+    const filesTotal = files.reduce((total, file) => total + file.size, 0)
     const form = new FormData()
     files.forEach((file) => form.append("files", file))
 
@@ -479,8 +580,20 @@ export function uploadImportTaskFilesWithProgress(
     if (key) request.setRequestHeader("X-API-Key", key)
     if (token) request.setRequestHeader("Authorization", `Bearer ${token}`)
 
+    onProgress({ loaded: 0, total: filesTotal, percent: 0 })
+    request.upload.onloadstart = () => {
+      onProgress({ loaded: 0, total: filesTotal, percent: filesTotal > 0 ? 1 : 0 })
+    }
     request.upload.onprogress = (event) => {
-      if (!event.lengthComputable) return
+      if (!event.lengthComputable) {
+        const percent = filesTotal > 0 ? Math.min(95, Math.round((event.loaded / filesTotal) * 100)) : 0
+        onProgress({
+          loaded: event.loaded,
+          total: filesTotal,
+          percent,
+        })
+        return
+      }
       onProgress({
         loaded: event.loaded,
         total: event.total,
@@ -489,7 +602,7 @@ export function uploadImportTaskFilesWithProgress(
     }
     request.onload = () => {
       if (request.status >= 200 && request.status < 300) {
-        onProgress({ loaded: 1, total: 1, percent: 100 })
+        onProgress({ loaded: filesTotal, total: filesTotal, percent: 100 })
         resolve(JSON.parse(request.responseText) as BackendImportJob)
       } else {
         reject(new Error(uploadErrorMessage(request)))
