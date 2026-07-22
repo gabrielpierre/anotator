@@ -21,12 +21,18 @@ import {
   Trash2,
   Check,
   Plus,
+  MoreHorizontal,
+  Pencil,
+  ArrowRightLeft,
+  X,
+  AlertTriangle,
 } from "lucide-react"
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import {
   createInferenceRun,
+  deleteLabel,
   deleteInferenceSuggestions,
+  fetchLabelImpact,
   fetchLabels,
   fetchModelVersions,
   fetchInferenceSuggestions,
@@ -34,15 +40,19 @@ import {
   fetchTaskDataMeta,
   fetchTasks,
   jobsEventsUrl,
+  mapLabel,
+  renameLabel,
   saveManualAnnotations,
   taskFrameAssetUrl,
   updateLabelColor,
+  updateInferenceSuggestionStatus,
 } from "@/lib/api/client"
 import { labelsFromTasks } from "@/lib/api/status"
 import { useCurrentUser } from "@/lib/auth/user-context"
 import type {
   BackendAnnotationRecord,
   BackendCvatLabel,
+  BackendLabelImpact,
   BackendInferenceSuggestion,
   BackendManualAnnotationShape,
   BackendModelVersion,
@@ -69,6 +79,8 @@ const tools: { icon: typeof MousePointer2; label: string; tool: ToolKey; key: st
 ]
 
 type ClassItem = { name: string; color: string; parent?: string }
+type ClassActionMode = "rename" | "map" | "delete"
+type ClassActionTarget = { mode: ClassActionMode; cls: ClassItem }
 
 const initialClassList: ClassItem[] = []
 
@@ -157,6 +169,12 @@ export function AnnotateView() {
   const [classList, setClassList] = useState<ClassItem[]>(() => initialClassList)
   // Nenhuma classe ativa por padrão: o usuário desenha primeiro e escolhe a classe depois.
   const [activeClass, setActiveClass] = useState<string | null>(null)
+  const [classActionMenu, setClassActionMenu] = useState<string | null>(null)
+  const [classActionDialog, setClassActionDialog] = useState<ClassActionTarget | null>(null)
+  const [classActionValue, setClassActionValue] = useState("")
+  const [classActionImpact, setClassActionImpact] = useState<BackendLabelImpact | null>(null)
+  const [classActionError, setClassActionError] = useState<string | null>(null)
+  const [classActionSubmitting, setClassActionSubmitting] = useState(false)
   const colorFor = useCallback(
     (cls: string) => {
       const item = classList.find((c) => c.name === cls)
@@ -196,6 +214,8 @@ export function AnnotateView() {
   const [saved, setSaved] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
+  const [dismissedCanvasHints, setDismissedCanvasHints] = useState<Record<string, true>>({})
+  const [activeSuggestionHints, setActiveSuggestionHints] = useState<Record<string, true>>({})
 
   // ---- Navegação de imagens ----
   const [imageIndex, setImageIndex] = useState(0)
@@ -300,6 +320,40 @@ export function AnnotateView() {
   const suggestions = backendSuggestions
     .filter((suggestion) => suggestion.frame === currentFrame)
     .map(mapBackendSuggestion)
+  const visibleSuggestions = suggestions.filter((suggestion) => !hiddenLayers.includes(suggestion.origin.model_id))
+  const suggestionHintKey = `suggestions:${currentFrameKey}`
+  const showSuggestionHint = Boolean(
+    (visibleSuggestions.length > 0 || activeSuggestionHints[suggestionHintKey]) && !dismissedCanvasHints[suggestionHintKey],
+  )
+  const toolHintText =
+    tool === "box"
+      ? activeClass
+        ? `Arraste para desenhar como "${activeClass}" · duplo clique troca a classe`
+        : "Arraste para desenhar · escolha a classe depois no autocomplete"
+      : tool === "polygon"
+        ? polyDraft?.length
+          ? "Clique no primeiro ponto para fechar · Enter ou duplo-clique finaliza · Esc cancela"
+          : "Clique para adicionar o primeiro vértice do polígono"
+        : tool === "point"
+          ? "Clique para adicionar um ponto"
+          : tool === "pan"
+            ? "Arraste para mover · scroll para zoom"
+            : tool === "select"
+              ? "Clique para selecionar · arraste para mover · Delete remove"
+              : activeClass
+                ? `Clique em um objeto para aplicar "${activeClass}"`
+                : "Clique em um objeto para escolher a classe"
+  const toolHintKey = `tool:${currentFrameKey}:${tool}:${activeClass ?? ""}:${polyDraft?.length ? "draft" : "idle"}`
+  const dismissCanvasHint = (key: string) => {
+    setDismissedCanvasHints((previous) => (previous[key] ? previous : { ...previous, [key]: true }))
+  }
+
+  useEffect(() => {
+    if (visibleSuggestions.length === 0) return
+    setActiveSuggestionHints((previous) =>
+      previous[suggestionHintKey] ? previous : { ...previous, [suggestionHintKey]: true },
+    )
+  }, [suggestionHintKey, visibleSuggestions.length])
 
   const layerUnit = (m: ModelInfo) =>
     m.task === "Segmentação" ? "máscaras" : m.task === "Classificação" ? "labels" : "sugestões"
@@ -467,6 +521,7 @@ export function AnnotateView() {
     const el = containerRef.current
     if (!el) return
     const onWheel = (e: WheelEvent) => {
+      if ((e.target as HTMLElement | null)?.closest("[data-canvas-scroll-area]")) return
       e.preventDefault()
       const rect = el.getBoundingClientRect()
       const cx = rect.left + rect.width / 2
@@ -630,6 +685,167 @@ export function AnnotateView() {
     },
     [classList, currentClassScopeKey, currentProjectExternalId, currentTask?.external_id],
   )
+
+  const classActionSourceName = classActionDialog?.cls.name ?? null
+
+  useEffect(() => {
+    if (!classActionMenu) return
+    const close = () => setClassActionMenu(null)
+    window.addEventListener("click", close)
+    return () => window.removeEventListener("click", close)
+  }, [classActionMenu])
+
+  useEffect(() => {
+    if (!classActionSourceName) return
+    const controller = new AbortController()
+    setClassActionImpact(null)
+    setClassActionError(null)
+    fetchLabelImpact(
+      {
+        name: classActionSourceName,
+        projectExternalId: currentProjectExternalId,
+        taskExternalId: currentProjectExternalId ? null : currentTask?.external_id,
+      },
+      controller.signal,
+    )
+      .then(setClassActionImpact)
+      .catch((error) => {
+        if (!controller.signal.aborted) setClassActionError(classActionErrorMessage(error))
+      })
+    return () => controller.abort()
+  }, [classActionSourceName, currentProjectExternalId, currentTask?.external_id])
+
+  const openClassAction = (mode: ClassActionMode, cls: ClassItem) => {
+    setClassActionMenu(null)
+    setClassActionDialog({ mode, cls })
+    setClassActionValue(mode === "rename" ? cls.name : "")
+    setClassActionError(null)
+    setClassActionImpact(null)
+  }
+
+  const rewriteLocalClassReferences = useCallback(
+    (sourceName: string, targetName: string | null) => {
+      const sourceLower = sourceName.toLowerCase()
+      const targetLower = targetName?.toLowerCase() ?? null
+      const rewriteItems = (items: ClassItem[]) => {
+        if (!targetName) {
+          return items
+            .filter((item) => item.name.toLowerCase() !== sourceLower)
+            .map((item) => (item.parent?.toLowerCase() === sourceLower ? { ...item, parent: undefined } : item))
+        }
+        const targetExists = items.some((item) => item.name.toLowerCase() === targetLower)
+        return items
+          .filter((item) => !(targetExists && item.name.toLowerCase() === sourceLower))
+          .map((item) => {
+            if (item.name.toLowerCase() === sourceLower) return { ...item, name: targetName }
+            if (item.parent?.toLowerCase() === sourceLower) return { ...item, parent: targetName }
+            return item
+          })
+      }
+
+      setClassList((prev) => mergeClassItems(rewriteItems(prev)))
+      setLocalProjectClasses((prev) => {
+        const current = mergeClassItems(prev[currentClassScopeKey] ?? [], classList)
+        return { ...prev, [currentClassScopeKey]: mergeClassItems(rewriteItems(current)) }
+      })
+      setActiveClass((current) => (current?.toLowerCase() === sourceLower ? targetName : current))
+
+      if (targetName) {
+        setShapesByFrame((prev) => {
+          const next: Record<string, Shape[]> = {}
+          let changed = false
+          for (const [key, frameShapes] of Object.entries(prev)) {
+            next[key] = frameShapes.map((shape) => {
+              if (shape.cls.toLowerCase() !== sourceLower) return shape
+              changed = true
+              return { ...shape, cls: targetName }
+            })
+          }
+          return changed ? next : prev
+        })
+        setBackendSuggestions((prev) =>
+          prev.map((suggestion) =>
+            suggestion.label_name?.toLowerCase() === sourceLower
+              ? { ...suggestion, label_name: targetName }
+              : suggestion,
+          ),
+        )
+      } else {
+        setBackendSuggestions((prev) =>
+          prev.filter((suggestion) => suggestion.label_name?.toLowerCase() !== sourceLower),
+        )
+      }
+    },
+    [classList, currentClassScopeKey],
+  )
+
+  const refreshClassSources = useCallback(async () => {
+    const [labelRows, taskRows] = await Promise.all([fetchLabels(), fetchTasks()])
+    setBackendLabels(labelRows)
+    setTasks(taskRows)
+  }, [])
+
+  const submitClassAction = async (event: React.FormEvent) => {
+    event.preventDefault()
+    if (!classActionDialog) return
+    const sourceName = classActionDialog.cls.name
+    const targetName = classActionValue.trim()
+    const scope = {
+      project_external_id: currentProjectExternalId,
+      task_external_id: currentProjectExternalId ? null : currentTask?.external_id ?? null,
+    }
+
+    if (classActionDialog.mode !== "delete" && !targetName) {
+      setClassActionError("Informe a classe de destino.")
+      return
+    }
+    if (classActionDialog.mode === "rename") {
+      const targetExists = classList.some(
+        (item) => item.name.toLowerCase() === targetName.toLowerCase() && item.name.toLowerCase() !== sourceName.toLowerCase(),
+      )
+      if (targetExists) {
+        setClassActionError("Essa classe ja existe. Use mapear para juntar as classes.")
+        return
+      }
+    }
+    if (classActionDialog.mode === "delete") {
+      const localUsage = Object.values(shapesByFrame).reduce(
+        (total, frameShapes) =>
+          total + frameShapes.filter((shape) => shape.cls.toLowerCase() === sourceName.toLowerCase()).length,
+        0,
+      )
+      if (localUsage > 0) {
+        setClassActionError("Ainda ha objetos carregados com essa classe. Mapeie para outra classe antes de excluir.")
+        return
+      }
+    }
+
+    setClassActionSubmitting(true)
+    setClassActionError(null)
+    try {
+      if (classActionDialog.mode === "rename") {
+        await renameLabel({ name: sourceName, new_name: targetName, ...scope })
+        rewriteLocalClassReferences(sourceName, targetName)
+      } else if (classActionDialog.mode === "map") {
+        await mapLabel({ source_name: sourceName, target_name: targetName, ...scope })
+        rewriteLocalClassReferences(sourceName, targetName)
+      } else {
+        await deleteLabel({
+          name: sourceName,
+          projectExternalId: scope.project_external_id,
+          taskExternalId: scope.task_external_id,
+        })
+        rewriteLocalClassReferences(sourceName, null)
+      }
+      await refreshClassSources()
+      setClassActionDialog(null)
+      setClassActionValue("")
+    } catch (error) {
+      setClassActionError(classActionErrorMessage(error))
+    } finally {
+      setClassActionSubmitting(false)
+    }
+  }
 
   const createAndApplyPickerClass = () => {
     if (!classPicker) return
@@ -932,23 +1148,23 @@ export function AnnotateView() {
     return () => window.removeEventListener("keydown", onKey)
   }, [undo, redo, deleteSelected, finishPolygon, polyDraft, classList])
 
-  const persistCurrentFrame = useCallback(async (mode: "manual" | "auto" = "manual") => {
+  const saveFrameShapes = useCallback(async (targetShapes: Shape[], mode: "manual" | "auto" = "manual") => {
     if (!currentTask?.external_id) {
       if (mode === "manual") setSaveError("Nenhuma task CVAT sincronizada para salvar.")
       return
     }
-    if (shapes.some((shape) => !shape.cls.trim())) {
+    if (targetShapes.some((shape) => !shape.cls.trim())) {
       if (mode === "manual") setSaveError("Defina a classe de todos os objetos antes de salvar.")
       return
     }
-    const signature = frameShapesSignature(shapes)
+    const signature = frameShapesSignature(targetShapes)
     setSaving(true)
     setSaveError(null)
     try {
       const records = await saveManualAnnotations({
         task_external_id: currentTask.external_id,
         frame: currentFrame,
-        shapes: shapes.map((shape) => shapeToManualAnnotation(shape, classList)),
+        shapes: targetShapes.map((shape) => shapeToManualAnnotation(shape, classList)),
         actor: currentUser.email || currentUser.id,
         sync_cvat: true,
         replace_existing: true,
@@ -973,7 +1189,50 @@ export function AnnotateView() {
     } finally {
       setSaving(false)
     }
-  }, [classList, currentClassScopeKey, currentFrame, currentFrameKey, currentTask?.external_id, currentUser.email, currentUser.id, shapes])
+  }, [classList, currentClassScopeKey, currentFrame, currentFrameKey, currentTask?.external_id, currentUser.email, currentUser.id])
+
+  const persistCurrentFrame = useCallback(
+    async (mode: "manual" | "auto" = "manual") => saveFrameShapes(shapes, mode),
+    [saveFrameShapes, shapes],
+  )
+
+  const acceptSuggestion = (suggestion: Suggestion) => {
+    setActiveSuggestionHints((previous) =>
+      previous[suggestionHintKey] ? previous : { ...previous, [suggestionHintKey]: true },
+    )
+    const cls = createClassItem(suggestion.cls) ?? suggestion.cls
+    const shape: Shape = {
+      id: nextId.current++,
+      type: "box",
+      cls,
+      conf: suggestion.conf,
+      x: suggestion.x,
+      y: suggestion.y,
+      w: suggestion.w,
+      h: suggestion.h,
+    }
+    const nextShapes = [...shapes, shape]
+    past.current.push(shapes)
+    if (past.current.length > 50) past.current.shift()
+    future.current = []
+    setShapes(nextShapes)
+    setSelectedId(shape.id)
+    setBackendSuggestions((prev) => prev.filter((item) => item.id !== suggestion.backendId))
+    void updateInferenceSuggestionStatus(suggestion.backendId, "accepted").catch(() => {
+      setSaveError("A sugestão foi aceita localmente, mas o backend não confirmou a decisão.")
+    })
+    void saveFrameShapes(nextShapes, "manual")
+  }
+
+  const rejectSuggestion = (suggestion: Suggestion) => {
+    setActiveSuggestionHints((previous) =>
+      previous[suggestionHintKey] ? previous : { ...previous, [suggestionHintKey]: true },
+    )
+    setBackendSuggestions((prev) => prev.filter((item) => item.id !== suggestion.backendId))
+    void updateInferenceSuggestionStatus(suggestion.backendId, "rejected").catch(() => {
+      setSaveError("A sugestão foi rejeitada localmente, mas o backend não confirmou a decisão.")
+    })
+  }
 
   const handleSave = () => {
     void persistCurrentFrame("manual")
@@ -995,6 +1254,7 @@ export function AnnotateView() {
   const pct = (v: number) => `${v * 100}%`
 
   return (
+    <>
     <div className="flex h-[calc(100dvh-3.5rem)] flex-col lg:flex-row">
       {/* Tool rail */}
       <div className="flex shrink-0 items-center gap-1 border-b border-border bg-card px-3 py-2 lg:flex-col lg:border-b-0 lg:border-r lg:py-4">
@@ -1094,6 +1354,15 @@ export function AnnotateView() {
           ref={containerRef}
           className="relative flex flex-1 items-center justify-center overflow-hidden bg-[#0b0d10] p-6 touch-none select-none"
         >
+          {showSuggestionHint && (
+            <button
+              type="button"
+              onClick={() => dismissCanvasHint(suggestionHintKey)}
+              className="absolute top-3 left-1/2 z-20 -translate-x-1/2 rounded-full bg-black/65 px-3 py-1 text-xs text-white/85 shadow-sm backdrop-blur transition-colors hover:bg-black/80"
+            >
+              Sugestões ativas · clique esquerdo aceita · botão direito rejeita
+            </button>
+          )}
           <div
             ref={stageRef}
             className="relative overflow-hidden rounded-lg shadow-2xl"
@@ -1234,36 +1503,51 @@ export function AnnotateView() {
             })}
 
             {/* Sugestões de autoanotação (status: proposed) — visual diferenciado das anotações manuais */}
-            {suggestions
-              .filter((s) => !hiddenLayers.includes(s.origin.model_id))
-              .map((s) => {
-                const color = colorFor(s.cls)
-                return (
-                  <div
-                    key={`sug-${s.id}`}
-                    className="pointer-events-none absolute rounded-[3px] border-2 border-dashed"
+            {visibleSuggestions.map((s) => {
+              const color = colorFor(s.cls)
+              return (
+                <div
+                  key={`sug-${s.backendId}`}
+                  role="button"
+                  tabIndex={0}
+                  title="Clique para aceitar. Botão direito rejeita."
+                  className="pointer-events-auto absolute cursor-pointer rounded-[3px] border-2 border-dashed transition-[box-shadow,background-color] hover:shadow-[0_0_0_3px_rgba(79,140,255,0.28)]"
+                  onPointerDown={(event) => {
+                    if (event.button !== 0) {
+                      event.stopPropagation()
+                      return
+                    }
+                    event.preventDefault()
+                    event.stopPropagation()
+                    acceptSuggestion(s)
+                  }}
+                  onContextMenu={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    rejectSuggestion(s)
+                  }}
+                  style={{
+                    left: pct(s.x),
+                    top: pct(s.y),
+                    width: pct(s.w),
+                    height: pct(s.h),
+                    borderColor: color,
+                    backgroundColor: `color-mix(in oklch, ${color} 10%, transparent)`,
+                  }}
+                >
+                  <span
+                    className="pointer-events-none absolute -top-[22px] left-0 whitespace-nowrap rounded px-1.5 py-0.5 text-xs font-medium text-white/95"
                     style={{
-                      left: pct(s.x),
-                      top: pct(s.y),
-                      width: pct(s.w),
-                      height: pct(s.h),
-                      borderColor: color,
-                      backgroundColor: `color-mix(in oklch, ${color} 10%, transparent)`,
+                      backgroundColor: `color-mix(in oklch, ${color} 75%, black)`,
+                      transform: `scale(${1 / view.s})`,
+                      transformOrigin: "bottom left",
                     }}
                   >
-                    <span
-                      className="pointer-events-none absolute -top-[22px] left-0 whitespace-nowrap rounded px-1.5 py-0.5 text-xs font-medium text-white/95"
-                      style={{
-                        backgroundColor: `color-mix(in oklch, ${color} 75%, black)`,
-                        transform: `scale(${1 / view.s})`,
-                        transformOrigin: "bottom left",
-                      }}
-                    >
-                      {s.cls} {s.conf.toFixed(2)} · {modelLabelFor(s.origin.model_id, s.origin.model_version)}
-                    </span>
-                  </div>
-                )
-              })}
+                    {s.cls} {s.conf.toFixed(2)} · {modelLabelFor(s.origin.model_id, s.origin.model_version)}
+                  </span>
+                </div>
+              )
+            })}
 
             {/* Box draft */}
             {draft && (
@@ -1373,6 +1657,7 @@ export function AnnotateView() {
             <div
               role="dialog"
               aria-label={classPicker.isNew ? "Definir classe do novo objeto" : "Trocar classe do objeto"}
+              data-canvas-scroll-area
               className="absolute z-20 w-56 rounded-lg border border-border bg-popover p-2 shadow-xl"
               style={{
                 left: clamp(classPicker.x, 8, (containerRef.current?.clientWidth ?? 400) - 232),
@@ -1447,23 +1732,15 @@ export function AnnotateView() {
           )}
 
           {/* Hint */}
-          <div className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 text-xs text-white/80 backdrop-blur">
-            {tool === "box" &&
-              (activeClass
-                ? `Arraste para desenhar como "${activeClass}" · duplo clique troca a classe`
-                : "Arraste para desenhar · escolha a classe depois no autocomplete")}
-            {tool === "polygon" &&
-              (polyDraft?.length
-                ? "Clique no primeiro ponto para fechar · Enter ou duplo-clique finaliza · Esc cancela"
-                : "Clique para adicionar o primeiro vértice do polígono")}
-            {tool === "point" && "Clique para adicionar um ponto"}
-            {tool === "pan" && "Arraste para mover · scroll para zoom"}
-            {tool === "select" && "Clique para selecionar · arraste para mover · Delete remove"}
-            {tool === "tag" &&
-              (activeClass
-                ? `Clique em um objeto para aplicar "${activeClass}"`
-                : "Clique em um objeto para escolher a classe")}
-          </div>
+          {!dismissedCanvasHints[toolHintKey] && (
+            <button
+              type="button"
+              onClick={() => dismissCanvasHint(toolHintKey)}
+              className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 text-xs text-white/80 backdrop-blur transition-colors hover:bg-black/80"
+            >
+              {toolHintText}
+            </button>
+          )}
         </div>
 
         {/* Filmstrip: preview das imagens vizinhas do lote */}
@@ -1520,13 +1797,13 @@ export function AnnotateView() {
       </div>
 
       {/* Right panel */}
-      <aside className="flex w-full shrink-0 flex-col gap-4 overflow-y-auto border-t border-border bg-card p-4 lg:w-80 lg:border-l lg:border-t-0">
-        <Card>
-          <CardHeader>
-            <CardTitle>Classes</CardTitle>
+      <aside className="flex w-full shrink-0 flex-col overflow-y-auto border-t border-border bg-card lg:w-80 lg:border-l lg:border-t-0">
+        <section className="border-b border-border px-4 py-4">
+          <div className="mb-3 flex items-center justify-between">
+            <p className="text-sm font-semibold text-foreground">Classes</p>
             <span className="text-xs text-muted-foreground">Atalhos 1-9</span>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-1">
+          </div>
+          <div className="flex flex-col gap-1">
             {classList.map((c, i) => {
               const isActive = activeClass === c.name
               const shortcutIndex = classList.filter((x) => !x.parent).findIndex((x) => x.name === c.name)
@@ -1534,7 +1811,7 @@ export function AnnotateView() {
                 <div key={c.name} className="flex flex-col">
                   <div
                     className={cn(
-                      "group flex items-center justify-between rounded-lg transition-colors",
+                      "group relative flex items-center justify-between rounded-lg transition-colors",
                       isActive ? "bg-muted ring-1 ring-brand-blue/40" : "hover:bg-muted",
                     )}
                   >
@@ -1558,6 +1835,11 @@ export function AnnotateView() {
                     <button
                       type="button"
                       onClick={() => setActiveClass((prev) => (prev === c.name ? null : c.name))}
+                      onDoubleClick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        openClassAction("rename", c)
+                      }}
                       aria-pressed={isActive}
                       title={isActive ? "Clique para desmarcar" : undefined}
                       className="flex min-w-0 flex-1 items-center gap-2 px-1 py-1.5 text-sm"
@@ -1584,7 +1866,50 @@ export function AnnotateView() {
                           {shortcutIndex + 1}
                         </kbd>
                       )}
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          setClassActionMenu((current) => (current === c.name ? null : c.name))
+                        }}
+                        aria-label={`Acoes da classe ${c.name}`}
+                        className="inline-flex size-6 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-background hover:text-foreground group-hover:opacity-100 data-[open=true]:opacity-100"
+                        data-open={classActionMenu === c.name}
+                      >
+                        <MoreHorizontal className="size-4" />
+                      </button>
                     </span>
+                    {classActionMenu === c.name && (
+                      <div
+                        className="absolute right-1 top-8 z-30 w-48 overflow-hidden rounded-xl border border-border bg-card p-1 shadow-xl"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => openClassAction("rename", c)}
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"
+                        >
+                          <Pencil className="size-4 text-muted-foreground" />
+                          Renomear
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => openClassAction("map", c)}
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm hover:bg-muted"
+                        >
+                          <ArrowRightLeft className="size-4 text-muted-foreground" />
+                          Mapear para outra
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => openClassAction("delete", c)}
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-destructive hover:bg-destructive/10"
+                        >
+                          <Trash2 className="size-4" />
+                          Excluir
+                        </button>
+                      </div>
+                    )}
                   </div>
                   {/* Input inline para nova subclasse desta classe */}
                   {addingClass?.parent === c.name && (
@@ -1659,12 +1984,12 @@ export function AnnotateView() {
                 Nova classe
               </button>
             )}
-          </CardContent>
-        </Card>
+          </div>
+        </section>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Objetos ({shapes.length})</CardTitle>
+        <section className="border-b border-border px-4 py-4">
+          <div className="mb-3 flex items-center justify-between">
+            <p className="text-sm font-semibold text-foreground">Objetos ({shapes.length})</p>
             {selectedId != null && (
               <button
                 type="button"
@@ -1675,8 +2000,8 @@ export function AnnotateView() {
                 Remover
               </button>
             )}
-          </CardHeader>
-          <CardContent className="flex max-h-64 flex-col gap-1 overflow-y-auto">
+          </div>
+          <div className="flex max-h-64 flex-col gap-1 overflow-y-auto">
             {shapes.length === 0 && <p className="px-2 py-4 text-sm text-muted-foreground">Nenhum objeto ainda.</p>}
             {shapes.map((s) => (
               <button
@@ -1699,8 +2024,8 @@ export function AnnotateView() {
                 <span className="text-xs tabular-nums text-muted-foreground">#{s.id}</span>
               </button>
             ))}
-          </CardContent>
-        </Card>
+          </div>
+        </section>
 
         <AutoAnnotationCard
           models={annotationModels}
@@ -1737,7 +2062,208 @@ export function AnnotateView() {
         />
       </aside>
     </div>
+    {classActionDialog && (
+      <ClassActionDialog
+        target={classActionDialog}
+        value={classActionValue}
+        impact={classActionImpact}
+        error={classActionError}
+        submitting={classActionSubmitting}
+        classList={classList}
+        onValueChange={setClassActionValue}
+        onClose={() => {
+          if (classActionSubmitting) return
+          setClassActionDialog(null)
+          setClassActionValue("")
+          setClassActionError(null)
+        }}
+        onSubmit={submitClassAction}
+      />
+    )}
+    </>
   )
+}
+
+function ClassActionDialog({
+  target,
+  value,
+  impact,
+  error,
+  submitting,
+  classList,
+  onValueChange,
+  onClose,
+  onSubmit,
+}: {
+  target: ClassActionTarget
+  value: string
+  impact: BackendLabelImpact | null
+  error: string | null
+  submitting: boolean
+  classList: ClassItem[]
+  onValueChange: (value: string) => void
+  onClose: () => void
+  onSubmit: (event: React.FormEvent) => void
+}) {
+  const sourceName = target.cls.name
+  const isDeleteBlocked = target.mode === "delete" && Boolean(impact?.used)
+  const title =
+    target.mode === "rename"
+      ? "Renomear classe"
+      : target.mode === "map"
+        ? "Mapear classe"
+        : "Excluir classe"
+  const description =
+    target.mode === "rename"
+      ? "Troca o nome da classe em todo o projeto. Se o destino ja existe, use mapear."
+      : target.mode === "map"
+        ? "Move anotacoes, sugestoes e assets desta classe para outra."
+        : "Remove a classe do catalogo apenas quando ela nao esta em uso."
+  const destinationSuggestions = classList.filter((item) => item.name.toLowerCase() !== sourceName.toLowerCase())
+  const destinationQuery = value.trim().toLowerCase()
+  const filteredDestinationSuggestions = destinationSuggestions.filter((item) =>
+    item.name.toLowerCase().includes(destinationQuery),
+  )
+  const hasSelectedDestination = destinationSuggestions.some((item) => item.name.toLowerCase() === destinationQuery)
+  const submitLabel = target.mode === "rename" ? "Renomear" : target.mode === "map" ? "Mapear" : "Excluir"
+  const submitDisabled = submitting || isDeleteBlocked || (target.mode === "map" && !hasSelectedDestination)
+  const impactSummary = formatClassImpactSummary(impact)
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+    >
+      <button type="button" aria-label="Fechar" onClick={onClose} className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+      <form
+        onSubmit={onSubmit}
+        className="relative z-10 flex w-full max-w-md flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-xl"
+      >
+        <div className="flex items-start justify-between gap-4 border-b border-border p-5">
+          <div>
+            <h2 className="text-lg font-semibold text-foreground">{title}</h2>
+            <p className="mt-0.5 text-sm text-muted-foreground">{description}</p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            aria-label="Fechar"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
+
+        <div className="flex flex-col gap-4 p-5">
+          <div className="rounded-xl bg-muted px-3 py-2">
+            <div className="flex items-center gap-2">
+              <span className="size-3 rounded-full" style={{ backgroundColor: target.cls.color }} />
+              <span className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{sourceName}</span>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">{impactSummary}</p>
+          </div>
+
+          {target.mode !== "delete" && (
+            <label className="flex flex-col gap-1.5">
+              <span className="text-sm font-medium text-foreground">
+                {target.mode === "rename" ? "Novo nome" : "Classe de destino"}
+              </span>
+              <input
+                autoFocus
+                value={value}
+                onChange={(event) => onValueChange(event.target.value)}
+                placeholder={target.mode === "rename" ? "Ex.: torre" : "Digite para filtrar"}
+                className="h-10 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue"
+              />
+            </label>
+          )}
+
+          {target.mode === "map" && (
+            <div className="flex flex-col gap-2">
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Sugestões de destino</p>
+              {filteredDestinationSuggestions.length ? (
+                <div className="flex flex-wrap gap-2">
+                  {filteredDestinationSuggestions.map((item) => (
+                    <button
+                      key={item.name}
+                      type="button"
+                      onClick={() => onValueChange(item.name)}
+                      className={cn(
+                        "inline-flex h-8 items-center gap-2 rounded-full border px-3 text-sm transition-colors",
+                        value.trim().toLowerCase() === item.name.toLowerCase()
+                          ? "border-brand-blue bg-brand-blue/10 text-brand-blue"
+                          : "border-border bg-background text-foreground hover:border-brand-blue/60",
+                      )}
+                    >
+                      <span className="size-2.5 rounded-full" style={{ backgroundColor: item.color }} />
+                      {item.name}
+                    </button>
+                  ))}
+                </div>
+              ) : destinationSuggestions.length ? (
+                <p className="text-sm text-muted-foreground">Nenhuma classe encontrada.</p>
+              ) : (
+                <p className="text-sm text-muted-foreground">Nenhuma outra classe criada neste projeto.</p>
+              )}
+            </div>
+          )}
+
+          {isDeleteBlocked && (
+            <div className="flex gap-2 rounded-xl border border-destructive/20 bg-destructive/10 p-3 text-sm text-destructive">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <p>Esta classe esta em uso. Mapeie para outra classe antes de excluir.</p>
+            </div>
+          )}
+
+          {error && <div className="rounded-xl bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</div>}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-border p-4">
+          <Button type="button" variant="outline" onClick={onClose} disabled={submitting}>
+            Cancelar
+          </Button>
+          <Button
+            type="submit"
+            disabled={submitDisabled}
+            variant={target.mode === "delete" ? "destructive" : "default"}
+          >
+            {submitting ? "Aplicando..." : submitLabel}
+          </Button>
+        </div>
+      </form>
+    </div>
+  )
+}
+
+function formatClassImpactSummary(impact: BackendLabelImpact | null) {
+  if (!impact) return "Calculando uso da classe..."
+  return [
+    `${impact.annotations} anot.`,
+    `${impact.suggestions} sugest.`,
+    `${impact.derived_assets} assets`,
+    `${impact.task_labels} lotes`,
+  ].join(" · ")
+}
+
+function classActionErrorMessage(error: unknown) {
+  const raw = error instanceof Error ? error.message : String(error || "Nao foi possivel aplicar a acao.")
+  try {
+    const parsed = JSON.parse(raw) as { message?: string }
+    if (parsed.message?.includes("Target label already exists")) {
+      return "Essa classe ja existe. Use mapear para juntar as classes."
+    }
+    if (parsed.message?.includes("Label is in use")) {
+      return "Esta classe esta em uso. Mapeie para outra classe antes de excluir."
+    }
+    if (parsed.message) return parsed.message
+  } catch {
+    // O backend tambem pode retornar erro como string simples.
+  }
+  if (raw.includes("Target label already exists")) return "Essa classe ja existe. Use mapear para juntar as classes."
+  if (raw.includes("Label is in use")) return "Esta classe esta em uso. Mapeie para outra classe antes de excluir."
+  return raw
 }
 
 function modelFamilyFor(model: ModelInfo): "detection" | "segmentation" | "classification" | "tracking" {
@@ -1786,6 +2312,7 @@ function mapBackendSuggestion(suggestion: BackendInferenceSuggestion): Suggestio
       : pointsToBox(suggestion.points)
   return {
     id: numericIdFromString(suggestion.id),
+    backendId: suggestion.id,
     cls: suggestion.label_name ?? "unknown",
     conf: suggestion.score ?? 0,
     x: clamp(Number(box.x ?? 0)),

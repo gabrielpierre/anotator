@@ -153,6 +153,36 @@ export type BackendLabelColorUpdate = {
   task_external_id?: string | null
 }
 
+export type BackendLabelRename = {
+  name: string
+  new_name: string
+  project_external_id?: string | null
+  task_external_id?: string | null
+}
+
+export type BackendLabelMap = {
+  source_name: string
+  target_name: string
+  project_external_id?: string | null
+  task_external_id?: string | null
+}
+
+export type BackendLabelImpact = {
+  name: string
+  labels: number
+  task_labels: number
+  annotations: number
+  suggestions: number
+  derived_assets: number
+  used: boolean
+}
+
+export type BackendLabelActionResult = {
+  labels: BackendCvatLabel[]
+  impact: BackendLabelImpact
+  warnings: string[]
+}
+
 export type BackendTaskDataMeta = {
   id: string
   task_external_id: string

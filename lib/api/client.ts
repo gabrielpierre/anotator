@@ -17,6 +17,10 @@ import type {
   BackendJobCapacity,
   BackendJobMetrics,
   BackendLabelColorUpdate,
+  BackendLabelActionResult,
+  BackendLabelImpact,
+  BackendLabelMap,
+  BackendLabelRename,
   BackendModelVersion,
   BackendModelVersionCreate,
   BackendModelVersionUpdate,
@@ -291,6 +295,35 @@ export function updateLabelColor(payload: BackendLabelColorUpdate, signal?: Abor
   return patchJson<BackendCvatLabel[]>("/labels/color", payload, signal)
 }
 
+export function fetchLabelImpact(
+  params: { name: string; projectExternalId?: string | null; taskExternalId?: string | null },
+  signal?: AbortSignal,
+) {
+  const query = new URLSearchParams({ name: params.name })
+  if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
+  if (params.taskExternalId) query.set("task_external_id", params.taskExternalId)
+  return getJson<BackendLabelImpact>(`/labels/impact?${query.toString()}`, signal)
+}
+
+export function renameLabel(payload: BackendLabelRename, signal?: AbortSignal) {
+  return patchJson<BackendLabelActionResult>("/labels/rename", payload, signal)
+}
+
+export function mapLabel(payload: BackendLabelMap, signal?: AbortSignal) {
+  return postJson<BackendLabelActionResult>("/labels/map", payload, signal)
+}
+
+export function deleteLabel(
+  params: { name: string; projectExternalId?: string | null; taskExternalId?: string | null },
+  signal?: AbortSignal,
+) {
+  const query = new URLSearchParams()
+  if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
+  if (params.taskExternalId) query.set("task_external_id", params.taskExternalId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return deleteJson<BackendLabelActionResult>(`/labels/${encodeURIComponent(params.name)}${suffix}`, signal)
+}
+
 export function fetchJobs(signal?: AbortSignal) {
   return getJson<BackendJob[]>("/jobs", signal)
 }
@@ -348,6 +381,18 @@ export function deleteInferenceSuggestions(
   if (params.frame !== undefined) query.set("frame", String(params.frame))
   if (params.modelId) query.set("model_id", params.modelId)
   return deleteJson<{ deleted: number }>(`/inference-runs/suggestions?${query.toString()}`, signal)
+}
+
+export function updateInferenceSuggestionStatus(
+  suggestionId: string,
+  status: "accepted" | "rejected" | "proposed",
+  signal?: AbortSignal,
+) {
+  return patchJson<BackendInferenceSuggestion>(
+    `/inference-runs/suggestions/${encodeURIComponent(suggestionId)}/status`,
+    { status },
+    signal,
+  )
 }
 
 export function fetchReviewQueue(signal?: AbortSignal) {

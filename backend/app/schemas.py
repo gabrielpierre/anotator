@@ -202,6 +202,36 @@ class LabelColorUpdate(BaseModel):
     task_external_id: str | None = Field(default=None, max_length=64)
 
 
+class LabelRename(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    new_name: str = Field(min_length=1, max_length=255)
+    project_external_id: str | None = Field(default=None, max_length=64)
+    task_external_id: str | None = Field(default=None, max_length=64)
+
+
+class LabelMap(BaseModel):
+    source_name: str = Field(min_length=1, max_length=255)
+    target_name: str = Field(min_length=1, max_length=255)
+    project_external_id: str | None = Field(default=None, max_length=64)
+    task_external_id: str | None = Field(default=None, max_length=64)
+
+
+class LabelImpactRead(BaseModel):
+    name: str
+    labels: int = 0
+    task_labels: int = 0
+    annotations: int = 0
+    suggestions: int = 0
+    derived_assets: int = 0
+    used: bool = False
+
+
+class LabelActionResult(BaseModel):
+    labels: list[CvatLabelRead] = Field(default_factory=list)
+    impact: LabelImpactRead
+    warnings: list[str] = Field(default_factory=list)
+
+
 class TaskDataMetaRead(OrmModel):
     id: str
     task_external_id: str
@@ -341,6 +371,10 @@ class InferenceSuggestionRead(OrmModel):
     raw: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
+
+
+class InferenceSuggestionStatusUpdate(BaseModel):
+    status: Literal["proposed", "accepted", "rejected"]
 
 
 class ClassDistribution(BaseModel):

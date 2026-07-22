@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import db_session
 from app.models import InferenceSuggestion, JobRecord, Task
-from app.schemas import InferenceRunCreate, InferenceSuggestionRead, JobRead
+from app.schemas import InferenceRunCreate, InferenceSuggestionRead, InferenceSuggestionStatusUpdate, JobRead
 from app.services.jobs import attach_celery_task, create_job
 from app.tasks import inference_run_task
 
@@ -75,3 +75,23 @@ def delete_suggestions(
     result = db.execute(query)
     db.commit()
     return {"deleted": result.rowcount or 0}
+
+
+@router.patch("/suggestions/{suggestion_id}/status", response_model=InferenceSuggestionRead)
+def update_suggestion_status(
+    suggestion_id: str,
+    payload: InferenceSuggestionStatusUpdate,
+    db: Session = Depends(db_session),
+) -> InferenceSuggestion:
+    suggestion = db.get(InferenceSuggestion, suggestion_id)
+    if suggestion is None:
+        suggestion = db.scalar(select(InferenceSuggestion).where(InferenceSuggestion.external_id == suggestion_id))
+    if suggestion is None:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+
+    suggestion.status = payload.status
+    suggestion.raw = {**(suggestion.raw or {}), "decision": payload.status}
+    db.add(suggestion)
+    db.commit()
+    db.refresh(suggestion)
+    return suggestion

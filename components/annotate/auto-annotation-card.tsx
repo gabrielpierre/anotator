@@ -13,7 +13,6 @@ import {
   CheckCircle2,
   AlertTriangle,
 } from "lucide-react"
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { ProgressBar } from "@/components/app/primitives"
 import { cn } from "@/lib/utils"
@@ -32,6 +31,7 @@ export type ModelInfo = {
 
 export type Suggestion = {
   id: number
+  backendId: string
   cls: string
   conf: number
   x: number
@@ -379,12 +379,12 @@ export function AutoAnnotationCard({
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Autoanotação</CardTitle>
+    <section className="px-4 py-4">
+      <div className="mb-3 flex items-center justify-between">
+        <p className="text-sm font-semibold text-foreground">Autoanotação</p>
         <Sparkles className="size-4 text-brand-blue" />
-      </CardHeader>
-      <CardContent className="flex flex-col gap-3">
+      </div>
+      <div className="flex flex-col gap-3">
         {/* Modelos */}
         <CollapsibleSection title="Modelos">
           <div className="flex flex-col gap-2">
@@ -766,7 +766,7 @@ export function AutoAnnotationCard({
             Ver configurações avançadas
           </button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </section>
   )
 }

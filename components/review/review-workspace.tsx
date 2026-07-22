@@ -209,6 +209,23 @@ function sameReviewFrame(annotation: ReviewAnnotation, current: ReviewAnnotation
   return annotation.cvatJobId === current.cvatJobId && annotation.frame === current.frame
 }
 
+function reviewFrameKey(annotation: ReviewAnnotation) {
+  if (annotation.previewUrl) return `preview:${annotation.previewUrl}`
+  return `task:${annotation.cvatJobId ?? annotation.taskName ?? "unknown"}:frame:${annotation.frame ?? "unknown"}`
+}
+
+function compareReviewAnnotations(a: ReviewAnnotation, b: ReviewAnnotation) {
+  const taskA = a.taskName ?? a.cvatJobId ?? ""
+  const taskB = b.taskName ?? b.cvatJobId ?? ""
+  const taskOrder = taskA.localeCompare(taskB, "pt-BR", { numeric: true })
+  if (taskOrder !== 0) return taskOrder
+  const jobOrder = String(a.cvatJobId ?? "").localeCompare(String(b.cvatJobId ?? ""), "pt-BR", { numeric: true })
+  if (jobOrder !== 0) return jobOrder
+  const frameOrder = (a.frame ?? 0) - (b.frame ?? 0)
+  if (frameOrder !== 0) return frameOrder
+  return a.id - b.id
+}
+
 function stableNumericId(value: string) {
   let hash = 0
   for (let i = 0; i < value.length; i++) {
@@ -268,6 +285,7 @@ export function ReviewWorkspace() {
   const [log, setLog] = React.useState<{ id: number; decision: Decision }[]>([])
   const [autoAdvance, setAutoAdvance] = React.useState(true)
   const [scale, setScale] = React.useState(1)
+  const [pan, setPan] = React.useState({ x: 0, y: 0 })
   const [tab, setTab] = React.useState<"anotacoes" | "tracks" | "tags" | "comentarios">("anotacoes")
   const [checkedClasses, setCheckedClasses] = React.useState<Set<string>>(() => new Set())
   const [boxState, setBoxState] = React.useState<Record<number, Box>>(initialBoxes)
@@ -282,6 +300,8 @@ export function ReviewWorkspace() {
   const canvasRef = React.useRef<HTMLDivElement>(null)
   const scaleRef = React.useRef(scale)
   scaleRef.current = scale
+  const panRef = React.useRef(pan)
+  panRef.current = pan
 
   // ---- Correcao de objeto ----
   const [clsOverride, setClsOverride] = React.useState<Record<number, string>>({})
@@ -376,24 +396,26 @@ export function ReviewWorkspace() {
 
   const visibleAnnotations = React.useMemo(
     () =>
-      reviewItems.filter((a) => {
-        const b = boxState[a.id]
-        if (!b || !checkedClasses.has(a.cls)) return false
-        if (onlyUnreviewed && decisions[a.id]) return false
-        if (onlyThisClass && selectedCls && a.cls !== selectedCls) return false
-        if (a.conf < minConf) return false
-        if (hasBoxSizeFilter) {
-          const areaPct = boxAreaPct(b)
-          if (sizeFilter === "custom") {
-            if (boxAreaMin !== null && areaPct < boxAreaMin) return false
-            if (boxAreaMax !== null && areaPct > boxAreaMax) return false
-          } else {
-            const bucket = boxAreaBucket(areaPct)
-            if (bucket !== sizeFilter) return false
+      reviewItems
+        .filter((a) => {
+          const b = boxState[a.id]
+          if (!b || !checkedClasses.has(a.cls)) return false
+          if (onlyUnreviewed && decisions[a.id]) return false
+          if (onlyThisClass && selectedCls && a.cls !== selectedCls) return false
+          if (a.conf < minConf) return false
+          if (hasBoxSizeFilter) {
+            const areaPct = boxAreaPct(b)
+            if (sizeFilter === "custom") {
+              if (boxAreaMin !== null && areaPct < boxAreaMin) return false
+              if (boxAreaMax !== null && areaPct > boxAreaMax) return false
+            } else {
+              const bucket = boxAreaBucket(areaPct)
+              if (bucket !== sizeFilter) return false
+            }
           }
-        }
-        return true
-      }),
+          return true
+        })
+        .sort(compareReviewAnnotations),
     [
       boxAreaMax,
       boxAreaMin,
@@ -419,10 +441,10 @@ export function ReviewWorkspace() {
     : []
   const frameAnnotationTotal = currentFrameAnnotations.length
   const reviewedCount = Object.keys(decisions).length
-  const queueTotal = reviewItems.length
-  const currentQueueIndex = reviewItems.findIndex((item) => item.id === current.id)
+  const queueTotal = visibleAnnotations.length
+  const currentQueueIndex = visibleAnnotations.findIndex((item) => item.id === current.id)
   const queuePos = queueTotal === 0 ? 0 : Math.max(1, currentQueueIndex + 1)
-  const queuePct = queueTotal === 0 ? 0 : Math.round((reviewedCount / queueTotal) * 100)
+  const queuePct = reviewItems.length === 0 ? 0 : Math.round((reviewedCount / reviewItems.length) * 100)
   const currentPreviewSrc = current.previewUrl ?? "/placeholder.svg"
 
   const selectNext = React.useCallback(() => {
@@ -430,6 +452,53 @@ export function ReviewWorkspace() {
     const next = visibleAnnotations[Math.min(i + 1, visibleAnnotations.length - 1)]
     if (next) setSelectedId(next.id)
   }, [selectedId, visibleAnnotations])
+
+  const selectPrevious = React.useCallback(() => {
+    const i = visibleAnnotations.findIndex((a) => a.id === selectedId)
+    const previous = visibleAnnotations[Math.max(i - 1, 0)]
+    if (previous) setSelectedId(previous.id)
+  }, [selectedId, visibleAnnotations])
+
+  const selectFrame = React.useCallback(
+    (direction: -1 | 1) => {
+      const currentIndex = visibleAnnotations.findIndex((a) => a.id === selectedId)
+      if (currentIndex < 0) return
+      const currentKey = reviewFrameKey(visibleAnnotations[currentIndex])
+      if (direction < 0) {
+        for (let index = currentIndex - 1; index >= 0; index -= 1) {
+          if (reviewFrameKey(visibleAnnotations[index]) !== currentKey) {
+            setSelectedId(visibleAnnotations[index].id)
+            return
+          }
+        }
+        return
+      }
+      for (let index = currentIndex + 1; index < visibleAnnotations.length; index += 1) {
+        if (reviewFrameKey(visibleAnnotations[index]) !== currentKey) {
+          setSelectedId(visibleAnnotations[index].id)
+          return
+        }
+      }
+    },
+    [selectedId, visibleAnnotations],
+  )
+
+  const startPan = React.useCallback((e: { clientX: number; clientY: number; preventDefault?: () => void; stopPropagation?: () => void }) => {
+    e.preventDefault?.()
+    e.stopPropagation?.()
+    const startX = e.clientX
+    const startY = e.clientY
+    const base = panRef.current
+    const onMove = (ev: PointerEvent) => {
+      setPan({ x: base.x + ev.clientX - startX, y: base.y + ev.clientY - startY })
+    }
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove)
+      window.removeEventListener("pointerup", onUp)
+    }
+    window.addEventListener("pointermove", onMove)
+    window.addEventListener("pointerup", onUp)
+  }, [])
 
   const beginDrag = React.useCallback(
     (e: React.PointerEvent, id: number, mode: "move" | Handle) => {
@@ -803,15 +872,51 @@ export function ReviewWorkspace() {
         <section className="flex min-w-0 flex-1 flex-col">
           {/* playback bar */}
           <div className="flex items-center gap-1.5 border-b border-border px-4 py-2">
-            {[ChevronsLeft, ChevronLeft, Play, ChevronRight, ChevronsRight].map((Icon, i) => (
-              <button
-                key={i}
-                onClick={() => (i < 2 ? undo() : selectNext())}
-                className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
-              >
-                <Icon className="size-4" />
-              </button>
-            ))}
+            <button
+              type="button"
+              onClick={() => selectFrame(-1)}
+              className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label="Imagem anterior"
+              title="Imagem anterior"
+            >
+              <ChevronsLeft className="size-4" />
+            </button>
+            <button
+              type="button"
+              onClick={selectPrevious}
+              className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label="Objeto anterior"
+              title="Objeto anterior"
+            >
+              <ChevronLeft className="size-4" />
+            </button>
+            <button
+              type="button"
+              onClick={selectNext}
+              className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label="Próximo objeto"
+              title="Próximo objeto"
+            >
+              <Play className="size-4" />
+            </button>
+            <button
+              type="button"
+              onClick={selectNext}
+              className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label="Próximo objeto"
+              title="Próximo objeto"
+            >
+              <ChevronRight className="size-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => selectFrame(1)}
+              className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+              aria-label="Próxima imagem"
+              title="Próxima imagem"
+            >
+              <ChevronsRight className="size-4" />
+            </button>
             <span className="ml-1 text-sm font-medium tabular-nums">
               {queuePos.toLocaleString("pt-BR")} / {queueTotal.toLocaleString("pt-BR")}
             </span>
@@ -833,7 +938,10 @@ export function ReviewWorkspace() {
                 <ZoomOut className="size-4" />
               </button>
               <button
-                onClick={() => setScale(1)}
+                onClick={() => {
+                  setScale(1)
+                  setPan({ x: 0, y: 0 })
+                }}
                 className="min-w-14 rounded-lg px-2 py-1 text-center text-sm font-medium tabular-nums hover:bg-muted"
               >
                 {Math.round(scale * 100)}%
@@ -856,10 +964,13 @@ export function ReviewWorkspace() {
             ref={canvasRef}
             className="relative min-h-0 flex-1 overflow-hidden bg-black"
             onWheel={onWheelZoom}
+            onPointerDown={(e) => {
+              if (e.button === 1) startPan(e)
+            }}
           >
             <div
-              className="absolute inset-0 origin-center transition-transform duration-75"
-              style={{ transform: `scale(${scale})` }}
+              className="absolute inset-0 origin-center"
+              style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})` }}
             >
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
@@ -876,6 +987,10 @@ export function ReviewWorkspace() {
                   <div
                     key={a.id}
                     onPointerDown={(e) => {
+                      if (e.button === 1) {
+                        startPan(e)
+                        return
+                      }
                       if (correcting && active) {
                         beginDrag(e, a.id, "move")
                         return
@@ -911,7 +1026,13 @@ export function ReviewWorkspace() {
                       handles.map((h) => (
                         <span
                           key={h.id}
-                          onPointerDown={(e) => beginDrag(e, a.id, h.id)}
+                          onPointerDown={(e) => {
+                            if (e.button === 1) {
+                              startPan(e)
+                              return
+                            }
+                            beginDrag(e, a.id, h.id)
+                          }}
                           className={cn("absolute rounded-sm border border-white bg-brand-blue", h.cls)}
                           style={{
                             width: `${8 / scale}px`,
