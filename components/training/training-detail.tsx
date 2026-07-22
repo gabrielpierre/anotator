@@ -9,13 +9,13 @@ import { StatusBadge, ProgressBar, StatRow, Meter } from "@/components/app/primi
 import { TabNav } from "@/components/app/tab-nav"
 import { MetricLineChart } from "@/components/app/charts"
 import {
-  artifactAssetUrlFromUri,
-  artifactDownloadPathFromUri,
   deleteTrainingRun,
   downloadBackendFile,
   fetchTrainingRun,
   pauseTrainingRun,
   stopTrainingRun,
+  trainingArtifactAssetUrl,
+  trainingArtifactDownloadPath,
   trainingRunEventsUrl,
 } from "@/lib/api/client"
 import { formatDateTimePt, toUiJobStatus } from "@/lib/api/status"
@@ -76,6 +76,7 @@ type MetricRow = {
 }
 
 type TrainingImageArtifact = {
+  runId: string
   name: string
   path: string
   uri: string
@@ -595,6 +596,7 @@ function trainingImageArtifacts(run: BackendTrainingRun) {
       const path = String(row.path ?? name)
       if (!/\.(jpe?g|png)$/i.test(name) && !/\.(jpe?g|png)$/i.test(path)) return null
       return {
+        runId: run.id,
         name,
         path,
         uri,
@@ -779,7 +781,7 @@ function ValidationArtifactsCard({ run }: { run: BackendTrainingRun }) {
                   >
                     <div className="aspect-video overflow-hidden bg-muted/20">
                       <img
-                        src={artifactAssetUrlFromUri(artifact.uri)}
+                        src={trainingArtifactAssetUrl(artifact.runId, artifact.path)}
                         alt={artifact.label}
                         className="h-full w-full object-cover transition-transform group-hover:scale-[1.02]"
                       />
@@ -823,7 +825,7 @@ function ValidationMediaViewer({
         )}
       >
         <img
-          src={artifactAssetUrlFromUri(artifact.uri)}
+          src={trainingArtifactAssetUrl(artifact.runId, artifact.path)}
           alt={artifact.label}
           className={cn("h-full w-full", variant === "matrix" ? "object-contain" : "object-cover")}
         />
@@ -979,9 +981,11 @@ function artifactsFromRun(run: BackendTrainingRun) {
   return run.artifacts.map((artifact, index) => {
     const row = artifact && typeof artifact === "object" ? (artifact as Record<string, unknown>) : {}
     const name = String(row.name ?? row.path ?? `artifact-${index + 1}`)
+    const path = String(row.path ?? name)
     return {
       name,
-      desc: String(row.uri ?? row.path ?? "Artefato MLflow"),
+      path,
+      desc: path || "Artefato MLflow",
       size: formatBytes(row.size_bytes),
       uri: typeof row.uri === "string" ? row.uri : null,
     }
@@ -1003,8 +1007,7 @@ function ArtifactsTab({ run }: { run: BackendTrainingRun | null }) {
     <Card className="p-0">
       <div className="divide-y divide-border">
         {rows.map((a) => {
-          const uri = "uri" in a ? a.uri : null
-          const canDownload = typeof uri === "string" && uri.startsWith("s3://")
+          const canDownload = Boolean(a.path)
           return (
           <div key={a.name} className="flex items-center gap-3 px-5 py-3.5">
             <div className="flex size-9 items-center justify-center rounded-lg bg-muted font-mono text-[10px] text-muted-foreground">
@@ -1020,7 +1023,7 @@ function ArtifactsTab({ run }: { run: BackendTrainingRun | null }) {
               size="sm"
               disabled={!canDownload}
               onClick={() => {
-                if (canDownload) void downloadBackendFile(artifactDownloadPathFromUri(uri), a.name)
+                if (canDownload && run) void downloadBackendFile(trainingArtifactDownloadPath(run.id, a.path), a.name)
               }}
             >
               Baixar

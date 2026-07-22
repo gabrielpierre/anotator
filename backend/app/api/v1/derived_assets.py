@@ -3,7 +3,8 @@ from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, db_session
+from app.api.deps import current_user, db_session, require_project_access
+from app.api.project_scope import filter_visible_assets, project_for_asset, project_values, require_asset_access
 from app.core.config import get_settings
 from app.models import AuditEvent, DerivedAsset, User
 from app.schemas import DerivedAssetRead, DerivedAssetReviewDecision, DerivedAssetUpdate
@@ -14,12 +15,13 @@ router = APIRouter()
 
 @router.get("", response_model=list[DerivedAssetRead])
 def list_derived_assets(
+    project_id: str | None = Query(default=None, max_length=64),
     pipeline_run_id: str | None = None,
     dataset_release_id: str | None = None,
     split: str | None = None,
     limit: int = Query(default=100, ge=1, le=500),
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[DerivedAsset]:
     query = select(DerivedAsset)
     if pipeline_run_id:
@@ -29,7 +31,11 @@ def list_derived_assets(
     if split:
         query = query.where(DerivedAsset.split == split)
     query = query.order_by(DerivedAsset.created_at.desc()).limit(limit)
-    return list(db.scalars(query).all())
+    assets = list(db.scalars(query).all())
+    if project_id:
+        project = require_project_access(db, user, project_id)
+        assets = [asset for asset in assets if project_values(project_for_asset(db, asset)) & project_values(project)]
+    return filter_visible_assets(db, user, assets)
 
 
 @router.patch("/{asset_id}", response_model=DerivedAssetRead)
@@ -39,7 +45,7 @@ def update_derived_asset(
     db: Session = Depends(db_session),
     actor: User = Depends(current_user),
 ) -> DerivedAsset:
-    asset = _require_asset(db, asset_id)
+    asset = require_asset_access(db, actor, asset_id)
     before = _asset_state(asset)
     if payload.label_name is not None:
         asset.label_name = payload.label_name
@@ -70,7 +76,7 @@ def review_derived_asset(
     db: Session = Depends(db_session),
     actor: User = Depends(current_user),
 ) -> DerivedAsset:
-    asset = _require_asset(db, asset_id)
+    asset = require_asset_access(db, actor, asset_id)
     before = _asset_state(asset)
     if payload.corrected_label:
         asset.label_name = payload.corrected_label
@@ -101,9 +107,9 @@ def review_derived_asset(
 def download_derived_asset(
     asset_id: str,
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> Response:
-    asset = _require_asset(db, asset_id)
+    asset = require_asset_access(db, user, asset_id)
     if not asset.crop_uri:
         raise HTTPException(status_code=404, detail="Derived asset crop not found")
     try:

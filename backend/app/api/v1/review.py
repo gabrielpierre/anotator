@@ -2,12 +2,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, db_session
+from app.api.deps import current_user, db_session, require_project_access
+from app.api.project_scope import (
+    annotation_revision_visible,
+    require_annotation_access,
+    require_task_access,
+    review_decision_visible,
+    track_revision_visible,
+    visible_task_external_ids as scope_visible_task_external_ids,
+)
 from app.core.config import get_settings
 from app.models import (
     AnnotationRecord,
     AnnotationRevision,
     AuditEvent,
+    Project,
+    ProjectMember,
     ReviewDecision,
     Task,
     TaskDataMeta,
@@ -32,39 +42,42 @@ router = APIRouter()
 
 @router.get("/queue", response_model=list[ReviewQueueItem])
 def review_queue(
+    project_external_id: str | None = Query(default=None, max_length=64),
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[ReviewQueueItem]:
-    candidates = list(
-        db.scalars(
-            select(AnnotationRecord)
-            .where(
-                AnnotationRecord.review_state == "pending",
-                AnnotationRecord.task_external_id.is_not(None),
-                AnnotationRecord.frame.is_not(None),
-            )
-            .order_by(AnnotationRecord.updated_at.desc())
-            .limit(2000)
-        ).all()
+    task_external_ids = scope_visible_task_external_ids(db, user, project_external_id)
+    if task_external_ids is not None and not task_external_ids:
+        return []
+    query = select(AnnotationRecord).where(
+        AnnotationRecord.review_state == "pending",
+        AnnotationRecord.task_external_id.is_not(None),
+        AnnotationRecord.frame.is_not(None),
     )
+    if task_external_ids is not None:
+        query = query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
+    candidates = list(db.scalars(query.order_by(AnnotationRecord.updated_at.desc()).limit(2000)).all())
     annotations = [annotation for annotation in candidates if _is_reviewable_annotation(annotation)][:500]
     return [_queue_item_from_annotation(db, annotation) for annotation in annotations]
 
 
 @router.get("/queue/count")
 def review_queue_count(
+    project_external_id: str | None = Query(default=None, max_length=64),
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> dict[str, int]:
-    candidates = list(
-        db.scalars(
-            select(AnnotationRecord).where(
-                AnnotationRecord.review_state == "pending",
-                AnnotationRecord.task_external_id.is_not(None),
-                AnnotationRecord.frame.is_not(None),
-            )
-        ).all()
+    task_external_ids = scope_visible_task_external_ids(db, user, project_external_id)
+    if task_external_ids is not None and not task_external_ids:
+        return {"pending": 0}
+    query = select(AnnotationRecord).where(
+        AnnotationRecord.review_state == "pending",
+        AnnotationRecord.task_external_id.is_not(None),
+        AnnotationRecord.frame.is_not(None),
     )
+    if task_external_ids is not None:
+        query = query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
+    candidates = list(db.scalars(query).all())
     return {"pending": sum(1 for annotation in candidates if _is_reviewable_annotation(annotation))}
 
 
@@ -72,29 +85,44 @@ def review_queue_count(
 def create_review_decision(
     payload: ReviewDecisionCreate,
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> ReviewDecision:
+    require_annotation_access(db, user, payload.external_annotation_id)
     return apply_review_decision(db, CvatClient(get_settings()), payload)
 
 
 @router.get("/decisions", response_model=list[ReviewDecisionRead])
 def list_review_decisions(
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[ReviewDecision]:
-    return list(db.scalars(select(ReviewDecision).order_by(ReviewDecision.created_at.desc())).all())
+    decisions = list(db.scalars(select(ReviewDecision).order_by(ReviewDecision.created_at.desc())).all())
+    return [decision for decision in decisions if review_decision_visible(db, user, decision)]
 
 
 @router.get("/annotations", response_model=list[AnnotationRecordRead])
 def list_review_annotations(
     task_external_id: str | None = None,
+    project_external_id: str | None = Query(default=None, max_length=64),
     frame: int | None = Query(default=None, ge=0),
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[AnnotationRecord]:
     query = select(AnnotationRecord)
     if task_external_id:
+        task = require_task_access(db, user, task_external_id)
+        task_external_id = task.external_id
         query = query.where(AnnotationRecord.task_external_id == task_external_id)
+    elif project_external_id:
+        task_ids = scope_visible_task_external_ids(db, user, project_external_id)
+        if not task_ids:
+            return []
+        query = query.where(AnnotationRecord.task_external_id.in_(task_ids))
+    elif user.role != "admin":
+        task_ids = scope_visible_task_external_ids(db, user)
+        if not task_ids:
+            return []
+        query = query.where(AnnotationRecord.task_external_id.in_(task_ids))
     if frame is not None:
         query = query.where(AnnotationRecord.frame == frame)
     return list(db.scalars(query.order_by(AnnotationRecord.updated_at.desc())).all())
@@ -107,6 +135,7 @@ def save_review_manual_annotations(
     user: User = Depends(current_user),
 ) -> list[AnnotationRecord]:
     actor = payload.actor if payload.actor != "local-user" else user.email
+    require_task_access(db, user, payload.task_external_id)
     try:
         return save_manual_annotations(
             db,
@@ -120,19 +149,19 @@ def save_review_manual_annotations(
 @router.get("/annotation-revisions", response_model=list[AnnotationRevisionRead])
 def list_annotation_revisions(
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[AnnotationRevision]:
-    return list(
-        db.scalars(select(AnnotationRevision).order_by(AnnotationRevision.created_at.desc())).all()
-    )
+    revisions = list(db.scalars(select(AnnotationRevision).order_by(AnnotationRevision.created_at.desc())).all())
+    return [revision for revision in revisions if annotation_revision_visible(db, user, revision.annotation_external_id)]
 
 
 @router.get("/track-revisions", response_model=list[TrackRevisionRead])
 def list_track_revisions(
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[TrackRevision]:
-    return list(db.scalars(select(TrackRevision).order_by(TrackRevision.created_at.desc())).all())
+    revisions = list(db.scalars(select(TrackRevision).order_by(TrackRevision.created_at.desc())).all())
+    return [revision for revision in revisions if track_revision_visible(db, user, revision.track_external_id)]
 
 
 @router.post("/tracks/{track_id}/accept-segment", response_model=TrackRevisionRead)
@@ -218,6 +247,35 @@ def _queue_item_from_annotation(db: Session, annotation: AnnotationRecord) -> Re
     )
 
 
+def _visible_task_external_ids(
+    db: Session,
+    user: User,
+    project_external_id: str | None,
+) -> list[str] | None:
+    if project_external_id:
+        require_project_access(db, user, project_external_id)
+        return [
+            task.external_id
+            for task in db.scalars(select(Task).where(Task.project_external_id == project_external_id)).all()
+        ]
+    if user.role == "admin":
+        return None
+    project_external_ids = [
+        project.external_id
+        for project in db.scalars(
+            select(Project)
+            .join(ProjectMember, ProjectMember.project_id == Project.id)
+            .where(ProjectMember.user_id == user.id)
+        ).all()
+    ]
+    if not project_external_ids:
+        return []
+    return [
+        task.external_id
+        for task in db.scalars(select(Task).where(Task.project_external_id.in_(project_external_ids))).all()
+    ]
+
+
 def _is_reviewable_annotation(annotation: AnnotationRecord) -> bool:
     if annotation.annotation_type == "tag":
         return False
@@ -270,6 +328,7 @@ def _apply_track_action(
     before = [_annotation_snapshot(annotation) for annotation in annotations]
     if not annotations:
         raise HTTPException(status_code=404, detail="Track not found locally")
+    require_annotation_access(db, user, annotations[0].external_id)
     for annotation in annotations:
         raw = dict(annotation.raw or {})
         if action == "accept_segment":

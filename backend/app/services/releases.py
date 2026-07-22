@@ -50,6 +50,7 @@ def prepare_dataset_release(
     if not task_external_ids:
         raise ValueError("DatasetRelease requires at least one synchronized CVAT task")
     project = _resolve_project(db, payload.project_id)
+    project = _resolve_release_project_from_tasks(db, project, task_external_ids)
     _ensure_project_storage_quota(db, project, task_external_ids, payload)
     export_format = payload.export_format or settings.dataset_export_format
     release = DatasetRelease(
@@ -194,6 +195,30 @@ def _resolve_project(db: Session, project_id: str | None) -> Project | None:
     return projects[0] if len(projects) == 1 else None
 
 
+def _resolve_release_project_from_tasks(
+    db: Session,
+    project: Project | None,
+    task_external_ids: list[str],
+) -> Project | None:
+    tasks = list(db.scalars(select(Task).where(Task.external_id.in_(task_external_ids))).all())
+    if len(tasks) != len(set(task_external_ids)):
+        found = {task.external_id for task in tasks}
+        missing = sorted(set(task_external_ids) - found)
+        raise ValueError(f"Task(s) not found for release: {', '.join(missing)}")
+
+    project_external_ids = {task.project_external_id for task in tasks if task.project_external_id}
+    if len(project_external_ids) > 1:
+        raise ValueError("DatasetRelease cannot mix tasks from different projects")
+    task_project_external_id = next(iter(project_external_ids), None)
+    if project is not None:
+        if task_project_external_id and task_project_external_id != project.external_id:
+            raise ValueError("Selected tasks do not belong to the selected project")
+        return project
+    if task_project_external_id:
+        return db.scalar(select(Project).where(Project.external_id == task_project_external_id))
+    return None
+
+
 def _ensure_project_storage_quota(
     db: Session,
     project: Project | None,
@@ -282,7 +307,16 @@ def _build_snapshot(
     jobs = list(db.scalars(select(JobRecord).where(JobRecord.task_external_id.in_(task_external_ids))).all())
     labels = list(db.scalars(select(CvatLabel).where(CvatLabel.task_external_id.in_(task_external_ids))).all())
     if not labels:
-        labels = list(db.scalars(select(CvatLabel)).all())
+        project_external_ids = {task.project_external_id for task in tasks if task.project_external_id}
+        if project_external_ids:
+            labels = list(
+                db.scalars(
+                    select(CvatLabel).where(
+                        CvatLabel.project_external_id.in_(project_external_ids),
+                        CvatLabel.task_external_id.is_(None),
+                    )
+                ).all()
+            )
     annotation_count = db.scalar(
         select(func.count(AnnotationRecord.id)).where(AnnotationRecord.task_external_id.in_(task_external_ids))
     )

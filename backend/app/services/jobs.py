@@ -1,14 +1,18 @@
 import os
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
 from celery import Celery
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models import AuditEvent, DatasetRelease, JobRecord, PipelineRun, TrainingRun, utcnow
 
 FINAL_JOB_STATUSES = {"succeeded", "failed", "canceled"}
 ACTIVE_JOB_STATUSES = {"queued", "running", "paused"}
+STALE_JOB_KINDS_EXCLUDED = {"cvat_job"}
 
 
 class JobCanceled(RuntimeError):
@@ -193,6 +197,51 @@ def cancel_job(
     return job
 
 
+def fail_stale_active_jobs(db: Session) -> list[JobRecord]:
+    stale_after_seconds = get_settings().job_stale_after_seconds
+    if stale_after_seconds <= 0:
+        return []
+
+    threshold = utcnow() - timedelta(seconds=stale_after_seconds)
+    stale_jobs = list(
+        db.scalars(
+            select(JobRecord).where(
+                JobRecord.status == "running",
+                JobRecord.kind.notin_(STALE_JOB_KINDS_EXCLUDED),
+                JobRecord.updated_at < threshold,
+            )
+        ).all()
+    )
+    if not stale_jobs:
+        return []
+
+    reason = (
+        f"Job sem heartbeat por mais de {stale_after_seconds} segundos. "
+        "O processo de worker pode ter sido interrompido."
+    )
+    for job in stale_jobs:
+        job.status = "failed"
+        job.detail = reason
+        job.finished_at = utcnow()
+        job.raw = {**(job.raw or {}), "stale": True, "stale_after_seconds": stale_after_seconds}
+        job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
+        db.add(job)
+        _fail_linked_resource(db, job, reason)
+        db.add(
+            AuditEvent(
+                actor="system",
+                action="job_failed_stale",
+                target=job.id,
+                reason=reason,
+                payload={"kind": job.kind, "raw": job.raw},
+            )
+        )
+    db.commit()
+    for job in stale_jobs:
+        db.refresh(job)
+    return stale_jobs
+
+
 def ensure_not_canceled(db: Session, job_id: str) -> None:
     job = require_job(db, job_id)
     if job.status == "canceled":
@@ -244,6 +293,42 @@ def _cancel_linked_resource(db: Session, job: JobRecord) -> None:
                 if release is not None and release.status not in {"ready", "failed", "canceled"}:
                     release.status = "canceled"
                     release.snapshot = {**(release.snapshot or {}), "error": "Pipeline job canceled"}
+                    db.add(release)
+
+
+def _fail_linked_resource(db: Session, job: JobRecord, reason: str) -> None:
+    raw = job.raw or {}
+    release_id = raw.get("dataset_release_id")
+    if release_id:
+        release = db.get(DatasetRelease, str(release_id))
+        if release is not None and release.status not in {"ready", "failed", "canceled"}:
+            release.status = "failed"
+            release.snapshot = {**(release.snapshot or {}), "error": reason}
+            db.add(release)
+
+    training_run_id = raw.get("training_run_id")
+    if training_run_id:
+        run = db.get(TrainingRun, str(training_run_id))
+        if run is not None and run.status not in FINAL_JOB_STATUSES:
+            run.status = "failed"
+            run.progress = job.progress
+            run.metrics = {**(run.metrics or {}), "status": "failed", "error": reason}
+            db.add(run)
+
+    pipeline_run_id = raw.get("pipeline_run_id")
+    if pipeline_run_id:
+        run = db.get(PipelineRun, str(pipeline_run_id))
+        if run is not None and run.status not in FINAL_JOB_STATUSES:
+            run.status = "failed"
+            run.progress = job.progress
+            run.lineage = {**(run.lineage or {}), "error": reason}
+            db.add(run)
+            derived_release_id = (run.lineage or {}).get("derived_release_id")
+            if derived_release_id:
+                release = db.get(DatasetRelease, str(derived_release_id))
+                if release is not None and release.status not in {"ready", "failed", "canceled"}:
+                    release.status = "failed"
+                    release.snapshot = {**(release.snapshot or {}), "error": reason}
                     db.add(release)
 
 

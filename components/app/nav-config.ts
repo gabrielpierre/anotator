@@ -31,3 +31,18 @@ export const navEntries: NavEntry[] = [
   { label: "Releases", href: "/releases", icon: GitBranch },
   { label: "Usuários", href: "/usuarios", icon: Users, adminOnly: true },
 ]
+
+export const projectNavEntries: NavEntry[] = [
+  { label: "Visão geral", href: "/", icon: LayoutGrid },
+  { label: "Dados", href: "/dados", icon: Database },
+  { label: "Anotar", href: "/anotar", icon: PenLine },
+  { label: "Revisar", href: "/revisar", icon: CheckSquare },
+  { label: "Treinar", href: "/treinar", icon: Cpu },
+  { label: "Modelos", href: "/modelos", icon: Boxes },
+  { label: "Releases", href: "/releases", icon: GitBranch },
+]
+
+export const adminNavEntries: NavEntry[] = [
+  { label: "Gerenciar projetos", href: "/projetos", icon: FolderKanban, adminOnly: true },
+  { label: "Usuários", href: "/usuarios", icon: Users, adminOnly: true },
+]

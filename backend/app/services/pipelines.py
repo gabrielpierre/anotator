@@ -17,6 +17,8 @@ from app.models import (
     DerivedAsset,
     PipelineDefinition,
     PipelineRun,
+    Project,
+    Task,
 )
 from app.services.artifacts import ArtifactStore, proxy_download_url
 from app.services.cvat_client import CvatClient
@@ -199,9 +201,10 @@ def _source_release(db: Session, definition: dict[str, Any]) -> DatasetRelease |
 
 
 def _source_annotations(db: Session, task_external_ids: list[str]) -> list[AnnotationRecord]:
+    if not task_external_ids:
+        raise ValueError("Pipeline source task scope is required")
     query = select(AnnotationRecord).where(AnnotationRecord.review_state.in_(["accepted", "corrected"]))
-    if task_external_ids:
-        query = query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
+    query = query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
     return list(db.scalars(query.order_by(AnnotationRecord.task_external_id, AnnotationRecord.frame)).all())
 
 
@@ -251,9 +254,12 @@ def _create_target_release(
     base_name = str(definition.get("target_release_name") or f"derived_cls_{run.id[:8]}")
     name = _unique_release_name(db, base_name)
     task_external_ids = sorted({str(annotation.task_external_id) for annotation in annotations if annotation.task_external_id})
+    source_task_external_ids = _source_task_ids(db, definition)
+    project = _target_project(db, source_release, source_task_external_ids or task_external_ids)
     release = DatasetRelease(
         name=name,
         status="building",
+        project_id=project.id if project is not None else None,
         task_external_ids=task_external_ids,
         immutable=True,
         snapshot={
@@ -262,6 +268,8 @@ def _create_target_release(
             "source_release_id": source_release.id if source_release else definition.get("source_release_id"),
             "source_release_name": source_release.name if source_release else None,
             "definition": definition,
+            "project_id": project.id if project is not None else None,
+            "project_external_id": project.external_id if project is not None else None,
             "mutable_source_blocked": True,
             "derived_type": "classification_crops",
         },
@@ -279,6 +287,20 @@ def _create_target_release(
     db.commit()
     db.refresh(release)
     return release
+
+
+def _target_project(
+    db: Session,
+    source_release: DatasetRelease | None,
+    task_external_ids: list[str],
+) -> Project | None:
+    if source_release and source_release.project_id:
+        return db.get(Project, source_release.project_id)
+    tasks = list(db.scalars(select(Task).where(Task.external_id.in_(task_external_ids))).all()) if task_external_ids else []
+    project_external_ids = {task.project_external_id for task in tasks if task.project_external_id}
+    if len(project_external_ids) != 1:
+        return None
+    return db.scalar(select(Project).where(Project.external_id == next(iter(project_external_ids))))
 
 
 def _unique_release_name(db: Session, base_name: str) -> str:

@@ -3,18 +3,19 @@ import json
 import os
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_admin, current_user, db_session
+from app.api.deps import current_admin, current_user, db_session, require_project_access
+from app.api.project_scope import job_matches_project, job_visible as scoped_job_visible
 from app.core.celery_app import celery_app
 from app.core.database import SessionLocal
-from app.models import JobRecord, Project, ProjectMember, Task, User
+from app.models import JobRecord, User
 from app.schemas import JobCapacityRead, JobMetricsRead, JobPriorityUpdate, JobRead
 from app.services.compute import gpu_snapshot
-from app.services.jobs import attach_celery_task, cancel_job, create_job
+from app.services.jobs import attach_celery_task, cancel_job, create_job, fail_stale_active_jobs
 
 router = APIRouter()
 PROCESSING_JOB_KINDS_EXCLUDED = {"cvat_job"}
@@ -22,21 +23,25 @@ PROCESSING_JOB_KINDS_EXCLUDED = {"cvat_job"}
 
 @router.get("", response_model=list[JobRead])
 def list_jobs(
+    project_id: str | None = Query(default=None, max_length=64),
     db: Session = Depends(db_session),
     user: User = Depends(current_user),
 ) -> list[JobRecord]:
-    return _visible_jobs(db, user)
+    return _visible_jobs(db, user, project_id=project_id)
 
 
 @router.get("/events")
-async def job_events(user: User = Depends(current_user)) -> StreamingResponse:
+async def job_events(
+    project_id: str | None = Query(default=None, max_length=64),
+    user: User = Depends(current_user),
+) -> StreamingResponse:
     viewer_id = user.id
 
     async def event_stream() -> AsyncIterator[str]:
         while True:
             with SessionLocal() as db:
                 viewer = db.get(User, viewer_id)
-                jobs = _visible_jobs(db, viewer) if viewer is not None else []
+                jobs = _visible_jobs(db, viewer, project_id=project_id) if viewer is not None else []
                 payload = {"jobs": [_serialize_job(job) for job in jobs]}
             yield f"event: jobs\ndata: {json.dumps(payload)}\n\n"
             await asyncio.sleep(1)
@@ -46,10 +51,11 @@ async def job_events(user: User = Depends(current_user)) -> StreamingResponse:
 
 @router.get("/capacity", response_model=JobCapacityRead)
 def job_capacity(
+    project_id: str | None = Query(default=None, max_length=64),
     db: Session = Depends(db_session),
     user: User = Depends(current_user),
 ) -> JobCapacityRead:
-    jobs = _visible_jobs(db, user, order=False)
+    jobs = _visible_jobs(db, user, order=False, project_id=project_id)
     queued = sum(1 for job in jobs if job.status == "queued")
     running = sum(1 for job in jobs if job.status == "running")
     memory = _memory_snapshot()
@@ -169,90 +175,32 @@ def _serialize_job(job: JobRecord) -> dict:
 
 
 def _visible_job_or_none(db: Session, user: User, job_id: str) -> JobRecord | None:
+    fail_stale_active_jobs(db)
     job = db.get(JobRecord, job_id)
     if job is None or job.kind in PROCESSING_JOB_KINDS_EXCLUDED:
         return None
     if user.role == "admin":
         return job
-    return job if _job_matches_user_projects(db, job, user) else None
+    return job if scoped_job_visible(db, user, job) else None
 
 
-def _visible_jobs(db: Session, user: User, order: bool = True) -> list[JobRecord]:
+def _visible_jobs(
+    db: Session,
+    user: User,
+    order: bool = True,
+    project_id: str | None = None,
+) -> list[JobRecord]:
+    fail_stale_active_jobs(db)
     query = select(JobRecord).where(JobRecord.kind.notin_(PROCESSING_JOB_KINDS_EXCLUDED))
     if order:
         query = query.order_by(JobRecord.updated_at.desc())
     jobs = list(db.scalars(query).all())
+    project = require_project_access(db, user, project_id) if project_id else None
+    if project is not None:
+        jobs = [job for job in jobs if job_matches_project(db, job, project)]
     if user.role == "admin":
         return jobs
-    return [job for job in jobs if _job_matches_user_projects(db, job, user)]
-
-
-def _job_matches_user_projects(db: Session, job: JobRecord, user: User) -> bool:
-    project_values = _accessible_project_values(db, user)
-    if not project_values:
-        return False
-    task_project_values = _task_project_values(db, job)
-    return any(value in project_values for value in _job_project_values(job, task_project_values))
-
-
-def _accessible_project_values(db: Session, user: User) -> set[str]:
-    projects = db.scalars(
-        select(Project)
-        .join(ProjectMember, ProjectMember.project_id == Project.id)
-        .where(ProjectMember.user_id == user.id)
-    ).all()
-    values: set[str] = set()
-    for project in projects:
-        values.add(project.id)
-        values.add(project.external_id)
-    return values
-
-
-def _task_project_values(db: Session, job: JobRecord) -> set[str]:
-    task_ids = {
-        value
-        for value in {
-            job.task_external_id,
-            _raw_value(job.raw, "task_external_id"),
-            _nested_raw_value(job.raw, "payload", "task_external_id"),
-            _nested_raw_value(job.raw, "lineage", "task_external_id"),
-        }
-        if value
-    }
-    if not task_ids:
-        return set()
-    tasks = db.scalars(select(Task).where(Task.external_id.in_(task_ids))).all()
-    return {task.project_external_id for task in tasks if task.project_external_id}
-
-
-def _job_project_values(job: JobRecord, task_project_values: set[str]) -> set[str]:
-    values = {
-        _raw_value(job.raw, "project_id"),
-        _raw_value(job.raw, "project_external_id"),
-        _nested_raw_value(job.raw, "payload", "project_id"),
-        _nested_raw_value(job.raw, "payload", "project_external_id"),
-        _nested_raw_value(job.raw, "lineage", "project_id"),
-        _nested_raw_value(job.raw, "lineage", "project_external_id"),
-        *task_project_values,
-    }
-    return {str(value) for value in values if value}
-
-
-def _raw_value(raw: dict | None, key: str) -> str | None:
-    if not isinstance(raw, dict):
-        return None
-    value = raw.get(key)
-    return str(value) if value is not None else None
-
-
-def _nested_raw_value(raw: dict | None, parent: str, key: str) -> str | None:
-    if not isinstance(raw, dict):
-        return None
-    node = raw.get(parent)
-    if not isinstance(node, dict):
-        return None
-    value = node.get(key)
-    return str(value) if value is not None else None
+    return [job for job in jobs if scoped_job_visible(db, user, job)]
 
 
 def _dispatch_retry(job: JobRecord) -> str | None:

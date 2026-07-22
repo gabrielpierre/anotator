@@ -1,15 +1,22 @@
 "use client"
 
 import * as React from "react"
-import { useRouter } from "next/navigation"
+import { useRouter, useSearchParams } from "next/navigation"
 import { AppShell } from "@/components/app/app-shell"
 import { ProjectOverview } from "@/components/overview/project-overview"
 import { useCurrentUser } from "@/lib/auth/user-context"
 
 export default function Page() {
   const router = useRouter()
-  const { authReady, isAuthenticated, isAdmin, projects } = useCurrentUser()
+  const searchParams = useSearchParams()
+  const { authReady, isAuthenticated, isAdmin, projects, setActiveProjectId } = useCurrentUser()
   const shouldChooseProject = authReady && isAuthenticated && isAdmin && projects.length === 0
+  const requestedProjectId = searchParams.get("project")
+
+  React.useEffect(() => {
+    if (!requestedProjectId || !projects.some((project) => project.id === requestedProjectId)) return
+    setActiveProjectId(requestedProjectId)
+  }, [projects, requestedProjectId, setActiveProjectId])
 
   React.useEffect(() => {
     if (shouldChooseProject) router.replace("/projetos")

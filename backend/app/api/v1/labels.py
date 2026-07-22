@@ -6,15 +6,36 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, db_session, require_project_access
-from app.models import AnnotationRecord, AuditEvent, CvatLabel, DerivedAsset, InferenceSuggestion, Task, User
+from app.models import AnnotationRecord, AuditEvent, CvatLabel, DerivedAsset, InferenceSuggestion, Project, ProjectMember, Task, User
 from app.schemas import CvatLabelRead, LabelActionResult, LabelColorUpdate, LabelImpactRead, LabelMap, LabelRename
 
 router = APIRouter()
 
 
 @router.get("", response_model=list[CvatLabelRead])
-def list_labels(db: Session = Depends(db_session)) -> list[CvatLabel]:
-    return list(db.scalars(select(CvatLabel).order_by(CvatLabel.name)).all())
+def list_labels(
+    project_external_id: str | None = Query(default=None, max_length=64),
+    task_external_id: str | None = Query(default=None, max_length=64),
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> list[CvatLabel]:
+    if project_external_id or task_external_id:
+        scope = _resolve_label_scope(db, user, project_external_id, task_external_id)
+        return _labels_for_scope(db, scope)
+
+    query = select(CvatLabel)
+    if user.role != "admin":
+        project_external_ids = _accessible_project_external_ids(db, user)
+        task_external_ids = _task_external_ids_for_projects(db, project_external_ids)
+        if not project_external_ids and not task_external_ids:
+            return []
+        conditions = []
+        if project_external_ids:
+            conditions.append(CvatLabel.project_external_id.in_(project_external_ids))
+        if task_external_ids:
+            conditions.append(CvatLabel.task_external_id.in_(task_external_ids))
+        query = query.where(or_(*conditions))
+    return list(db.scalars(query.order_by(CvatLabel.name, CvatLabel.task_external_id)).all())
 
 
 @router.patch("/color", response_model=list[CvatLabelRead])
@@ -221,6 +242,28 @@ def _clean_label_name(name: str) -> str:
     return value
 
 
+def _accessible_project_external_ids(db: Session, user: User) -> list[str]:
+    if user.role == "admin":
+        return [project.external_id for project in db.scalars(select(Project)).all()]
+    return [
+        project.external_id
+        for project in db.scalars(
+            select(Project)
+            .join(ProjectMember, ProjectMember.project_id == Project.id)
+            .where(ProjectMember.user_id == user.id)
+        ).all()
+    ]
+
+
+def _task_external_ids_for_projects(db: Session, project_external_ids: list[str]) -> list[str]:
+    if not project_external_ids:
+        return []
+    return [
+        task.external_id
+        for task in db.scalars(select(Task).where(Task.project_external_id.in_(project_external_ids))).all()
+    ]
+
+
 def _label_digest(scope: str, name: str) -> str:
     return hashlib.sha1(f"{scope}:label:{name}".encode()).hexdigest()[:16]
 
@@ -266,9 +309,31 @@ def _resolve_label_scope(
 def _label_impact(db: Session, name: str, scope: dict) -> LabelImpactRead:
     label_name = _clean_label_name(name)
     task_external_ids = _task_external_ids(scope)
-    annotations = _count_label_name(db, AnnotationRecord, label_name, task_external_ids, "task_external_id")
-    suggestions = _count_label_name(db, InferenceSuggestion, label_name, task_external_ids, "task_external_id")
-    derived_assets = _count_label_name(db, DerivedAsset, label_name, task_external_ids, "source_task_external_id")
+    strict_task_scope = _scope_requires_task_filter(scope)
+    annotations = _count_label_name(
+        db,
+        AnnotationRecord,
+        label_name,
+        task_external_ids,
+        "task_external_id",
+        strict_empty=strict_task_scope,
+    )
+    suggestions = _count_label_name(
+        db,
+        InferenceSuggestion,
+        label_name,
+        task_external_ids,
+        "task_external_id",
+        strict_empty=strict_task_scope,
+    )
+    derived_assets = _count_label_name(
+        db,
+        DerivedAsset,
+        label_name,
+        task_external_ids,
+        "source_task_external_id",
+        strict_empty=strict_task_scope,
+    )
     task_labels = sum(1 for task in scope["tasks"] if _task_has_label(task, label_name))
     labels = len(_label_rows(db, scope, label_name))
     return LabelImpactRead(
@@ -292,7 +357,11 @@ def _count_label_name(
     name: str,
     task_external_ids: list[str],
     task_field_name: str,
+    *,
+    strict_empty: bool = False,
 ) -> int:
+    if strict_empty and not task_external_ids:
+        return 0
     query = select(func.count(model.id)).where(func.lower(model.label_name) == name.lower())
     if task_external_ids:
         task_field = getattr(model, task_field_name)
@@ -349,22 +418,44 @@ def _rewrite_label_references(
     target_color = _label_color_for_name(db, scope, target_name) or source_color
     target_label_id = _label_raw_id_for_name(db, scope, target_name) or _label_raw_id_for_name(db, scope, source_name)
     task_external_ids = _task_external_ids(scope)
+    strict_task_scope = _scope_requires_task_filter(scope)
 
-    for annotation in _records_with_label(db, AnnotationRecord, source_name, task_external_ids, "task_external_id"):
+    for annotation in _records_with_label(
+        db,
+        AnnotationRecord,
+        source_name,
+        task_external_ids,
+        "task_external_id",
+        strict_empty=strict_task_scope,
+    ):
         annotation.label_name = target_name
         if target_label_id is not None:
             annotation.label_id = target_label_id
         annotation.raw = _rewrite_raw_label(annotation.raw, target_name, target_color, target_label_id)
         db.add(annotation)
 
-    for suggestion in _records_with_label(db, InferenceSuggestion, source_name, task_external_ids, "task_external_id"):
+    for suggestion in _records_with_label(
+        db,
+        InferenceSuggestion,
+        source_name,
+        task_external_ids,
+        "task_external_id",
+        strict_empty=strict_task_scope,
+    ):
         suggestion.label_name = target_name
         if target_label_id is not None:
             suggestion.label_id = target_label_id
         suggestion.raw = _rewrite_raw_label(suggestion.raw, target_name, target_color, target_label_id)
         db.add(suggestion)
 
-    for asset in _records_with_label(db, DerivedAsset, source_name, task_external_ids, "source_task_external_id"):
+    for asset in _records_with_label(
+        db,
+        DerivedAsset,
+        source_name,
+        task_external_ids,
+        "source_task_external_id",
+        strict_empty=strict_task_scope,
+    ):
         asset.label_name = target_name
         if target_label_id is not None:
             asset.label_id = target_label_id
@@ -382,11 +473,19 @@ def _records_with_label(
     name: str,
     task_external_ids: list[str],
     task_field_name: str,
+    *,
+    strict_empty: bool = False,
 ) -> list:
+    if strict_empty and not task_external_ids:
+        return []
     query = select(model).where(func.lower(model.label_name) == name.lower())
     if task_external_ids:
         query = query.where(getattr(model, task_field_name).in_(task_external_ids))
     return list(db.scalars(query).all())
+
+
+def _scope_requires_task_filter(scope: dict) -> bool:
+    return bool(scope.get("project_external_id") or scope.get("task_external_id"))
 
 
 def _rewrite_label_rows(

@@ -1,3 +1,4 @@
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
@@ -7,8 +8,16 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.models import AuditEvent, CvatLabel, InferenceSuggestion, Task, utcnow
+from app.models import AnnotationRecord, AuditEvent, CvatLabel, InferenceSuggestion, Task, utcnow
 from app.schemas import InferenceRunCreate
+from app.services.annotations import (
+    _cvat_annotation_version,
+    _ensure_local_label,
+    _frame_dimensions,
+    _job_for_task,
+    _label_id_for_name,
+    normalize_cvat_job_id,
+)
 from app.services.cvat_client import CvatClient
 
 
@@ -74,16 +83,25 @@ def run_inference(
                 timestamp=timestamp,
                 label_id=label_ids.get(prediction.label_name or ""),
             )
+            existing = db.scalar(select(InferenceSuggestion).where(InferenceSuggestion.external_id == suggestion.external_id))
+            if existing is not None:
+                suggestions.append(existing)
+                continue
             db.add(suggestion)
             suggestions.append(suggestion)
 
     db.flush()
-    if payload.write_to_cvat and payload.cvat_job_id:
-        _append_suggestions_to_cvat(client, payload.cvat_job_id, suggestions)
-        for suggestion in suggestions:
-            suggestion.status = "accepted"
-            suggestion.raw = {**(suggestion.raw or {}), "cvat_written": True}
-            db.add(suggestion)
+    accepted_annotations = 0
+    cvat_synced = False
+    cvat_error: str | None = None
+    if payload.write_to_cvat:
+        accepted_annotations, cvat_synced, cvat_error = _materialize_accepted_suggestions(
+            db,
+            client=client,
+            task=task,
+            payload=payload,
+            suggestions=suggestions,
+        )
 
     db.add(
         AuditEvent(
@@ -98,8 +116,11 @@ def run_inference(
                 "frame_start": payload.frame_start,
                 "frame_end": frame_end,
                 "created": len(suggestions),
+                "accepted_annotations": accepted_annotations,
                 "apply_mode": payload.apply_mode,
                 "write_to_cvat": payload.write_to_cvat,
+                "cvat_synced": cvat_synced,
+                "cvat_error": cvat_error,
             },
         )
     )
@@ -108,6 +129,249 @@ def run_inference(
         db.refresh(suggestion)
     _report(progress_callback, 98, f"Stored {len(suggestions)} suggestions.")
     return suggestions
+
+
+def _materialize_accepted_suggestions(
+    db: Session,
+    *,
+    client: CvatClient,
+    task: Task,
+    payload: InferenceRunCreate,
+    suggestions: list[InferenceSuggestion],
+) -> tuple[int, bool, str | None]:
+    if not suggestions:
+        return 0, False, None
+
+    job = _job_for_task(db, payload.task_external_id)
+    cvat_job_id = (
+        normalize_cvat_job_id(payload.cvat_job_id)
+        or (normalize_cvat_job_id(job.external_id) if job and job.external_id else None)
+    )
+    local_job_id = cvat_job_id or f"local:{payload.task_external_id}"
+    version = _cvat_annotation_version(client, cvat_job_id) if cvat_job_id else None
+
+    records: list[AnnotationRecord] = []
+    cvat_shapes: list[dict[str, Any]] = []
+    missing_labels: set[str] = set()
+    for suggestion in suggestions:
+        suggestion.status = "accepted"
+        if suggestion.shape_type not in {"rectangle", "polygon"}:
+            suggestion.raw = {**(suggestion.raw or {}), "accepted_directly": False, "skip_reason": "unsupported_shape"}
+            db.add(suggestion)
+            continue
+
+        label_name = (suggestion.label_name or "").strip()
+        if not label_name:
+            suggestion.raw = {**(suggestion.raw or {}), "accepted_directly": False, "skip_reason": "missing_label"}
+            db.add(suggestion)
+            continue
+
+        label_id = suggestion.label_id or _label_id_for_name(db, label_name, payload.task_external_id)
+        if label_id is None:
+            _ensure_local_label(db, task, label_name, None)
+            db.flush()
+            label_id = _label_id_for_name(db, label_name, payload.task_external_id)
+        if label_id is None:
+            missing_labels.add(label_name)
+
+        points = _absolute_suggestion_points(db, suggestion, payload.task_external_id)
+        if not points:
+            suggestion.raw = {**(suggestion.raw or {}), "accepted_directly": False, "skip_reason": "missing_points"}
+            db.add(suggestion)
+            continue
+
+        external_id = _accepted_annotation_external_id(payload.task_external_id, suggestion)
+        existing = db.scalar(select(AnnotationRecord).where(AnnotationRecord.external_id == external_id))
+        record_already_existed = existing is not None
+        annotation_id = external_id.rsplit(":", 1)[-1]
+        raw = {
+            "id": annotation_id,
+            "type": suggestion.shape_type,
+            "frame": suggestion.frame,
+            "label_id": label_id,
+            "label_name": label_name,
+            "source": "auto",
+            "points": points,
+            "attributes": [],
+            "bbox_norm": _suggestion_bbox_norm(suggestion),
+            "points_norm": _suggestion_points_norm(suggestion),
+            "coordinate_space": "image-absolute",
+            "origin": "autoannotation",
+            "model_id": payload.model_id,
+            "model_version": payload.model_version,
+            "model_family": payload.model_family,
+            "confidence": suggestion.score,
+            "_cvat_version": version,
+            "cvat_synced": False,
+            "cvat_error": None,
+            "suggestion_id": suggestion.id,
+        }
+
+        if existing is None:
+            record = AnnotationRecord(
+                external_id=external_id,
+                cvat_job_id=local_job_id,
+                task_external_id=payload.task_external_id,
+                annotation_type="shape",
+                cvat_annotation_id=annotation_id,
+                frame=suggestion.frame,
+                label_id=label_id,
+                label_name=label_name,
+                shape_type=suggestion.shape_type,
+                source="auto",
+                confidence=suggestion.score,
+                points=points,
+                review_state="pending",
+                raw=raw,
+            )
+        else:
+            record = existing
+            record.cvat_job_id = local_job_id
+            record.task_external_id = payload.task_external_id
+            record.annotation_type = "shape"
+            record.cvat_annotation_id = annotation_id
+            record.frame = suggestion.frame
+            record.label_id = label_id
+            record.label_name = label_name
+            record.shape_type = suggestion.shape_type
+            record.source = "auto"
+            record.confidence = suggestion.score
+            record.points = points
+            record.review_state = "pending"
+            record.raw = raw
+
+        db.add(record)
+        records.append(record)
+        suggestion.raw = {**(suggestion.raw or {}), "accepted_directly": True, "annotation_external_id": external_id}
+        db.add(suggestion)
+
+        if cvat_job_id and label_id is not None and not record_already_existed:
+            cvat_shapes.append(
+                {
+                    "type": suggestion.shape_type,
+                    "frame": suggestion.frame,
+                    "label_id": label_id,
+                    "points": points,
+                    "source": "auto",
+                    "attributes": [],
+                }
+            )
+
+    db.flush()
+    cvat_synced = False
+    cvat_error: str | None = None
+    if cvat_job_id and cvat_shapes:
+        try:
+            body: dict[str, Any] = {"tags": [], "shapes": cvat_shapes, "tracks": []}
+            if version is not None:
+                body["version"] = version
+            client.partial_update_job_annotations(cvat_job_id, "create", body)
+            cvat_synced = True
+        except Exception as exc:
+            cvat_error = str(exc)
+    elif missing_labels:
+        cvat_error = f"Labels not found in CVAT: {', '.join(sorted(missing_labels))}"
+    elif records and not cvat_job_id:
+        cvat_error = "CVAT job not found for task"
+
+    for record in records:
+        record.raw = {
+            **(record.raw or {}),
+            "cvat_synced": cvat_synced and record.label_id is not None,
+            "cvat_error": None if cvat_synced and record.label_id is not None else cvat_error,
+        }
+        db.add(record)
+
+    for suggestion in suggestions:
+        suggestion.raw = {
+            **(suggestion.raw or {}),
+            "cvat_written": cvat_synced,
+            "cvat_error": None if cvat_synced else cvat_error,
+        }
+        db.add(suggestion)
+
+    return len(records), cvat_synced, cvat_error
+
+
+def _accepted_annotation_external_id(task_external_id: str, suggestion: InferenceSuggestion) -> str:
+    digest = hashlib.sha1(suggestion.external_id.encode()).hexdigest()[:16]
+    return f"auto:{task_external_id}:{suggestion.frame}:{digest}"
+
+
+def _absolute_suggestion_points(
+    db: Session,
+    suggestion: InferenceSuggestion,
+    task_external_id: str,
+) -> list[float]:
+    points = [float(value) for value in (suggestion.points or []) if _is_number(value)]
+    if not points:
+        return []
+    if any(value > 1 for value in points):
+        return [round(value, 3) for value in points]
+    frame_width, frame_height = _frame_dimensions(db, task_external_id, suggestion.frame)
+    return [
+        round(value * (frame_width if index % 2 == 0 else frame_height), 3)
+        for index, value in enumerate(points)
+    ]
+
+
+def _suggestion_bbox_norm(suggestion: InferenceSuggestion) -> dict[str, float] | None:
+    raw = suggestion.raw if isinstance(suggestion.raw, dict) else {}
+    bbox = raw.get("bbox_norm")
+    if isinstance(bbox, dict):
+        parsed = {key: _float_or_none(bbox.get(key)) for key in ("x", "y", "w", "h")}
+        if all(value is not None for value in parsed.values()):
+            return {key: float(value) for key, value in parsed.items() if value is not None}
+    points_norm = _suggestion_points_norm(suggestion)
+    if len(points_norm) < 4:
+        return None
+    xs = points_norm[0::2]
+    ys = points_norm[1::2]
+    x1, x2 = min(xs), max(xs)
+    y1, y2 = min(ys), max(ys)
+    return {"x": x1, "y": y1, "w": max(0.0, x2 - x1), "h": max(0.0, y2 - y1)}
+
+
+def _suggestion_points_norm(suggestion: InferenceSuggestion) -> list[float]:
+    raw = suggestion.raw if isinstance(suggestion.raw, dict) else {}
+    polygon = raw.get("polygon_norm")
+    if isinstance(polygon, list):
+        flattened: list[float] = []
+        for point in polygon:
+            if isinstance(point, list | tuple) and len(point) >= 2:
+                x = _float_or_none(point[0])
+                y = _float_or_none(point[1])
+                if x is not None and y is not None:
+                    flattened.extend([x, y])
+        if flattened:
+            return flattened
+    bbox = raw.get("bbox_norm")
+    if isinstance(bbox, dict):
+        x = _float_or_none(bbox.get("x"))
+        y = _float_or_none(bbox.get("y"))
+        w = _float_or_none(bbox.get("w"))
+        h = _float_or_none(bbox.get("h"))
+        if x is not None and y is not None and w is not None and h is not None:
+            return [x, y, x + w, y + h]
+    points = [float(value) for value in (suggestion.points or []) if _is_number(value)]
+    if points and all(0 <= value <= 1 for value in points):
+        return points
+    return []
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_number(value: Any) -> bool:
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def ultralytics_predict(image: Any, payload: InferenceRunCreate) -> list[ModelPrediction]:
@@ -184,10 +448,7 @@ def _prediction_to_suggestion(
     timestamp: str,
     label_id: int | None,
 ) -> InferenceSuggestion:
-    external_id = (
-        f"inference:{payload.task_external_id}:{frame}:"
-        f"{payload.model_id}:{payload.model_version}:{timestamp}:{prediction_index}"
-    )
+    external_id = _suggestion_external_id(payload, frame, prediction_index, timestamp)
     origin = {
         "model_id": payload.model_id,
         "model_version": payload.model_version,
@@ -220,6 +481,27 @@ def _prediction_to_suggestion(
         origin=origin,
         raw=prediction.raw,
     )
+
+
+def _suggestion_external_id(
+    payload: InferenceRunCreate,
+    frame: int,
+    prediction_index: int,
+    timestamp: str,
+) -> str:
+    raw = ":".join(
+        [
+            payload.task_external_id,
+            str(frame),
+            payload.model_id,
+            payload.model_version,
+            payload.model_family,
+            payload.dedupe_key or timestamp,
+            str(prediction_index),
+        ]
+    )
+    digest = hashlib.sha1(raw.encode()).hexdigest()[:24]
+    return f"inference:{payload.task_external_id}:{frame}:{digest}"
 
 
 def _replace_existing_suggestions(db: Session, payload: InferenceRunCreate, frames: list[int]) -> None:

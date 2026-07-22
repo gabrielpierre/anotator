@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, db_session
+from app.api.deps import current_user, db_session, require_project_access
+from app.api.project_scope import job_visible, project_payload
 from app.core.config import get_settings
 from app.models import AuditEvent, JobRecord, Project, User
 from app.schemas import ImportJobRead, ImportTaskCreate, JobRead
@@ -10,6 +11,8 @@ from app.services.artifacts import S3ArtifactStore
 from app.services.imports import (
     DuplicateImportImagesError,
     build_import_file_manifest,
+    is_import_image_file,
+    record_import_storage_usage,
     validate_import_file_manifest_unique,
     validate_import_quota,
 )
@@ -27,6 +30,9 @@ def create_import_task(
 ) -> ImportJobRead:
     payload = _normalize_import_project(db, payload)
     payload = _normalize_import_assignee(payload, actor)
+    project = require_project_access(db, actor, payload.project_id) if payload.project_id else None
+    if project is None and actor.role != "admin":
+        raise HTTPException(status_code=403, detail="Project is required to import images")
     _validate_assignee(db, payload, actor)
     store = S3ArtifactStore(get_settings())
     try:
@@ -49,6 +55,7 @@ def create_import_task(
             "operation": "import_task",
             "payload": payload.model_dump(mode="json"),
             "created_by": _actor_payload(actor),
+            **project_payload(project),
         },
     )
     db.add(
@@ -116,6 +123,8 @@ async def upload_import_task_files(
     job = db.get(JobRecord, job_id)
     if job is None or job.kind != "import":
         raise HTTPException(status_code=404, detail="Import job not found")
+    if not job_visible(db, actor, job):
+        raise HTTPException(status_code=404, detail="Import job not found")
     if job.status not in {"queued", "failed"}:
         raise HTTPException(status_code=409, detail="Import job is not accepting files")
     payload = ImportTaskCreate.model_validate((job.raw or {}).get("payload") or {})
@@ -156,11 +165,18 @@ async def upload_import_task_files(
         content_type = file.content_type or "application/octet-stream"
         prepared_files.append((filename, content, content_type))
     manifest = build_import_file_manifest(prepared_files)
+    image_manifest = build_import_file_manifest(
+        [
+            (filename, content, content_type)
+            for filename, content, content_type in prepared_files
+            if is_import_image_file(filename, content_type)
+        ]
+    )
     try:
         validate_import_file_manifest_unique(
             db,
             payload,
-            manifest,
+            image_manifest,
             artifact_store=store,
             current_job_id=job.id,
         )
@@ -173,8 +189,10 @@ async def upload_import_task_files(
         )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     uploaded = []
-    for (filename, content, content_type), metadata in zip(prepared_files, manifest, strict=True):
-        key = f"imports/{job.id}/uploads/{metadata['filename']}"
+    for index, ((filename, content, content_type), metadata) in enumerate(
+        zip(prepared_files, manifest, strict=True)
+    ):
+        key = f"imports/{job.id}/uploads/{index:06d}-{metadata['filename']}"
         uri = store.put_bytes(key, content, content_type)
         uploaded.append(
             {
@@ -183,10 +201,17 @@ async def upload_import_task_files(
             }
         )
     try:
-        validate_import_quota(db, payload, uploaded_bytes=total_bytes)
+        project = validate_import_quota(db, payload, uploaded_bytes=total_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    job.raw = {**(job.raw or {}), "upload_artifacts": uploaded}
+    previous_uploaded_bytes = _int_value((job.raw or {}).get("upload_storage_bytes")) or 0
+    record_import_storage_usage(
+        db,
+        project,
+        total_bytes,
+        previous_uploaded_bytes=previous_uploaded_bytes,
+    )
+    job.raw = {**(job.raw or {}), "upload_artifacts": uploaded, "upload_storage_bytes": total_bytes}
     job.detail = f"Queued upload of {len(uploaded)} files."
     db.add(job)
     db.add(
@@ -217,13 +242,30 @@ def _duplicate_upload_filenames(files: list[UploadFile]) -> list[str]:
     return sorted(duplicates.values(), key=str.casefold)
 
 
+def _int_value(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 @router.get("/{job_id}", response_model=ImportJobRead)
 def get_import_job(
     job_id: str,
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> ImportJobRead:
     job = db.get(JobRecord, job_id)
     if job is None or job.kind != "import":
+        raise HTTPException(status_code=404, detail="Import job not found")
+    if not job_visible(db, user, job):
         raise HTTPException(status_code=404, detail="Import job not found")
     return ImportJobRead(job=JobRead.model_validate(job))

@@ -32,6 +32,7 @@ import {
   stopTrainingRun,
 } from "@/lib/api/client"
 import { formatDateTimePt, toUiJobStatus, type UiJobStatus } from "@/lib/api/status"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendDatasetRelease, BackendJobStatus, BackendTrainingRun } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
@@ -42,9 +43,14 @@ export function TrainingList() {
   const [openActionsId, setOpenActionsId] = React.useState<string | null>(null)
   const [busyAction, setBusyAction] = React.useState<{ id: string; action: "pause" | "stop" | "delete" } | null>(null)
   const [actionError, setActionError] = React.useState<string | null>(null)
+  const { activeProject, projects } = useCurrentUser()
+  const currentProjectId = activeProject?.id ?? projects[0]?.id ?? null
 
   const loadData = React.useCallback((signal?: AbortSignal) => {
-    return Promise.all([fetchTrainingRuns(signal), fetchDatasetReleases(signal)])
+    return Promise.all([
+      fetchTrainingRuns({ projectId: currentProjectId }, signal),
+      fetchDatasetReleases({ projectId: currentProjectId }, signal),
+    ])
       .then(([runs, datasetReleases]) => {
         setBackendRuns(runs)
         setBackendReleases(datasetReleases)
@@ -53,7 +59,7 @@ export function TrainingList() {
         setBackendRuns(null)
         setBackendReleases(null)
       })
-  }, [])
+  }, [currentProjectId])
 
   React.useEffect(() => {
     const controller = new AbortController()

@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
-import { useSearchParams } from "next/navigation"
+import { useRouter, useSearchParams } from "next/navigation"
 import {
   MousePointer2,
   Square,
@@ -14,6 +14,7 @@ import {
   Undo2,
   Redo2,
   Save,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   ChevronsLeft,
@@ -26,6 +27,7 @@ import {
   ArrowRightLeft,
   X,
   AlertTriangle,
+  FolderKanban,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -130,19 +132,28 @@ const handles: { id: Handle; cls: string; cursor: string }[] = [
 const POLY_CLOSE_DIST = 0.02
 
 export function AnnotateView() {
+  const router = useRouter()
   const searchParams = useSearchParams()
   const [tasks, setTasks] = useState<BackendTask[] | null>(null)
   const [backendLabels, setBackendLabels] = useState<BackendCvatLabel[]>([])
   const [taskMeta, setTaskMeta] = useState<BackendTaskDataMeta | null>(null)
   const [modelVersions, setModelVersions] = useState<BackendModelVersion[]>([])
-  const { currentUser } = useCurrentUser()
+  const { currentUser, activeProject, projects } = useCurrentUser()
+  const activeProjectId = activeProject?.id ?? projects[0]?.id ?? null
+  const activeProjectExternalId = activeProject?.externalId ?? projects[0]?.externalId ?? null
   const selectedTaskId = searchParams.get("task")
   const currentTask = useMemo(() => {
+    if (!activeProjectExternalId) return null
     if (!tasks?.length) return null
     if (!selectedTaskId) return tasks[0]
-    return tasks.find((task) => task.external_id === selectedTaskId || task.id === selectedTaskId) ?? tasks[0]
-  }, [selectedTaskId, tasks])
-  const currentProjectExternalId = currentTask?.project_external_id ?? null
+    return tasks.find((task) => task.external_id === selectedTaskId || task.id === selectedTaskId) ?? null
+  }, [activeProjectExternalId, selectedTaskId, tasks])
+  const currentProjectExternalId = currentTask?.project_external_id ?? activeProjectExternalId
+  const currentProjectId =
+    (currentProjectExternalId
+      ? projects.find((project) => project.externalId === currentProjectExternalId)?.id
+      : null) ??
+    activeProjectId
   const currentClassScopeKey = classScopeKey(currentProjectExternalId)
   const projectTasks = useMemo(() => {
     if (!tasks?.length) return []
@@ -216,19 +227,48 @@ export function AnnotateView() {
   const [saveError, setSaveError] = useState<string | null>(null)
   const [dismissedCanvasHints, setDismissedCanvasHints] = useState<Record<string, true>>({})
   const [activeSuggestionHints, setActiveSuggestionHints] = useState<Record<string, true>>({})
+  const [rightPanelCollapsed, setRightPanelCollapsed] = useState({ classes: false, objects: false })
+  const toggleRightPanelSection = (section: "classes" | "objects") => {
+    setRightPanelCollapsed((current) => ({ ...current, [section]: !current[section] }))
+  }
 
   // ---- Navegação de imagens ----
   const [imageIndex, setImageIndex] = useState(0)
+  const [onlyUnannotated, setOnlyUnannotated] = useState(false)
+  const [annotatedFrames, setAnnotatedFrames] = useState<Set<number>>(() => new Set())
   const loadedAnnotationKeys = useRef(new Set<string>())
   const dirtyFrameSignatures = useRef(new Map<string, string>())
+  const handledJobEvents = useRef(new Set<string>())
 
   useEffect(() => {
     const controller = new AbortController()
-    fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
-    fetchLabels(controller.signal).then(setBackendLabels).catch(() => setBackendLabels([]))
-    fetchModelVersions(controller.signal).then(setModelVersions).catch(() => setModelVersions([]))
+    if (!activeProjectExternalId) {
+      setTasks([])
+      setModelVersions([])
+      return () => controller.abort()
+    }
+    fetchTasks({ projectExternalId: activeProjectExternalId }, controller.signal)
+      .then(setTasks)
+      .catch(() => setTasks(null))
+    if (currentProjectId) {
+      fetchModelVersions({ projectId: currentProjectId }, controller.signal).then(setModelVersions).catch(() => setModelVersions([]))
+    } else {
+      setModelVersions([])
+    }
     return () => controller.abort()
-  }, [])
+  }, [activeProjectExternalId, currentProjectId])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    if (!currentProjectExternalId) {
+      setBackendLabels([])
+      return () => controller.abort()
+    }
+    fetchLabels({ projectExternalId: currentProjectExternalId }, controller.signal)
+      .then(setBackendLabels)
+      .catch(() => setBackendLabels([]))
+    return () => controller.abort()
+  }, [currentProjectExternalId])
 
   useEffect(() => {
     setClassList(projectClassCatalog)
@@ -248,6 +288,50 @@ export function AnnotateView() {
   const currentTaskId = currentTask?.external_id ?? currentTask?.id
   const currentFrameKey = `${currentTaskId ?? "no-task"}:${currentFrame}`
   const previewSrc = taskFrameAssetUrl(currentTaskId, currentFrame) ?? "/placeholder.svg"
+  const knownAnnotatedFrames = useMemo(() => {
+    const frames = new Set(annotatedFrames)
+    if (!currentTaskId) return frames
+    const prefix = `${currentTaskId}:`
+    for (const [frameKey, frameShapes] of Object.entries(shapesByFrame)) {
+      if (!frameKey.startsWith(prefix)) continue
+      if (!frameShapes.some((shape) => shape.cls.trim())) continue
+      const frame = Number.parseInt(frameKey.slice(prefix.length), 10)
+      if (Number.isInteger(frame) && frame >= 0) frames.add(frame)
+    }
+    return frames
+  }, [annotatedFrames, currentTaskId, shapesByFrame])
+  const findUnannotatedImage = useCallback(
+    (fromIndex: number, direction: -1 | 1) => {
+      for (let index = fromIndex + direction; index >= 1 && index <= totalImages; index += direction) {
+        if (!knownAnnotatedFrames.has(index - 1)) return index
+      }
+      return null
+    },
+    [knownAnnotatedFrames, totalImages],
+  )
+  const navigateImage = useCallback(
+    (direction: -1 | 1, step = 1) => {
+      setImageIndex((index) => {
+        if (!onlyUnannotated) return Math.min(totalImages, Math.max(1, index + direction * step))
+        let nextIndex = index
+        for (let count = 0; count < step; count += 1) {
+          const candidate = findUnannotatedImage(nextIndex, direction)
+          if (!candidate) break
+          nextIndex = candidate
+        }
+        return nextIndex
+      })
+    },
+    [findUnannotatedImage, onlyUnannotated, totalImages],
+  )
+  const canGoPrevious = onlyUnannotated ? findUnannotatedImage(imageIndex, -1) != null : imageIndex > 1
+  const canGoNext = onlyUnannotated ? findUnannotatedImage(imageIndex, 1) != null : imageIndex < totalImages
+  const toggleOnlyUnannotated = (checked: boolean) => {
+    setOnlyUnannotated(checked)
+    if (!checked || !knownAnnotatedFrames.has(currentFrame)) return
+    const nextImage = findUnannotatedImage(imageIndex, 1) ?? findUnannotatedImage(imageIndex, -1)
+    if (nextImage) setImageIndex(nextImage)
+  }
   const [naturalFrameDimensionsByKey, setNaturalFrameDimensionsByKey] = useState<Record<string, FrameDimensions>>({})
   const currentFrameDimensions = useMemo(
     () => frameDimensionsFromMeta(taskMeta, currentFrame) ?? naturalFrameDimensionsByKey[currentFrameKey] ?? null,
@@ -264,6 +348,7 @@ export function AnnotateView() {
     setDraft(null)
     setPolyDraft(null)
     setClassPicker(null)
+    setAnnotatedFrames(new Set())
   }, [currentTaskId])
 
   useEffect(() => {
@@ -280,6 +365,28 @@ export function AnnotateView() {
     return () => controller.abort()
   }, [currentTaskId])
 
+  useEffect(() => {
+    const taskExternalId = currentTask?.external_id
+    if (!taskExternalId) {
+      setAnnotatedFrames(new Set())
+      return
+    }
+    const controller = new AbortController()
+    fetchReviewAnnotations({ taskExternalId }, controller.signal)
+      .then((records) => {
+        const frames = new Set<number>()
+        records.forEach((record) => {
+          if (!isEditableAnnotationRecord(record) || record.frame == null) return
+          frames.add(record.frame)
+        })
+        setAnnotatedFrames(frames)
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setAnnotatedFrames(new Set())
+      })
+    return () => controller.abort()
+  }, [currentTask?.external_id])
+
   const currentFrameKeyRef = useRef(currentFrameKey)
   currentFrameKeyRef.current = currentFrameKey
   const setShapes = useCallback((updater: Shape[] | ((prev: Shape[]) => Shape[])) => {
@@ -294,28 +401,45 @@ export function AnnotateView() {
     })
   }, [])
 
+  const refreshCurrentFrameAnnotations = useCallback(
+    async (signal?: AbortSignal, mode: "initial" | "refresh" = "refresh") => {
+      const taskExternalId = currentTask?.external_id
+      if (!taskExternalId || !currentFrameDimensions) return
+      const records = await fetchReviewAnnotations({ taskExternalId, frame: currentFrame }, signal)
+      loadedAnnotationKeys.current.add(currentFrameKey)
+      const loadedShapes = shapesFromAnnotationRecords(records, currentFrameDimensions)
+      if (loadedShapes.length > 0) {
+        nextId.current = Math.max(nextId.current, Math.max(...loadedShapes.map((shape) => shape.id)) + 1)
+      }
+      setClassList((prev) => mergeAnnotationClasses(prev, records))
+      setAnnotatedFrames((prev) => {
+        const next = new Set(prev)
+        if (loadedShapes.some((shape) => shape.cls.trim())) next.add(currentFrame)
+        else next.delete(currentFrame)
+        return next
+      })
+      setShapesByFrame((prev) => {
+        const currentShapes = prev[currentFrameKey] ?? initialShapes
+        if (mode === "initial" && currentShapes.length > 0) return prev
+        const nextShapes =
+          dirtyFrameSignatures.current.has(currentFrameKey) && currentShapes.length > 0
+            ? mergeLoadedShapes(currentShapes, loadedShapes)
+            : loadedShapes
+        return { ...prev, [currentFrameKey]: nextShapes }
+      })
+    },
+    [currentFrame, currentFrameDimensions, currentFrameKey, currentTask?.external_id],
+  )
+
   useEffect(() => {
     const taskExternalId = currentTask?.external_id
     if (!taskExternalId || !currentFrameDimensions || loadedAnnotationKeys.current.has(currentFrameKey)) return
     const controller = new AbortController()
-    fetchReviewAnnotations({ taskExternalId, frame: currentFrame }, controller.signal)
-      .then((records) => {
-        loadedAnnotationKeys.current.add(currentFrameKey)
-        const loadedShapes = shapesFromAnnotationRecords(records, currentFrameDimensions)
-        if (loadedShapes.length > 0) {
-          nextId.current = Math.max(nextId.current, Math.max(...loadedShapes.map((shape) => shape.id)) + 1)
-        }
-        setClassList((prev) => mergeAnnotationClasses(prev, records))
-        setShapesByFrame((prev) => {
-          if ((prev[currentFrameKey]?.length ?? 0) > 0) return prev
-          return { ...prev, [currentFrameKey]: loadedShapes }
-        })
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) loadedAnnotationKeys.current.add(currentFrameKey)
-      })
+    refreshCurrentFrameAnnotations(controller.signal, "initial").catch(() => {
+      if (!controller.signal.aborted) loadedAnnotationKeys.current.add(currentFrameKey)
+    })
     return () => controller.abort()
-  }, [currentFrame, currentFrameDimensions, currentFrameKey, currentTask?.external_id])
+  }, [currentFrameDimensions, currentFrameKey, currentTask?.external_id, refreshCurrentFrameAnnotations])
 
   const suggestions = backendSuggestions
     .filter((suggestion) => suggestion.frame === currentFrame)
@@ -387,17 +511,46 @@ export function AnnotateView() {
   }, [loadSuggestions])
 
   useEffect(() => {
-    const source = new EventSource(jobsEventsUrl())
+    if (!currentProjectId) return
+    const source = new EventSource(jobsEventsUrl({ projectId: currentProjectId }))
     const onJobs = (event: MessageEvent) => {
       try {
-        const payload = JSON.parse(event.data) as { jobs?: { kind?: string; status?: string; task_external_id?: string | null }[] }
-        const hasFinishedInference = payload.jobs?.some(
-          (job) =>
-            job.kind === "inference" &&
-            ["succeeded", "failed", "canceled"].includes(String(job.status)) &&
-            job.task_external_id === currentTask?.external_id,
+        const payload = JSON.parse(event.data) as {
+          jobs?: {
+            id?: string
+            kind?: string
+            status?: string
+            task_external_id?: string | null
+            raw?: Record<string, unknown>
+            updated_at?: string
+          }[]
+        }
+        const finalJobs = (payload.jobs ?? []).filter((job) =>
+          ["succeeded", "failed", "canceled"].includes(String(job.status)),
         )
-        if (hasFinishedInference) void loadSuggestions()
+        const newFinalJobs = finalJobs.filter((job) => {
+          const key = `${job.id ?? "job"}:${job.kind ?? ""}:${job.status ?? ""}:${job.updated_at ?? ""}`
+          if (handledJobEvents.current.has(key)) return false
+          handledJobEvents.current.add(key)
+          return true
+        })
+        const currentTaskExternalId = currentTask?.external_id
+        const hasFinishedInference = newFinalJobs.some(
+          (job) => job.kind === "inference" && job.task_external_id === currentTaskExternalId,
+        )
+        const finishedImports = newFinalJobs.filter((job) => job.kind === "import")
+        const hasCurrentTaskImport = finishedImports.some((job) => {
+          const rawTaskId = typeof job.raw?.cvat_task_id === "string" ? job.raw.cvat_task_id : null
+          return currentTaskExternalId && (job.task_external_id === currentTaskExternalId || rawTaskId === currentTaskExternalId)
+        })
+        if (finishedImports.length > 0 && activeProjectExternalId) {
+          void fetchTasks({ projectExternalId: activeProjectExternalId }).then(setTasks).catch(() => null)
+        }
+        if (hasFinishedInference || hasCurrentTaskImport) {
+          void loadSuggestions()
+          loadedAnnotationKeys.current.delete(currentFrameKey)
+          void refreshCurrentFrameAnnotations(undefined, "refresh")
+        }
       } catch {
         // Ignore malformed SSE snapshots.
       }
@@ -405,7 +558,14 @@ export function AnnotateView() {
     source.addEventListener("jobs", onJobs as EventListener)
     source.onerror = () => source.close()
     return () => source.close()
-  }, [currentTask?.external_id, loadSuggestions])
+  }, [
+    activeProjectExternalId,
+    currentFrameKey,
+    currentProjectId,
+    currentTask?.external_id,
+    loadSuggestions,
+    refreshCurrentFrameAnnotations,
+  ])
 
   const generateSuggestions = async (params: {
     models: ModelInfo[]
@@ -417,6 +577,7 @@ export function AnnotateView() {
     replaceModels: string[]
     frameStart: number
     frameEnd: number
+    dedupeKey?: string
   }) => {
     if (!currentTask) throw new Error("Nenhuma task CVAT sincronizada para inferencia.")
     const jobs = await Promise.all(
@@ -436,10 +597,21 @@ export function AnnotateView() {
           confirm_replace: params.replaceModels.includes(model.id) || params.applyMode === "substituir",
           user_id: currentUser.email || currentUser.id,
           write_to_cvat: params.applyMode === "aceitas",
+          dedupe_key: params.dedupeKey ? `${currentTask.external_id}:${model.id}:${params.dedupeKey}` : null,
         }),
       ),
     )
     setHiddenLayers((prev) => prev.filter((id) => !params.models.some((m) => m.id === id)))
+    const suggestionRefreshDelays = [700, 1600, 3200]
+    suggestionRefreshDelays.forEach((delay) => {
+      window.setTimeout(() => {
+        if (params.applyMode === "aceitas") {
+          void refreshCurrentFrameAnnotations(undefined, "refresh").catch(() => undefined)
+        } else {
+          void loadSuggestions().catch(() => undefined)
+        }
+      }, delay)
+    })
 
     return {
       created: 0,
@@ -780,10 +952,18 @@ export function AnnotateView() {
   )
 
   const refreshClassSources = useCallback(async () => {
-    const [labelRows, taskRows] = await Promise.all([fetchLabels(), fetchTasks()])
+    if (!currentProjectExternalId) {
+      setBackendLabels([])
+      setTasks([])
+      return
+    }
+    const [labelRows, taskRows] = await Promise.all([
+      fetchLabels({ projectExternalId: currentProjectExternalId }),
+      fetchTasks({ projectExternalId: currentProjectExternalId }),
+    ])
     setBackendLabels(labelRows)
     setTasks(taskRows)
-  }, [])
+  }, [currentProjectExternalId])
 
   const submitClassAction = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -1130,6 +1310,11 @@ export function AnnotateView() {
         cancelPickerRef.current()
         return
       }
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        e.preventDefault()
+        navigateImage(e.key === "ArrowLeft" ? -1 : 1)
+        return
+      }
       const match = tools.find((t) => t.key.toLowerCase() === e.key.toLowerCase())
       if (match) {
         setReturnToolAfterSelect(null)
@@ -1146,7 +1331,23 @@ export function AnnotateView() {
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [undo, redo, deleteSelected, finishPolygon, polyDraft, classList])
+  }, [undo, redo, deleteSelected, finishPolygon, navigateImage, polyDraft, classList])
+
+  useEffect(() => {
+    const onMouseNavigation = (event: MouseEvent) => {
+      if (event.button !== 3 && event.button !== 4) return
+      event.preventDefault()
+      event.stopPropagation()
+      navigateImage(event.button === 3 ? -1 : 1)
+    }
+
+    window.addEventListener("mousedown", onMouseNavigation, { capture: true })
+    window.addEventListener("auxclick", onMouseNavigation, { capture: true })
+    return () => {
+      window.removeEventListener("mousedown", onMouseNavigation, { capture: true })
+      window.removeEventListener("auxclick", onMouseNavigation, { capture: true })
+    }
+  }, [navigateImage])
 
   const saveFrameShapes = useCallback(async (targetShapes: Shape[], mode: "manual" | "auto" = "manual") => {
     if (!currentTask?.external_id) {
@@ -1176,6 +1377,12 @@ export function AnnotateView() {
         const saved = classItemsFromAnnotationRecords(records, classList)
         if (saved.length === 0) return prev
         return { ...prev, [currentClassScopeKey]: mergeClassItems(existing, saved) }
+      })
+      setAnnotatedFrames((prev) => {
+        const next = new Set(prev)
+        if (targetShapes.some((shape) => shape.cls.trim())) next.add(currentFrame)
+        else next.delete(currentFrame)
+        return next
       })
       if (dirtyFrameSignatures.current.get(currentFrameKey) === signature) {
         dirtyFrameSignatures.current.delete(currentFrameKey)
@@ -1253,6 +1460,48 @@ export function AnnotateView() {
 
   const pct = (v: number) => `${v * 100}%`
 
+  if (!currentTask) {
+    const isLoadingTasks = Boolean(activeProjectExternalId) && tasks === null
+    const title = !activeProjectExternalId
+      ? "Nenhum projeto ativo"
+      : isLoadingTasks
+        ? "Carregando lotes"
+        : selectedTaskId
+          ? "Lote nao encontrado neste projeto"
+          : "Nenhum lote para anotar"
+    const description = !activeProjectExternalId
+      ? "Selecione ou crie um projeto antes de abrir a tela de anotacao."
+      : isLoadingTasks
+        ? "Buscando os lotes do projeto ativo."
+        : selectedTaskId
+          ? "A task informada nao pertence ao projeto ativo ou foi removida."
+          : "Suba um lote em Dados. Assim que a importacao terminar, as imagens aparecem automaticamente aqui para anotar."
+    const targetHref = activeProjectExternalId ? projectScopedHref("/dados", activeProjectId) : "/projetos"
+
+    return (
+      <div className="flex h-[calc(100dvh-3.5rem)] items-center justify-center p-6">
+        <div className="flex max-w-md flex-col items-center gap-3 text-center">
+          <span className="flex size-12 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
+            {isLoadingTasks ? (
+              <span className="size-5 animate-spin rounded-full border-2 border-brand-blue/30 border-t-brand-blue" />
+            ) : (
+              <FolderKanban className="size-6" />
+            )}
+          </span>
+          <div className="flex flex-col gap-1">
+            <p className="text-base font-medium text-foreground">{title}</p>
+            <p className="text-sm text-muted-foreground">{description}</p>
+          </div>
+          {!isLoadingTasks && (
+            <Button onClick={() => router.push(targetHref)}>
+              {activeProjectExternalId ? "Ir para dados" : "Ir para projetos"}
+            </Button>
+          )}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <>
     <div className="flex h-[calc(100dvh-3.5rem)] flex-col lg:flex-row">
@@ -1290,8 +1539,8 @@ export function AnnotateView() {
               variant="ghost"
               size="icon"
               aria-label="Imagem anterior"
-              onClick={() => setImageIndex((i) => Math.max(1, i - 1))}
-              disabled={imageIndex <= 1}
+              onClick={() => navigateImage(-1)}
+              disabled={!canGoPrevious}
             >
               <ChevronLeft className="size-4" />
             </Button>
@@ -1302,14 +1551,23 @@ export function AnnotateView() {
               variant="ghost"
               size="icon"
               aria-label="Próxima imagem"
-              onClick={() => setImageIndex((i) => Math.min(totalImages, i + 1))}
-              disabled={imageIndex >= totalImages}
+              onClick={() => navigateImage(1)}
+              disabled={!canGoNext}
             >
               <ChevronRight className="size-4" />
             </Button>
             <span className="ml-2 font-medium text-foreground">
               {currentTask ? currentTask.name : `Imagem ${String(imageIndex).padStart(6, "0")}.jpg`}
             </span>
+            <label className="ml-3 inline-flex h-8 cursor-pointer items-center gap-2 rounded-full border border-border px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+              <input
+                type="checkbox"
+                checked={onlyUnannotated}
+                onChange={(event) => toggleOnlyUnannotated(event.target.checked)}
+                className="size-3.5 accent-[var(--brand-blue)]"
+              />
+              Apenas sem anotação
+            </label>
           </div>
           <div className="flex items-center gap-1">
             <Button variant="ghost" size="icon" aria-label="Desfazer" onClick={undo} disabled={past.current.length === 0}>
@@ -1748,7 +2006,7 @@ export function AnnotateView() {
           <button
             type="button"
             aria-label="Retroceder 10 imagens"
-            onClick={() => setImageIndex((i) => Math.max(1, i - 10))}
+            onClick={() => navigateImage(-1, 10)}
             className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
           >
             <ChevronsLeft className="size-4" />
@@ -1788,7 +2046,7 @@ export function AnnotateView() {
           <button
             type="button"
             aria-label="Avançar 10 imagens"
-            onClick={() => setImageIndex((i) => Math.min(totalImages, i + 10))}
+            onClick={() => navigateImage(1, 10)}
             className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
           >
             <ChevronsRight className="size-4" />
@@ -1799,10 +2057,24 @@ export function AnnotateView() {
       {/* Right panel */}
       <aside className="flex w-full shrink-0 flex-col overflow-y-auto border-t border-border bg-card lg:w-80 lg:border-l lg:border-t-0">
         <section className="border-b border-border px-4 py-4">
-          <div className="mb-3 flex items-center justify-between">
-            <p className="text-sm font-semibold text-foreground">Classes</p>
-            <span className="text-xs text-muted-foreground">Atalhos 1-9</span>
-          </div>
+          <button
+            type="button"
+            onClick={() => toggleRightPanelSection("classes")}
+            aria-expanded={!rightPanelCollapsed.classes}
+            className="mb-3 flex w-full items-center justify-between gap-3 text-left"
+          >
+            <span className="text-sm font-semibold text-foreground">Classes</span>
+            <span className="flex items-center gap-2 text-xs text-muted-foreground">
+              Atalhos 1-9
+              <ChevronDown
+                className={cn(
+                  "size-4 transition-transform",
+                  rightPanelCollapsed.classes ? "-rotate-90" : "rotate-0",
+                )}
+              />
+            </span>
+          </button>
+          {!rightPanelCollapsed.classes && (
           <div className="flex flex-col gap-1">
             {classList.map((c, i) => {
               const isActive = activeClass === c.name
@@ -1985,46 +2257,62 @@ export function AnnotateView() {
               </button>
             )}
           </div>
+          )}
         </section>
 
         <section className="border-b border-border px-4 py-4">
-          <div className="mb-3 flex items-center justify-between">
-            <p className="text-sm font-semibold text-foreground">Objetos ({shapes.length})</p>
+          <button
+            type="button"
+            onClick={() => toggleRightPanelSection("objects")}
+            aria-expanded={!rightPanelCollapsed.objects}
+            className="mb-3 flex w-full items-center justify-between gap-3 text-left"
+          >
+            <span className="text-sm font-semibold text-foreground">Objetos ({shapes.length})</span>
+            <ChevronDown
+              className={cn(
+                "size-4 shrink-0 text-muted-foreground transition-transform",
+                rightPanelCollapsed.objects ? "-rotate-90" : "rotate-0",
+              )}
+            />
+          </button>
+          {!rightPanelCollapsed.objects && (
+          <>
             {selectedId != null && (
               <button
                 type="button"
                 onClick={deleteSelected}
-                className="flex items-center gap-1 text-xs text-destructive hover:underline"
+                className="mb-2 flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-destructive hover:bg-destructive/10"
               >
                 <Trash2 className="size-3.5" />
                 Remover
               </button>
             )}
-          </div>
-          <div className="flex max-h-64 flex-col gap-1 overflow-y-auto">
-            {shapes.length === 0 && <p className="px-2 py-4 text-sm text-muted-foreground">Nenhum objeto ainda.</p>}
-            {shapes.map((s) => (
-              <button
-                key={s.id}
-                type="button"
-                onClick={() => setSelectedId(s.id)}
-                aria-pressed={selectedId === s.id}
-                className={cn(
-                  "flex items-center justify-between rounded-lg px-2 py-1.5 text-sm transition-colors",
-                  selectedId === s.id ? "bg-muted ring-1 ring-brand-blue/40" : "hover:bg-muted",
-                )}
-              >
-                <span className="flex items-center gap-2 text-foreground">
-                  <span className="size-2.5 rounded-sm" style={{ backgroundColor: colorFor(s.cls) }} />
-                  {s.cls}
-                  <span className="text-xs text-muted-foreground">
-                    {s.type === "box" ? "caixa" : s.type === "polygon" ? "polígono" : "ponto"}
+            <div className="flex max-h-64 flex-col gap-1 overflow-y-auto">
+              {shapes.length === 0 && <p className="px-2 py-4 text-sm text-muted-foreground">Nenhum objeto ainda.</p>}
+              {shapes.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  onClick={() => setSelectedId(s.id)}
+                  aria-pressed={selectedId === s.id}
+                  className={cn(
+                    "flex items-center justify-between rounded-lg px-2 py-1.5 text-sm transition-colors",
+                    selectedId === s.id ? "bg-muted ring-1 ring-brand-blue/40" : "hover:bg-muted",
+                  )}
+                >
+                  <span className="flex items-center gap-2 text-foreground">
+                    <span className="size-2.5 rounded-sm" style={{ backgroundColor: colorFor(s.cls) }} />
+                    {s.cls}
+                    <span className="text-xs text-muted-foreground">
+                      {s.type === "box" ? "caixa" : s.type === "polygon" ? "polígono" : "ponto"}
+                    </span>
                   </span>
-                </span>
-                <span className="text-xs tabular-nums text-muted-foreground">#{s.id}</span>
-              </button>
-            ))}
-          </div>
+                  <span className="text-xs tabular-nums text-muted-foreground">#{s.id}</span>
+                </button>
+              ))}
+            </div>
+          </>
+          )}
         </section>
 
         <AutoAnnotationCard
@@ -2419,6 +2707,21 @@ function duplicateBoxes(a: Shape, b: Shape) {
   return boxIou(a, b) >= 0.6
 }
 
+function mergeLoadedShapes(currentShapes: Shape[], loadedShapes: Shape[]) {
+  const next = [...currentShapes]
+  for (const loaded of loadedShapes) {
+    const exists = next.some((current) => current.id === loaded.id || duplicateShapes(current, loaded))
+    if (!exists) next.push(loaded)
+  }
+  return next
+}
+
+function duplicateShapes(a: Shape, b: Shape) {
+  if (a.cls !== b.cls || a.type !== b.type) return false
+  if (a.type === "box" && b.type === "box") return duplicateBoxes(a, b)
+  return frameShapesSignature([a]) === frameShapesSignature([b])
+}
+
 function boxIou(
   a: Extract<Shape, { type: "box" }>,
   b: Extract<Shape, { type: "box" }>,
@@ -2451,6 +2754,11 @@ function shapeFromAnnotationRecord(record: BackendAnnotationRecord, dimensions: 
 
   if ((shapeType === "points" || shapeType === "point") && pointsNorm.length >= 2) {
     return { id, type: "point", cls: label, x: clamp(pointsNorm[0]), y: clamp(pointsNorm[1]) }
+  }
+
+  if ((shapeType === "rectangle" || shapeType === "box") && pointsNorm.length >= 4) {
+    const box = bboxFromNormalizedPoints(pointsNorm)
+    if (box) return { id, type: "box", cls: label, ...box }
   }
 
   const rawBbox = normalizedBoxFromRecord(record.raw.bbox_norm)
@@ -2760,6 +3068,10 @@ function pointsToBox(points: unknown[]) {
     }
   }
   return { x: 0, y: 0, w: 0.05, h: 0.05 }
+}
+
+function projectScopedHref(path: string, projectId: string | null) {
+  return projectId ? `${path}?project=${encodeURIComponent(projectId)}` : path
 }
 
 function numericIdFromString(value: string) {

@@ -22,6 +22,8 @@ from app.models import (
 from app.schemas import TaskDeleteBlockingJob, TaskDeleteImpactRead, TaskDeleteResultRead
 from app.services.jobs import ACTIVE_JOB_STATUSES
 
+TASK_OWNED_JOB_KINDS = {"cvat_job", "import", "inference"}
+
 
 class ActiveTaskJobsError(RuntimeError):
     def __init__(self, impact: TaskDeleteImpactRead):
@@ -107,7 +109,7 @@ def delete_task_with_dependencies(
             raise RuntimeError("CVAT client is required when delete_cvat=true")
         client.delete_task(task.external_id)
 
-    deleted = _delete_local_task_records(db, task.external_id)
+    deleted = delete_local_task_records(db, task.external_id)
     task_id = task.id
     task_external_id = task.external_id
     task_name = task.name
@@ -151,7 +153,12 @@ def delete_task_with_dependencies(
     return result
 
 
-def _delete_local_task_records(db: Session, task_external_id: str) -> dict[str, int]:
+def delete_local_task_records(db: Session, task_external_id: str) -> dict[str, int]:
+    cvat_jobs = _count(
+        JobRecord,
+        (JobRecord.kind == "cvat_job") & (JobRecord.task_external_id == task_external_id),
+        db=db,
+    )
     return {
         "annotations": _delete_count(
             db,
@@ -173,13 +180,8 @@ def _delete_local_task_records(db: Session, task_external_id: str) -> dict[str, 
             db,
             delete(TaskPreview).where(TaskPreview.task_external_id == task_external_id),
         ),
-        "cvat_jobs": _delete_count(
-            db,
-            delete(JobRecord).where(
-                JobRecord.kind == "cvat_job",
-                JobRecord.task_external_id == task_external_id,
-            ),
-        ),
+        "cvat_jobs": cvat_jobs,
+        "jobs": _delete_task_owned_jobs(db, task_external_id),
     }
 
 
@@ -221,6 +223,23 @@ def _job_references_task(db: Session, job: JobRecord, task_external_id: str) -> 
             return True
 
     return False
+
+
+def _delete_task_owned_jobs(db: Session, task_external_id: str) -> int:
+    jobs = db.scalars(select(JobRecord).where(JobRecord.kind.in_(TASK_OWNED_JOB_KINDS))).all()
+    deleted = 0
+    for job in jobs:
+        if _job_directly_references_task(job, task_external_id):
+            db.delete(job)
+            deleted += 1
+    return deleted
+
+
+def _job_directly_references_task(job: JobRecord, task_external_id: str) -> bool:
+    if job.task_external_id == task_external_id:
+        return True
+    raw = job.raw or {}
+    return _json_references_task(raw, task_external_id)
 
 
 def _dataset_releases_for_task(db: Session, task_external_id: str) -> list[DatasetRelease]:

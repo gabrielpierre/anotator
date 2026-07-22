@@ -17,6 +17,7 @@ import {
   fetchTasks,
 } from "@/lib/api/client"
 import { formatDateTimePt, formatPtNumber } from "@/lib/api/status"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendDatasetRelease, BackendTask } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
@@ -28,11 +29,13 @@ export function ReleasesView() {
   const [creating, setCreating] = React.useState(false)
   const [deletingReleaseId, setDeletingReleaseId] = React.useState<string | null>(null)
   const [error, setError] = React.useState<string | null>(null)
+  const { activeProject, projects } = useCurrentUser()
+  const currentProject = activeProject ?? projects[0] ?? null
 
   const reload = React.useCallback((signal?: AbortSignal) => {
-    fetchDatasetReleases(signal).then(setBackendReleases).catch(() => setBackendReleases(null))
-    fetchTasks(signal).then(setTasks).catch(() => setTasks([]))
-  }, [])
+    fetchDatasetReleases({ projectId: currentProject?.id ?? null }, signal).then(setBackendReleases).catch(() => setBackendReleases(null))
+    fetchTasks({ projectExternalId: currentProject?.externalId ?? null }, signal).then(setTasks).catch(() => setTasks([]))
+  }, [currentProject?.externalId, currentProject?.id])
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -68,6 +71,7 @@ export function ReleasesView() {
     try {
       const release = await createDatasetRelease({
         name: payload.name,
+        project_id: currentProject?.id ?? null,
         task_external_ids: payload.taskExternalIds,
         include_images: true,
         export_format: "CVAT for images 1.1",

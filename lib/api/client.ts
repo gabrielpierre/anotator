@@ -110,6 +110,10 @@ function withApiKeyQuery(url: string) {
   return parsed.toString()
 }
 
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return typeof value === "object" && value !== null && "aborted" in value && "addEventListener" in value
+}
+
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(`${apiBaseUrl()}${path}`, {
     method: "GET",
@@ -249,6 +253,10 @@ export function updateProject(projectId: string, payload: BackendProjectUpdate, 
   return patchJson<BackendProject>(`/projects/${encodeURIComponent(projectId)}`, payload, signal)
 }
 
+export function deleteProject(projectId: string, signal?: AbortSignal) {
+  return deleteJson<BackendProject>(`/projects/${encodeURIComponent(projectId)}`, signal)
+}
+
 export function fetchProjectMembers(projectId: string, signal?: AbortSignal) {
   return getJson<BackendProjectMember[]>(`/projects/${encodeURIComponent(projectId)}/members`, signal)
 }
@@ -266,8 +274,16 @@ export function fetchDashboard(projectId = "default", signal?: AbortSignal) {
   return getJson<BackendDashboard>(`/projects/${encodeURIComponent(projectId)}/dashboard`, signal)
 }
 
-export function fetchTasks(signal?: AbortSignal) {
-  return getJson<BackendTask[]>("/tasks", signal)
+export function fetchTasks(
+  paramsOrSignal?: { projectExternalId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendTask[]>(`/tasks${suffix}`, signal)
 }
 
 export function fetchTaskDataMeta(taskId: string, signal?: AbortSignal) {
@@ -287,8 +303,17 @@ export function deleteTask(taskId: string, options: { deleteCvat?: boolean } = {
   return deleteJson<BackendTaskDeleteResult>(`/tasks/${encodeURIComponent(taskId)}?${query.toString()}`, signal)
 }
 
-export function fetchLabels(signal?: AbortSignal) {
-  return getJson<BackendCvatLabel[]>("/labels", signal)
+export function fetchLabels(
+  paramsOrSignal?: { projectExternalId?: string | null; taskExternalId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
+  if (params.taskExternalId) query.set("task_external_id", params.taskExternalId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendCvatLabel[]>(`/labels${suffix}`, signal)
 }
 
 export function updateLabelColor(payload: BackendLabelColorUpdate, signal?: AbortSignal) {
@@ -324,12 +349,28 @@ export function deleteLabel(
   return deleteJson<BackendLabelActionResult>(`/labels/${encodeURIComponent(params.name)}${suffix}`, signal)
 }
 
-export function fetchJobs(signal?: AbortSignal) {
-  return getJson<BackendJob[]>("/jobs", signal)
+export function fetchJobs(
+  paramsOrSignal?: { projectId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectId) query.set("project_id", params.projectId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendJob[]>(`/jobs${suffix}`, signal)
 }
 
-export function fetchJobCapacity(signal?: AbortSignal) {
-  return getJson<BackendJobCapacity>("/jobs/capacity", signal)
+export function fetchJobCapacity(
+  paramsOrSignal?: { projectId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectId) query.set("project_id", params.projectId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendJobCapacity>(`/jobs/capacity${suffix}`, signal)
 }
 
 export function updateJobPriority(jobId: string, priority: number, signal?: AbortSignal) {
@@ -348,8 +389,10 @@ export function cancelJob(jobId: string, signal?: AbortSignal) {
   return postJson<BackendJob>(`/jobs/${encodeURIComponent(jobId)}/cancel`, {}, signal)
 }
 
-export function jobsEventsUrl() {
-  return withApiKeyQuery(`${apiBaseUrl()}/jobs/events`)
+export function jobsEventsUrl(params: { projectId?: string | null } = {}) {
+  const url = new URL(`${apiBaseUrl()}/jobs/events`)
+  if (params.projectId) url.searchParams.set("project_id", params.projectId)
+  return withApiKeyQuery(url.toString())
 }
 
 export function queueCvatSync(signal?: AbortSignal) {
@@ -361,11 +404,12 @@ export function createInferenceRun(payload: BackendInferenceRunCreate, signal?: 
 }
 
 export function fetchInferenceSuggestions(
-  params: { taskExternalId?: string; frame?: number; modelId?: string; status?: string } = {},
+  params: { taskExternalId?: string; projectExternalId?: string | null; frame?: number; modelId?: string; status?: string } = {},
   signal?: AbortSignal,
 ) {
   const query = new URLSearchParams()
   if (params.taskExternalId) query.set("task_external_id", params.taskExternalId)
+  if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
   if (params.frame !== undefined) query.set("frame", String(params.frame))
   if (params.modelId) query.set("model_id", params.modelId)
   if (params.status) query.set("status", params.status)
@@ -395,20 +439,37 @@ export function updateInferenceSuggestionStatus(
   )
 }
 
-export function fetchReviewQueue(signal?: AbortSignal) {
-  return getJson<BackendReviewQueueItem[]>("/review/queue", signal)
+export function fetchReviewQueue(
+  paramsOrSignal?: { projectExternalId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendReviewQueueItem[]>(`/review/queue${suffix}`, signal)
 }
 
-export function fetchReviewQueueCount(signal?: AbortSignal) {
-  return getJson<BackendReviewQueueCount>("/review/queue/count", signal)
+export function fetchReviewQueueCount(
+  paramsOrSignal?: { projectExternalId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendReviewQueueCount>(`/review/queue/count${suffix}`, signal)
 }
 
 export function fetchReviewAnnotations(
-  params: { taskExternalId?: string; frame?: number } = {},
+  params: { taskExternalId?: string; projectExternalId?: string | null; frame?: number } = {},
   signal?: AbortSignal,
 ) {
   const query = new URLSearchParams()
   if (params.taskExternalId) query.set("task_external_id", params.taskExternalId)
+  if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
   if (params.frame !== undefined) query.set("frame", String(params.frame))
   const suffix = query.toString() ? `?${query.toString()}` : ""
   return getJson<BackendAnnotationRecord[]>(`/review/annotations${suffix}`, signal)
@@ -422,8 +483,16 @@ export function createReviewDecision(payload: BackendReviewDecisionCreate, signa
   return postJson<BackendReviewDecision>("/review/decisions", payload, signal)
 }
 
-export function fetchDatasetReleases(signal?: AbortSignal) {
-  return getJson<BackendDatasetRelease[]>("/dataset-releases", signal)
+export function fetchDatasetReleases(
+  paramsOrSignal?: { projectId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectId) query.set("project_id", params.projectId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendDatasetRelease[]>(`/dataset-releases${suffix}`, signal)
 }
 
 export function fetchDatasetRelease(releaseId: string, signal?: AbortSignal) {
@@ -464,8 +533,16 @@ export function datasetReleaseDownloadPath(releaseId: string) {
   return `/dataset-releases/${encodeURIComponent(releaseId)}/download`
 }
 
-export function fetchTrainingRuns(signal?: AbortSignal) {
-  return getJson<BackendTrainingRun[]>("/training-runs", signal)
+export function fetchTrainingRuns(
+  paramsOrSignal?: { projectId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectId) query.set("project_id", params.projectId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendTrainingRun[]>(`/training-runs${suffix}`, signal)
 }
 
 export function fetchTrainingRun(runId: string, signal?: AbortSignal) {
@@ -503,8 +580,16 @@ export function trainingRunEventsUrl(runId: string) {
   return withApiKeyQuery(`${apiBaseUrl()}/training-runs/${encodeURIComponent(runId)}/events`)
 }
 
-export function fetchModelVersions(signal?: AbortSignal) {
-  return getJson<BackendModelVersion[]>("/models", signal)
+export function fetchModelVersions(
+  paramsOrSignal?: { projectId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectId) query.set("project_id", params.projectId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendModelVersion[]>(`/models${suffix}`, signal)
 }
 
 export function createModelVersion(payload: BackendModelVersionCreate, signal?: AbortSignal) {
@@ -539,8 +624,16 @@ export function modelDownloadPath(modelId: string) {
   return `/models/${encodeURIComponent(modelId)}/download`
 }
 
-export function fetchPipelineRuns(signal?: AbortSignal) {
-  return getJson<BackendPipelineRun[]>("/pipeline-runs", signal)
+export function fetchPipelineRuns(
+  paramsOrSignal?: { projectId?: string | null } | AbortSignal,
+  maybeSignal?: AbortSignal,
+) {
+  const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
+  const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
+  const query = new URLSearchParams()
+  if (params.projectId) query.set("project_id", params.projectId)
+  const suffix = query.toString() ? `?${query.toString()}` : ""
+  return getJson<BackendPipelineRun[]>(`/pipeline-runs${suffix}`, signal)
 }
 
 export function createPipelineRun(payload: BackendPipelineRunCreate, signal?: AbortSignal) {
@@ -556,10 +649,11 @@ export function createPipelineDefinition(payload: BackendPipelineDefinitionCreat
 }
 
 export function fetchDerivedAssets(
-  params: { pipelineRunId?: string; datasetReleaseId?: string; split?: string; limit?: number } = {},
+  params: { projectId?: string | null; pipelineRunId?: string; datasetReleaseId?: string; split?: string; limit?: number } = {},
   signal?: AbortSignal,
 ) {
   const query = new URLSearchParams()
+  if (params.projectId) query.set("project_id", params.projectId)
   if (params.pipelineRunId) query.set("pipeline_run_id", params.pipelineRunId)
   if (params.datasetReleaseId) query.set("dataset_release_id", params.datasetReleaseId)
   if (params.split) query.set("split", params.split)
@@ -582,6 +676,21 @@ export function artifactDownloadPathFromUri(uri: string) {
 
 export function artifactAssetUrlFromUri(uri: string) {
   const url = new URL(`${apiBaseUrl()}${artifactDownloadPathFromUri(uri)}`)
+  url.searchParams.set("inline", "true")
+  return withApiKeyQuery(url.toString())
+}
+
+export function trainingArtifactDownloadPath(runId: string, artifactPath: string) {
+  const encodedPath = artifactPath
+    .split("/")
+    .filter(Boolean)
+    .map((part) => encodeURIComponent(part))
+    .join("/")
+  return `/training/${encodeURIComponent(runId)}/artifacts/${encodedPath}/download`
+}
+
+export function trainingArtifactAssetUrl(runId: string, artifactPath: string) {
+  const url = new URL(`${apiBaseUrl()}${trainingArtifactDownloadPath(runId, artifactPath)}`)
   url.searchParams.set("inline", "true")
   return withApiKeyQuery(url.toString())
 }
@@ -614,7 +723,7 @@ export function uploadImportTaskFilesWithProgress(
   return new Promise<BackendImportJob>((resolve, reject) => {
     const filesTotal = files.reduce((total, file) => total + file.size, 0)
     const form = new FormData()
-    files.forEach((file) => form.append("files", file))
+    files.forEach((file) => form.append("files", file, uploadFilename(file)))
 
     const request = new XMLHttpRequest()
     request.open("POST", `${apiBaseUrl()}/imports/tasks/${encodeURIComponent(jobId)}/files`)
@@ -663,6 +772,11 @@ export function uploadImportTaskFilesWithProgress(
     request.ontimeout = () => reject(new Error("Upload enviado, mas o backend demorou demais para finalizar o processamento."))
     request.send(form)
   })
+}
+
+function uploadFilename(file: File) {
+  const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath
+  return relativePath && relativePath.trim() ? relativePath : file.name
 }
 
 function uploadErrorMessage(request: XMLHttpRequest) {

@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     default_admin_email: str = Field(default="admin@cvat.plus", alias="DEFAULT_ADMIN_EMAIL")
     default_admin_password: str = Field(default="admin123", alias="DEFAULT_ADMIN_PASSWORD")
     default_admin_name: str = Field(default="Administrador", alias="DEFAULT_ADMIN_NAME")
+    job_stale_after_seconds: int = Field(default=900, alias="JOB_STALE_AFTER_SECONDS")
+    training_cpu_max_workers: int = Field(default=2, alias="TRAINING_CPU_MAX_WORKERS")
+    training_cpu_max_threads: int = Field(default=4, alias="TRAINING_CPU_MAX_THREADS")
 
     @property
     def cors_origins(self) -> list[str]:

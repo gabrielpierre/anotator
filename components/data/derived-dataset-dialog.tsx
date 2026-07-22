@@ -89,6 +89,7 @@ export function DerivedDatasetDialog({
       const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "")
       const run = await createPipelineRun({
         name: `Dataset derivado ${normalizedBranch}`,
+        project_id: projectId || null,
         target_release_name: `${normalizedBranch}_${stamp}`,
         task_external_ids: tasks.map((task) => task.external_id),
         sample_policy: { max_assets: maxAssets },

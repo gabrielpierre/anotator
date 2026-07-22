@@ -78,19 +78,21 @@ export function ProjectOverview() {
   const [auditEvents, setAuditEvents] = React.useState<BackendAuditEvent[]>([])
   const [importDialogOpen, setImportDialogOpen] = React.useState(false)
   const [customizeOpen, setCustomizeOpen] = React.useState(false)
-  const { isAdmin, projects, updateProject } = useCurrentUser()
+  const { isAdmin, projects, activeProject, updateProject } = useCurrentUser()
+  const currentProjectId = activeProject?.id ?? projects[0]?.id ?? null
+  const currentProjectExternalId = activeProject?.externalId ?? projects[0]?.externalId ?? null
 
   React.useEffect(() => {
     const controller = new AbortController()
-    fetchDashboard("default", controller.signal).then(setDashboard).catch(() => setDashboard(null))
-    fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
-    fetchDatasetReleases(controller.signal).then(setReleases).catch(() => setReleases([]))
-    fetchTrainingRuns(controller.signal).then(setTrainingRuns).catch(() => setTrainingRuns([]))
-    fetchModelVersions(controller.signal).then(setModels).catch(() => setModels([]))
-    fetchJobs(controller.signal).then(setJobs).catch(() => setJobs([]))
+    fetchDashboard(currentProjectId ?? "default", controller.signal).then(setDashboard).catch(() => setDashboard(null))
+    fetchTasks({ projectExternalId: currentProjectExternalId }, controller.signal).then(setTasks).catch(() => setTasks(null))
+    fetchDatasetReleases({ projectId: currentProjectId }, controller.signal).then(setReleases).catch(() => setReleases([]))
+    fetchTrainingRuns({ projectId: currentProjectId }, controller.signal).then(setTrainingRuns).catch(() => setTrainingRuns([]))
+    fetchModelVersions({ projectId: currentProjectId }, controller.signal).then(setModels).catch(() => setModels([]))
+    fetchJobs({ projectId: currentProjectId }, controller.signal).then(setJobs).catch(() => setJobs([]))
     fetchAuditEvents({ limit: 5 }, controller.signal).then((page) => setAuditEvents(page.items)).catch(() => setAuditEvents([]))
     return () => controller.abort()
-  }, [])
+  }, [currentProjectExternalId, currentProjectId])
 
   const stats = dashboard?.stats
   const taskList = tasks ?? []
@@ -101,7 +103,7 @@ export function ProjectOverview() {
   const objectCount = dashboard?.class_distribution.reduce((total, item) => total + item.count, 0) ?? 0
   const currentProject = dashboard?.project ?? null
   const currentProjectStorage = storageFromProject(currentProject)
-  const contextProject = projects.find((project) => project.id === currentProject?.id) ?? projects[0] ?? null
+  const contextProject = activeProject ?? projects.find((project) => project.id === currentProject?.id) ?? projects[0] ?? null
   const projectJobsHref = contextProject?.id ? `/jobs?project=${encodeURIComponent(contextProject.id)}` : "/jobs"
   const projectTasks = taskList.filter((task) => {
     const projectExternalId = currentProject?.external_id

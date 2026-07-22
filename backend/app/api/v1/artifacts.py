@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, db_session
+from app.api.project_scope import require_artifact_access
 from app.core.config import get_settings
 from app.models import ArtifactRecord, User
 from app.schemas import ArtifactPresignRead, ArtifactRead
@@ -25,9 +26,10 @@ def presign_artifact(
     artifact_id: str | None = None,
     uri: str | None = None,
     expires_in_seconds: int = Query(default=900, ge=60, le=86_400),
-    _: User = Depends(current_user),
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
 ) -> ArtifactPresignRead:
-    resolved_uri = _resolve_uri(artifact_id, uri)
+    resolved_uri = _resolve_uri(db, user, artifact_id, uri)
     try:
         url = S3ArtifactStore(get_settings()).presign(resolved_uri, expires_in_seconds=expires_in_seconds)
     except FileNotFoundError as exc:
@@ -42,13 +44,16 @@ def download_artifact(
     artifact_id: str,
     inline: bool = Query(default=False),
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> Response:
     record = db.get(ArtifactRecord, artifact_id)
     if record is not None:
+        require_artifact_access(db, user, record)
         uri = record.uri
         name = record.name
     else:
+        if user.role != "admin":
+            raise HTTPException(status_code=403, detail="Artifact owner could not be resolved")
         try:
             uri = uri_for_artifact_id(artifact_id)
         except Exception as exc:
@@ -128,9 +133,17 @@ def persist_artifact_record(
     return record
 
 
-def _resolve_uri(artifact_id: str | None, uri: str | None) -> str:
+def _resolve_uri(db: Session, user: User, artifact_id: str | None, uri: str | None) -> str:
     if uri:
+        if user.role != "admin":
+            raise HTTPException(status_code=403, detail="Raw artifact URI is admin-only")
         return uri
     if not artifact_id:
         raise HTTPException(status_code=400, detail="artifact_id or uri is required")
+    record = db.get(ArtifactRecord, artifact_id)
+    if record is not None:
+        require_artifact_access(db, user, record)
+        return record.uri
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Artifact owner could not be resolved")
     return uri_for_artifact_id(artifact_id)

@@ -4,6 +4,7 @@ import * as React from "react"
 import {
   authToken,
   createUser,
+  deleteProject,
   deactivateUser,
   fetchCurrentUser,
   fetchProjectMembers,
@@ -30,6 +31,7 @@ export type AppUser = {
 
 export type ProjectRecord = {
   id: string
+  externalId: string
   name: string
   status: string
   storagePath: string
@@ -72,8 +74,12 @@ type UserContextValue = {
   removeUser: (userId: string) => Promise<void>
   switchUser: (userId: string) => void
   projects: ProjectRecord[]
+  activeProject: ProjectRecord | null
+  activeProjectId: string | null
+  setActiveProjectId: (projectId: string | null) => void
   addProject: (project: ProjectRecord) => Promise<void>
   updateProject: (id: string, patch: { name?: string; storagePath?: string; quotaGb?: number; annotatorIds?: string[] }) => Promise<void>
+  removeProject: (id: string) => Promise<void>
   assignUserToProject: (projectId: string, userId: string) => Promise<void>
   removeUserFromProject: (projectId: string, userId: string) => Promise<void>
 }
@@ -87,6 +93,7 @@ const emptyUser: AppUser = {
 }
 
 const UserContext = React.createContext<UserContextValue | null>(null)
+const ACTIVE_PROJECT_ID_KEY = "cvat.active_project_id"
 
 function numberFromUnknown(value: unknown) {
   if (typeof value === "number" && Number.isFinite(value)) return value
@@ -110,6 +117,7 @@ export function projectRecordFromBackend(project: BackendProject, existingAnnota
   const annotatorIds = Array.isArray(rawAnnotators) ? rawAnnotators.map(String) : existingAnnotators
   return {
     id: project.id,
+    externalId: project.external_id,
     name: project.name,
     status: project.status,
     storagePath: String(storage.path ?? "--"),
@@ -137,6 +145,10 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
   const [authReady, setAuthReady] = React.useState(false)
   const [users, setUsers] = React.useState<AppUser[]>([])
   const [projects, setProjects] = React.useState<ProjectRecord[]>([])
+  const [activeProjectId, setActiveProjectIdState] = React.useState<string | null>(() => {
+    if (typeof window === "undefined") return null
+    return window.sessionStorage.getItem(ACTIVE_PROJECT_ID_KEY)
+  })
 
   const refreshDirectory = React.useCallback(async (user: AppUser) => {
     const projectRows = await fetchProjects()
@@ -274,6 +286,13 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     return
   }, [])
 
+  const setActiveProjectId = React.useCallback((projectId: string | null) => {
+    setActiveProjectIdState(projectId)
+    if (typeof window === "undefined") return
+    if (projectId) window.sessionStorage.setItem(ACTIVE_PROJECT_ID_KEY, projectId)
+    else window.sessionStorage.removeItem(ACTIVE_PROJECT_ID_KEY)
+  }, [])
+
   const syncProjectMembers = React.useCallback(async (projectId: string, annotatorIds: string[]) => {
     await putProjectMembers(projectId, annotatorIds)
   }, [])
@@ -313,6 +332,15 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     [syncProjectMembers],
   )
 
+  const removeProject = React.useCallback<UserContextValue["removeProject"]>(
+    async (id) => {
+      await deleteProject(id)
+      setProjects((current) => current.filter((project) => project.id !== id))
+      if (activeProjectId === id) setActiveProjectId(null)
+    },
+    [activeProjectId, setActiveProjectId],
+  )
+
   const assignUserToProject = React.useCallback<UserContextValue["assignUserToProject"]>(
     async (projectId, userId) => {
       const project = projects.find((item) => item.id === projectId)
@@ -339,7 +367,17 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
     [projects, syncProjectMembers],
   )
 
+  React.useEffect(() => {
+    if (projects.length === 0) {
+      if (activeProjectId !== null) setActiveProjectId(null)
+      return
+    }
+    if (activeProjectId && projects.some((project) => project.id === activeProjectId)) return
+    setActiveProjectId(projects[0].id)
+  }, [activeProjectId, projects, setActiveProjectId])
+
   const isAuthenticated = Boolean(currentUser.id && authToken())
+  const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0] ?? null
   const value = React.useMemo<UserContextValue>(
     () => ({
       currentUser,
@@ -356,8 +394,12 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
       removeUser,
       switchUser,
       projects,
+      activeProject,
+      activeProjectId: activeProject?.id ?? null,
+      setActiveProjectId,
       addProject,
       updateProject: updateProjectRecord,
+      removeProject,
       assignUserToProject,
       removeUserFromProject,
     }),
@@ -374,8 +416,11 @@ export function UserProvider({ children }: { children: React.ReactNode }) {
       removeUser,
       switchUser,
       projects,
+      activeProject,
+      setActiveProjectId,
       addProject,
       updateProjectRecord,
+      removeProject,
       assignUserToProject,
       removeUserFromProject,
     ],

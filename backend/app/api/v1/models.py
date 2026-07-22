@@ -1,9 +1,18 @@
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_admin, current_user, db_session
+from app.api.deps import current_admin, current_user, db_session, require_project_access
+from app.api.project_scope import (
+    filter_visible_models,
+    project_for_model,
+    project_for_release,
+    project_payload,
+    project_values,
+    require_model_access,
+    require_release_access,
+)
 from app.api.v1.artifacts import artifact_read_from_uri, persist_artifact_record
 from app.core.config import get_settings
 from app.models import ArtifactRecord, AuditEvent, InferenceSuggestion, ModelVersion, User
@@ -15,10 +24,15 @@ router = APIRouter()
 
 @router.get("", response_model=list[ModelVersionRead])
 def list_model_versions(
+    project_id: str | None = Query(default=None, max_length=64),
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> list[ModelVersion]:
-    return list(db.scalars(select(ModelVersion).order_by(ModelVersion.created_at.desc())).all())
+    models = list(db.scalars(select(ModelVersion).order_by(ModelVersion.created_at.desc())).all())
+    if project_id:
+        project = require_project_access(db, user, project_id)
+        models = [model for model in models if project_values(project_for_model(db, model)) & project_values(project)]
+    return filter_visible_models(db, user, models)
 
 
 @router.post("", response_model=ModelVersionRead)
@@ -28,6 +42,14 @@ def create_model_version(
     actor: User = Depends(current_admin),
 ) -> ModelVersion:
     _ensure_unique_model(db, payload.name, payload.version)
+    project = None
+    if payload.dataset_release_id:
+        release = require_release_access(db, actor, payload.dataset_release_id)
+        project = project_for_release(db, release)
+    elif payload.project_id:
+        project = require_project_access(db, actor, payload.project_id)
+    else:
+        raise HTTPException(status_code=400, detail="project_id or dataset_release_id is required")
     model = ModelVersion(
         name=payload.name,
         version=payload.version,
@@ -36,7 +58,7 @@ def create_model_version(
         dataset_release_id=payload.dataset_release_id,
         artifact_uri=payload.artifact_uri,
         metrics=payload.metrics,
-        params=payload.params,
+        params={**payload.params, **project_payload(project)},
         status=payload.status,
     )
     db.add(model)
@@ -62,16 +84,26 @@ async def import_model_weight(
     family: str = Form("detection"),
     base_model: str = Form("manual"),
     dataset_release_id: str | None = Form(None),
+    project_id: str | None = Form(None),
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> ModelImportRead:
     _ensure_unique_model(db, name, version)
+    project = None
+    if dataset_release_id:
+        release = require_release_access(db, actor, dataset_release_id)
+        project = project_for_release(db, release)
+    elif project_id:
+        project = require_project_access(db, actor, project_id)
+    else:
+        raise HTTPException(status_code=400, detail="project_id or dataset_release_id is required")
     model = ModelVersion(
         name=name,
         version=version,
         family=family,
         base_model=base_model,
         dataset_release_id=dataset_release_id,
+        params=project_payload(project),
         status="registered",
     )
     db.add(model)
@@ -126,7 +158,7 @@ def update_model_version(
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> ModelVersion:
-    model = _require_model(db, model_id)
+    model = require_model_access(db, actor, model_id)
     changes: dict[str, object] = {}
     for field in (
         "name",
@@ -143,6 +175,16 @@ def update_model_version(
         if value is not None:
             setattr(model, field, value)
             changes[field] = value
+    if payload.dataset_release_id is not None:
+        release = require_release_access(db, actor, payload.dataset_release_id)
+        model.params = {**(model.params or {}), **project_payload(project_for_release(db, release))}
+    elif payload.project_id is not None:
+        project = require_project_access(db, actor, payload.project_id)
+        model.params = {**(model.params or {}), **project_payload(project)}
+    elif payload.params is not None:
+        owner_project = project_for_model(db, model)
+        if owner_project is not None:
+            model.params = {**model.params, **project_payload(owner_project)}
     if "name" in changes or "version" in changes:
         existing = db.scalar(
             select(ModelVersion).where(
@@ -167,7 +209,8 @@ def promote_model(
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> ModelVersion:
-    model = _require_model(db, model_id)
+    model = require_model_access(db, actor, model_id)
+    model_project_values = project_values(project_for_model(db, model))
     promoted = list(
         db.scalars(
             select(ModelVersion).where(
@@ -178,6 +221,8 @@ def promote_model(
         ).all()
     )
     for row in promoted:
+        if project_values(project_for_model(db, row)) != model_project_values:
+            continue
         row.status = "registered"
         db.add(row)
     model.status = "promoted"
@@ -201,7 +246,7 @@ def archive_model(
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> ModelVersion:
-    model = _require_model(db, model_id)
+    model = require_model_access(db, actor, model_id)
     model.status = "archived"
     db.add(model)
     db.add(
@@ -223,7 +268,7 @@ def delete_model(
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> dict:
-    model = _require_model(db, model_id)
+    model = require_model_access(db, actor, model_id)
     artifact_uris = {model.artifact_uri} if model.artifact_uri else set()
     artifact_filters = [((ArtifactRecord.owner_type == "model") & (ArtifactRecord.owner_id == model.id))]
     if artifact_uris:
@@ -268,9 +313,9 @@ def delete_model(
 def download_model(
     model_id: str,
     db: Session = Depends(db_session),
-    _: User = Depends(current_user),
+    user: User = Depends(current_user),
 ) -> Response:
-    model = _require_model(db, model_id)
+    model = require_model_access(db, user, model_id)
     if not model.artifact_uri:
         raise HTTPException(status_code=404, detail="Model artifact not found")
     try:

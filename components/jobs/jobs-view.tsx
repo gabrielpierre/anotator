@@ -17,23 +17,24 @@ import type { BackendJob, BackendJobCapacity } from "@/lib/api/types"
 export function JobsView() {
   const searchParams = useSearchParams()
   const projectId = searchParams.get("project")
-  const { isAdmin, projects } = useCurrentUser()
+  const { isAdmin, projects, activeProject } = useCurrentUser()
   const [backendJobs, setBackendJobs] = React.useState<BackendJob[] | null>(null)
   const [capacity, setCapacity] = React.useState<BackendJobCapacity | null>(null)
   const [cancelingIds, setCancelingIds] = React.useState<Set<string>>(new Set())
   const scopedProject = projects.find((project) => project.id === projectId) ?? null
-  const defaultProject = projects[0] ?? null
+  const defaultProject = activeProject ?? projects[0] ?? null
   const isProjectScoped = Boolean(projectId)
+  const requestProjectId = projectId ?? (!isAdmin ? defaultProject?.id ?? null : null)
 
   React.useEffect(() => {
     const controller = new AbortController()
-    fetchJobs(controller.signal).then(setBackendJobs).catch(() => setBackendJobs(null))
-    fetchJobCapacity(controller.signal).then(setCapacity).catch(() => setCapacity(null))
+    fetchJobs({ projectId: requestProjectId }, controller.signal).then(setBackendJobs).catch(() => setBackendJobs(null))
+    fetchJobCapacity({ projectId: requestProjectId }, controller.signal).then(setCapacity).catch(() => setCapacity(null))
     return () => controller.abort()
-  }, [])
+  }, [requestProjectId])
 
   React.useEffect(() => {
-    const source = new EventSource(jobsEventsUrl())
+    const source = new EventSource(jobsEventsUrl({ projectId: requestProjectId }))
     const handleJobs = (event: MessageEvent) => {
       try {
         const payload = JSON.parse(event.data) as { jobs?: BackendJob[] }
@@ -47,7 +48,7 @@ export function JobsView() {
       source.close()
     }
     return () => source.close()
-  }, [])
+  }, [requestProjectId])
 
   const handleCancel = async (jobId: string) => {
     setCancelingIds((current) => new Set(current).add(jobId))
@@ -63,10 +64,7 @@ export function JobsView() {
     }
   }
 
-  const visibleBackendJobs = projectId
-    ? (backendJobs ?? []).filter((job) => jobMatchesProject(job, projectId))
-    : (backendJobs ?? [])
-  const mappedJobs = visibleBackendJobs.map(mapBackendJob)
+  const mappedJobs = (backendJobs ?? []).map(mapBackendJob)
   const activeItems = mappedJobs
     .filter((job) => job.status === "executando" || job.status === "pausado")
   const queuedItems = mappedJobs
@@ -295,24 +293,6 @@ function mapBackendJob(job: BackendJob) {
     eta: "--",
     gpu: Number(job.resource_metrics.gpu ?? 0),
   }
-}
-
-function jobMatchesProject(job: BackendJob, projectId: string) {
-  const raw = job.raw ?? {}
-  const payload = objectValue(raw.payload)
-  const lineage = objectValue(raw.lineage)
-  const values = [
-    job.task_external_id,
-    raw.project_id,
-    raw.project_external_id,
-    raw.task_external_id,
-    payload.project_id,
-    payload.project_external_id,
-    payload.task_external_id,
-    lineage.project_id,
-    lineage.project_external_id,
-  ]
-  return values.some((value) => String(value ?? "") === projectId)
 }
 
 function objectValue(value: unknown) {

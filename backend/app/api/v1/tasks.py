@@ -2,7 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_admin, db_session
+from app.api.deps import current_admin, current_user, db_session, require_project_access
+from app.api.project_scope import require_task_access
 from app.core.config import get_settings
 from app.models import AnnotationRecord, AuditEvent, CvatLabel, JobRecord, Project, ProjectMember, Task, TaskDataMeta, User
 from app.schemas import (
@@ -20,20 +21,35 @@ router = APIRouter()
 
 
 @router.get("", response_model=list[TaskRead])
-def list_tasks(db: Session = Depends(db_session)) -> list[Task]:
-    tasks = list(db.scalars(select(Task).order_by(Task.updated_at.desc())).all())
-    _backfill_orphan_task_project(db, tasks)
+def list_tasks(
+    project_external_id: str | None = Query(default=None, max_length=64),
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> list[Task]:
+    query = select(Task)
+    if project_external_id:
+        require_project_access(db, user, project_external_id)
+        query = query.where(Task.project_external_id == project_external_id)
+    elif user.role == "admin":
+        query = query.where(Task.project_external_id == "__none__")
+    elif user.role != "admin":
+        project_external_ids = _accessible_project_external_ids(db, user)
+        query = query.where(Task.project_external_id.in_(project_external_ids)) if project_external_ids else query.where(
+            Task.project_external_id == "__none__"
+        )
+    tasks = list(db.scalars(query.order_by(Task.updated_at.desc())).all())
     _backfill_import_assignees(db, tasks)
     _attach_annotation_progress(db, tasks)
     return tasks
 
 
 @router.get("/{task_id}", response_model=TaskRead)
-def get_task(task_id: str, db: Session = Depends(db_session)) -> Task:
-    task = _resolve_task(db, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
-    _backfill_orphan_task_project(db, [task])
+def get_task(
+    task_id: str,
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> Task:
+    task = require_task_access(db, user, task_id)
     _backfill_import_assignees(db, [task])
     _attach_annotation_progress(db, [task])
     return task
@@ -46,9 +62,7 @@ def update_task_assignee(
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> Task:
-    task = _resolve_task(db, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = require_task_access(db, actor, task_id)
 
     assignee_payload: dict | None = None
     if payload.user_id:
@@ -98,9 +112,7 @@ def get_task_delete_impact(
     db: Session = Depends(db_session),
     _: User = Depends(current_admin),
 ) -> TaskDeleteImpactRead:
-    task = _resolve_task(db, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = require_task_access(db, _, task_id)
     return build_task_delete_impact(db, task)
 
 
@@ -111,9 +123,7 @@ def delete_task(
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> TaskDeleteResultRead:
-    task = _resolve_task(db, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="Task not found")
+    task = require_task_access(db, actor, task_id)
     try:
         return delete_task_with_dependencies(
             db,
@@ -135,9 +145,13 @@ def delete_task(
 
 
 @router.get("/{task_id}/data-meta", response_model=TaskDataMetaRead)
-def get_task_data_meta(task_id: str, db: Session = Depends(db_session)) -> TaskDataMeta:
-    task = _resolve_task(db, task_id)
-    external_id = task.external_id if task else task_id
+def get_task_data_meta(
+    task_id: str,
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> TaskDataMeta:
+    task = require_task_access(db, user, task_id)
+    external_id = task.external_id
     meta = db.scalar(select(TaskDataMeta).where(TaskDataMeta.task_external_id == external_id))
     if meta is None:
         raise HTTPException(status_code=404, detail="Task data meta not found")
@@ -145,9 +159,13 @@ def get_task_data_meta(task_id: str, db: Session = Depends(db_session)) -> TaskD
 
 
 @router.get("/{task_id}/preview")
-def get_task_preview(task_id: str, db: Session = Depends(db_session)) -> Response:
-    task = _resolve_task(db, task_id)
-    external_id = task.external_id if task else task_id
+def get_task_preview(
+    task_id: str,
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> Response:
+    task = require_task_access(db, user, task_id)
+    external_id = task.external_id
     client = CvatClient(get_settings())
     try:
         preview = client.retrieve_task_preview(external_id)
@@ -163,9 +181,10 @@ def get_task_frame(
     variant: str = Query(default="annotation", pattern="^(annotation|original)$"),
     max_side: int | None = Query(default=None, ge=256, le=8192),
     db: Session = Depends(db_session),
+    user: User = Depends(current_user),
 ) -> Response:
-    task = _resolve_task(db, task_id)
-    external_id = task.external_id if task else task_id
+    task = require_task_access(db, user, task_id)
+    external_id = task.external_id
     if frame < 0:
         raise HTTPException(status_code=400, detail="Frame must be greater than or equal to zero")
     if task and task.size and frame >= task.size:
@@ -204,6 +223,19 @@ def get_task_frame(
 
 def _resolve_task(db: Session, task_id: str) -> Task | None:
     return db.get(Task, task_id) or db.scalar(select(Task).where(Task.external_id == task_id))
+
+
+def _accessible_project_external_ids(db: Session, user: User) -> list[str]:
+    if user.role == "admin":
+        return [project.external_id for project in db.scalars(select(Project)).all()]
+    return [
+        project.external_id
+        for project in db.scalars(
+            select(Project)
+            .join(ProjectMember, ProjectMember.project_id == Project.id)
+            .where(ProjectMember.user_id == user.id)
+        ).all()
+    ]
 
 
 def _attach_annotation_progress(db: Session, tasks: list[Task]) -> None:
@@ -291,57 +323,6 @@ def _backfill_import_assignees(db: Session, tasks: list[Task]) -> None:
                     "task_external_id": task.external_id,
                     "import_job_id": job.id,
                     "assignee": assignee_payload,
-                },
-            )
-        )
-        changed = True
-    if changed:
-        db.commit()
-
-
-def _backfill_orphan_task_project(db: Session, tasks: list[Task]) -> None:
-    orphans = [task for task in tasks if task.external_id and not task.project_external_id]
-    if not orphans:
-        return
-    active_projects = list(
-        db.scalars(select(Project).where(Project.status == "active").order_by(Project.created_at)).all()
-    )
-    if len(active_projects) != 1:
-        return
-    project = active_projects[0]
-    changed = False
-    for task in orphans:
-        task.project_external_id = project.external_id
-        raw = dict(task.raw or {})
-        raw["project_external_id_backfilled"] = {
-            "project_id": project.id,
-            "project_external_id": project.external_id,
-            "source": "single_active_project",
-        }
-        task.raw = raw
-
-        task_labels = list(
-            db.scalars(select(CvatLabel).where(CvatLabel.task_external_id == task.external_id)).all()
-        )
-        labels = _merge_task_labels(task.labels or [], task_labels)
-        if labels != (task.labels or []):
-            task.labels = labels
-        for label in task_labels:
-            if label.project_external_id:
-                continue
-            label.project_external_id = project.external_id
-            db.add(label)
-        db.add(task)
-        db.add(
-            AuditEvent(
-                actor="system",
-                action="task_project_backfilled",
-                target=task.id,
-                payload={
-                    "task_id": task.id,
-                    "task_external_id": task.external_id,
-                    "project_id": project.id,
-                    "project_external_id": project.external_id,
                 },
             )
         )

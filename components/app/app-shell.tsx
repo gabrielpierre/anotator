@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { useRouter } from "next/navigation"
+import { useRouter, useSearchParams } from "next/navigation"
 import { AppSidebar } from "@/components/app/app-sidebar"
 import { AppTopbar, type Crumb } from "@/components/app/app-topbar"
 import { useCurrentUser } from "@/lib/auth/user-context"
@@ -14,9 +14,10 @@ export function AppShell({
   children: React.ReactNode
 }) {
   const [navOpen, setNavOpen] = React.useState(false)
-  const { isAuthenticated, authReady, projects } = useCurrentUser()
+  const searchParams = useSearchParams()
+  const { isAuthenticated, authReady, activeProject, projects, setActiveProjectId } = useCurrentUser()
   const router = useRouter()
-  const currentProjectName = projects[0]?.name ?? "Projeto atual"
+  const currentProjectName = activeProject?.name ?? "Nenhum projeto"
   const resolvedBreadcrumb = breadcrumb.map((crumb) =>
     crumb.label === "Projeto atual" ? { ...crumb, label: currentProjectName } : crumb,
   )
@@ -26,6 +27,14 @@ export function AppShell({
   React.useEffect(() => {
     if (authReady && !isAuthenticated) router.replace("/login")
   }, [authReady, isAuthenticated, router])
+
+  React.useEffect(() => {
+    const requestedProjectId = searchParams.get("project")
+    if (!requestedProjectId) return
+    if (!projects.some((project) => project.id === requestedProjectId)) return
+    if (activeProject?.id === requestedProjectId) return
+    setActiveProjectId(requestedProjectId)
+  }, [activeProject?.id, projects, searchParams, setActiveProjectId])
 
   if (!authReady || !isAuthenticated) {
     return (

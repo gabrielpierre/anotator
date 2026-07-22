@@ -6,6 +6,7 @@ import {
   AlertTriangle,
   Download,
   Filter,
+  FolderKanban,
   HardDrive,
   Image as ImageIcon,
   Loader2,
@@ -23,6 +24,7 @@ import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, StatusBadge, ProgressBar } from "@/components/app/primitives"
 import { DerivedDatasetDialog } from "@/components/data/derived-dataset-dialog"
 import { ImportBatchDialog } from "@/components/data/import-batch-dialog"
+import { ImportDatasetDialog } from "@/components/data/import-dataset-dialog"
 import {
   apiAssetUrl,
   assignTaskAssignee,
@@ -31,6 +33,7 @@ import {
   downloadBackendFile,
   fetchDashboard,
   fetchDerivedAssets,
+  fetchImportJob,
   fetchPipelineRuns,
   fetchTaskDeleteImpact,
   fetchTasks,
@@ -41,6 +44,7 @@ import { useCurrentUser, type ProjectRecord } from "@/lib/auth/user-context"
 import type {
   BackendDashboard,
   BackendDerivedAsset,
+  BackendImportJob,
   BackendPipelineRun,
   BackendTask,
   BackendTaskDeleteImpact,
@@ -64,6 +68,7 @@ export function DataView() {
   const [pipelineRuns, setPipelineRuns] = React.useState<BackendPipelineRun[] | null>(null)
   const [pipelineError, setPipelineError] = React.useState<string | null>(null)
   const [importDialogOpen, setImportDialogOpen] = React.useState(false)
+  const [datasetImportDialogOpen, setDatasetImportDialogOpen] = React.useState(false)
   const [derivedDialogOpen, setDerivedDialogOpen] = React.useState(false)
   const [deleteTarget, setDeleteTarget] = React.useState<BackendTask | null>(null)
   const [deleteImpact, setDeleteImpact] = React.useState<BackendTaskDeleteImpact | null>(null)
@@ -73,22 +78,67 @@ export function DataView() {
   const [users, setUsers] = React.useState<BackendUser[] | null>(null)
   const [assigningTaskId, setAssigningTaskId] = React.useState<string | null>(null)
   const [assignmentError, setAssignmentError] = React.useState<string | null>(null)
-  const { projects, isAdmin } = useCurrentUser()
+  const { projects, activeProject, isAdmin } = useCurrentUser()
+  const currentProjectRecord = activeProject ?? projects[0] ?? null
+  const currentProjectId = currentProjectRecord?.id ?? null
+  const currentProjectExternalId = currentProjectRecord?.externalId ?? null
+  const importRefreshTimers = React.useRef<Array<ReturnType<typeof setTimeout>>>([])
+
+  const clearImportRefreshTimers = React.useCallback(() => {
+    for (const timer of importRefreshTimers.current) clearTimeout(timer)
+    importRefreshTimers.current = []
+  }, [])
 
   const loadData = React.useCallback((signal?: AbortSignal) => {
-    fetchTasks(signal).then(setTasks).catch(() => setTasks(null))
-    fetchDashboard("default", signal).then(setDashboard).catch(() => setDashboard(null))
-    fetchDerivedAssets({ limit: 8 }, signal).then(setDerivedAssets).catch(() => setDerivedAssets(null))
-    fetchPipelineRuns(signal).then(setPipelineRuns).catch(() => setPipelineRuns(null))
+    if (!currentProjectRecord) {
+      setTasks([])
+      setDashboard(null)
+      setDerivedAssets([])
+      setPipelineRuns([])
+      setUsers(null)
+      return
+    }
+    fetchTasks({ projectExternalId: currentProjectExternalId }, signal).then(setTasks).catch(() => setTasks(null))
+    fetchDashboard(currentProjectId, signal).then(setDashboard).catch(() => setDashboard(null))
+    fetchDerivedAssets({ projectId: currentProjectId, limit: 8 }, signal).then(setDerivedAssets).catch(() => setDerivedAssets(null))
+    fetchPipelineRuns({ projectId: currentProjectId }, signal).then(setPipelineRuns).catch(() => setPipelineRuns(null))
     if (isAdmin) fetchUsers(signal).then(setUsers).catch(() => setUsers(null))
     else setUsers(null)
-  }, [isAdmin])
+  }, [currentProjectExternalId, currentProjectId, currentProjectRecord, isAdmin])
+
+  const scheduleImportRefresh = React.useCallback(
+    (job?: BackendImportJob) => {
+      clearImportRefreshTimers()
+      const jobId = job?.job.id
+      let attempts = 0
+      const tick = () => {
+        attempts += 1
+        loadData()
+        if (!jobId || attempts >= 18) return
+        fetchImportJob(jobId)
+          .then((latest) => {
+            if (["succeeded", "failed", "canceled"].includes(latest.job.status)) {
+              loadData()
+              return
+            }
+            importRefreshTimers.current.push(setTimeout(tick, attempts < 8 ? 1000 : 2500))
+          })
+          .catch(() => {
+            if (attempts < 18) importRefreshTimers.current.push(setTimeout(tick, 2500))
+          })
+      }
+      importRefreshTimers.current.push(setTimeout(tick, 500))
+    },
+    [clearImportRefreshTimers, loadData],
+  )
 
   React.useEffect(() => {
     const controller = new AbortController()
     loadData(controller.signal)
     return () => controller.abort()
   }, [loadData])
+
+  React.useEffect(() => clearImportRefreshTimers, [clearImportRefreshTimers])
 
   const batches =
     tasks?.map((task) => {
@@ -136,8 +186,6 @@ export function DataView() {
   const annotatedCount = batches.reduce((total, batch) => total + batch.annotatedImages, 0)
   const objectCount = batches.reduce((total, batch) => total + batch.annotations, 0)
   const latestPipeline = pipelineRuns?.[0] ?? null
-  const currentProjectId = dashboard?.project?.id ?? projects[0]?.id ?? null
-  const currentProjectRecord = projects.find((project) => project.id === currentProjectId) ?? projects[0] ?? null
   const storage = storageFromDashboard(dashboard, currentProjectRecord)
 
   function closeDeleteDialog() {
@@ -195,6 +243,36 @@ export function DataView() {
     router.push(`/anotar?task=${encodeURIComponent(taskId)}`)
   }
 
+  if (!currentProjectRecord) {
+    return (
+      <div className="flex flex-col gap-6 p-4 md:p-6">
+        <PageHeader
+          title="Dados"
+          subtitle="Selecione ou crie um projeto para importar lotes e datasets."
+          actions={
+            <Button onClick={() => router.push("/projetos")}>
+              <FolderKanban className="size-4" />
+              Ir para projetos
+            </Button>
+          }
+        />
+        <Card>
+          <CardContent className="flex min-h-[320px] flex-col items-center justify-center gap-3 p-10 text-center">
+            <span className="flex size-12 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
+              <FolderKanban className="size-6" />
+            </span>
+            <div className="flex max-w-md flex-col gap-1">
+              <p className="text-base font-medium text-foreground">Nenhum projeto ativo</p>
+              <p className="text-sm text-muted-foreground">
+                Os lotes, classes e anotações são isolados por projeto. Crie ou selecione um projeto antes de trabalhar nos dados.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
       <PageHeader
@@ -210,6 +288,10 @@ export function DataView() {
               <Scissors className="size-4" />
               Dataset derivado
             </Button>
+            <Button variant="outline" onClick={() => setDatasetImportDialogOpen(true)}>
+              <Database className="size-4" />
+              Importar dataset
+            </Button>
             <Button onClick={() => setImportDialogOpen(true)}>
               <Upload className="size-4" />
               Importar lote
@@ -221,9 +303,19 @@ export function DataView() {
         open={importDialogOpen}
         projectId={currentProjectId}
         onClose={() => setImportDialogOpen(false)}
-        onImported={() => {
+        onImported={(job) => {
           setImportDialogOpen(false)
-          loadData()
+          scheduleImportRefresh(job)
+        }}
+      />
+      <ImportDatasetDialog
+        open={datasetImportDialogOpen}
+        initialProjectId={currentProjectId}
+        lockProject
+        onClose={() => setDatasetImportDialogOpen(false)}
+        onImported={(job) => {
+          setDatasetImportDialogOpen(false)
+          scheduleImportRefresh(job)
         }}
       />
       <DerivedDatasetDialog
@@ -290,117 +382,135 @@ export function DataView() {
               </Button>
             </div>
           </CardHeader>
-          <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[860px] text-sm">
-              <thead>
-                <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground">
-                  <th className="px-5 py-3 font-medium">Lote</th>
-                  <th className="px-5 py-3 font-medium">Imagens</th>
-                  <th className="px-5 py-3 font-medium">Origem</th>
-                  <th className="px-5 py-3 font-medium">Anotador</th>
-                  <th className="px-5 py-3 font-medium">Status</th>
-                  <th className="px-5 py-3 font-medium">Progresso</th>
-                </tr>
-              </thead>
-              <tbody>
-                {batches.map((b) => {
-                  const previewUrl = "previewUrl" in b && typeof b.previewUrl === "string" ? b.previewUrl : null
-                  return (
-                    <tr
-                      key={b.id}
-                      tabIndex={0}
-                      role="button"
-                      aria-label={`Abrir lote ${b.name} para anotação`}
-                      onClick={() => openTaskForAnnotation(b.task)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") {
-                          event.preventDefault()
-                          openTaskForAnnotation(b.task)
-                        }
-                      }}
-                      className="group cursor-pointer border-b border-border/60 last:border-0 hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-none"
-                    >
-                      <td className="px-5 py-3">
-                        <div className="flex items-center gap-2 font-medium text-foreground">
-                          {previewUrl ? (
-                            // eslint-disable-next-line @next/next/no-img-element
-                            <img src={previewUrl} alt="" className="size-8 rounded-lg object-cover" />
-                          ) : (
-                            <span className="flex size-8 items-center justify-center rounded-lg bg-surface-blue text-brand-blue">
-                              <ImageIcon className="size-4" />
-                            </span>
-                          )}
-                          <span className="min-w-0 flex-1 truncate">{b.name}</span>
-                          {isAdmin && (
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon-sm"
-                              title={`Apagar lote ${b.name}`}
-                              aria-label={`Apagar lote ${b.name}`}
-                              className="ml-auto shrink-0 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                              onClick={(event) => {
-                                event.stopPropagation()
-                                void openDeleteDialog(b.task)
-                              }}
-                            >
-                              <Trash2 className="size-4" />
-                            </Button>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-5 py-3 tabular-nums text-muted-foreground">
-                        {b.images.toLocaleString("pt-BR")}
-                      </td>
-                      <td className="px-5 py-3 text-muted-foreground">{b.source}</td>
-                      <td className="px-5 py-3">
-                        {isAdmin ? (
-                          <select
-                            value={b.assignee?.user_id ?? ""}
-                            disabled={assigningTaskId === b.task.id || !users}
-                            onClick={(event) => event.stopPropagation()}
-                            onKeyDown={(event) => event.stopPropagation()}
-                            onChange={(event) => void assignAnnotator(b.task, event.target.value || null)}
-                            className="h-8 w-44 rounded-full border border-border bg-background px-3 text-xs font-medium text-foreground outline-none transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
-                            aria-label={`Atribuir anotador ao lote ${b.name}`}
-                          >
-                            <option value="">Sem anotador</option>
-                            {b.assignee && !annotators.some((user) => user.id === b.assignee?.user_id) && (
-                              <option value={b.assignee.user_id}>{b.assignee.name}</option>
+          <CardContent className={batches.length > 0 ? "overflow-x-auto p-0" : "p-0"}>
+            {batches.length > 0 ? (
+              <table className="w-full min-w-[860px] text-sm">
+                <thead>
+                  <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground">
+                    <th className="px-5 py-3 font-medium">Lote</th>
+                    <th className="px-5 py-3 font-medium">Imagens</th>
+                    <th className="px-5 py-3 font-medium">Origem</th>
+                    <th className="px-5 py-3 font-medium">Anotador</th>
+                    <th className="px-5 py-3 font-medium">Status</th>
+                    <th className="px-5 py-3 font-medium">Progresso</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {batches.map((b) => {
+                    const previewUrl = "previewUrl" in b && typeof b.previewUrl === "string" ? b.previewUrl : null
+                    return (
+                      <tr
+                        key={b.id}
+                        tabIndex={0}
+                        role="button"
+                        aria-label={`Abrir lote ${b.name} para anotação`}
+                        onClick={() => openTaskForAnnotation(b.task)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault()
+                            openTaskForAnnotation(b.task)
+                          }
+                        }}
+                        className="group cursor-pointer border-b border-border/60 last:border-0 hover:bg-muted/40 focus-visible:bg-muted/40 focus-visible:outline-none"
+                      >
+                        <td className="px-5 py-3">
+                          <div className="flex items-center gap-2 font-medium text-foreground">
+                            {previewUrl ? (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img src={previewUrl} alt="" className="size-8 rounded-lg object-cover" />
+                            ) : (
+                              <span className="flex size-8 items-center justify-center rounded-lg bg-surface-blue text-brand-blue">
+                                <ImageIcon className="size-4" />
+                              </span>
                             )}
-                            {annotators.map((user) => (
-                              <option key={user.id} value={user.id}>
-                                {user.name}
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          <span className="text-xs text-muted-foreground">{b.assignee?.name ?? "Sem anotador"}</span>
-                        )}
-                      </td>
-                      <td className="px-5 py-3">
-                        <span className={`text-xs font-medium ${batchStatusTone[b.status] ?? "text-muted-foreground"}`}>
-                          {b.status}
-                        </span>
-                      </td>
-                      <td className="px-5 py-3">
-                        <div className="flex flex-col gap-1">
-                          <div className="flex items-center gap-2">
-                            <ProgressBar value={b.progress} className="w-24" />
-                            <span className="w-9 text-right text-xs tabular-nums text-muted-foreground">
-                              {b.progress}%
+                            <span className="min-w-0 flex-1 truncate">{b.name}</span>
+                            {isAdmin && (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-sm"
+                                title={`Apagar lote ${b.name}`}
+                                aria-label={`Apagar lote ${b.name}`}
+                                className="ml-auto shrink-0 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  void openDeleteDialog(b.task)
+                                }}
+                              >
+                                <Trash2 className="size-4" />
+                              </Button>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-5 py-3 tabular-nums text-muted-foreground">
+                          {b.images.toLocaleString("pt-BR")}
+                        </td>
+                        <td className="px-5 py-3 text-muted-foreground">{b.source}</td>
+                        <td className="px-5 py-3">
+                          {isAdmin ? (
+                            <select
+                              value={b.assignee?.user_id ?? ""}
+                              disabled={assigningTaskId === b.task.id || !users}
+                              onClick={(event) => event.stopPropagation()}
+                              onKeyDown={(event) => event.stopPropagation()}
+                              onChange={(event) => void assignAnnotator(b.task, event.target.value || null)}
+                              className="h-8 w-44 rounded-full border border-border bg-background px-3 text-xs font-medium text-foreground outline-none transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+                              aria-label={`Atribuir anotador ao lote ${b.name}`}
+                            >
+                              <option value="">Sem anotador</option>
+                              {b.assignee && !annotators.some((user) => user.id === b.assignee?.user_id) && (
+                                <option value={b.assignee.user_id}>{b.assignee.name}</option>
+                              )}
+                              {annotators.map((user) => (
+                                <option key={user.id} value={user.id}>
+                                  {user.name}
+                                </option>
+                              ))}
+                            </select>
+                          ) : (
+                            <span className="text-xs text-muted-foreground">{b.assignee?.name ?? "Sem anotador"}</span>
+                          )}
+                        </td>
+                        <td className="px-5 py-3">
+                          <span className={`text-xs font-medium ${batchStatusTone[b.status] ?? "text-muted-foreground"}`}>
+                            {b.status}
+                          </span>
+                        </td>
+                        <td className="px-5 py-3">
+                          <div className="flex flex-col gap-1">
+                            <div className="flex items-center gap-2">
+                              <ProgressBar value={b.progress} className="w-24" />
+                              <span className="w-9 text-right text-xs tabular-nums text-muted-foreground">
+                                {b.progress}%
+                              </span>
+                            </div>
+                            <span className="text-xs tabular-nums text-muted-foreground">
+                              {b.annotatedImages.toLocaleString("pt-BR")} / {b.images.toLocaleString("pt-BR")} imagens
                             </span>
                           </div>
-                          <span className="text-xs tabular-nums text-muted-foreground">
-                            {b.annotatedImages.toLocaleString("pt-BR")} / {b.images.toLocaleString("pt-BR")} imagens
-                          </span>
-                        </div>
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            ) : (
+              <div className="flex min-h-[320px] flex-col items-center justify-center gap-3 px-6 py-12 text-center">
+                <span className="flex size-12 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
+                  <Upload className="size-5" />
+                </span>
+                <div className="flex max-w-sm flex-col gap-1">
+                  <p className="text-base font-medium text-foreground">Nenhum lote importado</p>
+                  <p className="text-sm text-muted-foreground">
+                    Importe imagens para criar o primeiro lote deste projeto.
+                  </p>
+                </div>
+                <Button onClick={() => setImportDialogOpen(true)}>
+                  <Upload className="size-4" />
+                  Importar lote
+                </Button>
+              </div>
+            )}
           </CardContent>
         </Card>
 
@@ -732,17 +842,26 @@ function storageFromDashboard(dashboard: BackendDashboard | null, fallbackProjec
       const usedGb = usedBytes / 1024 ** 3
       return {
         percent: Math.min(100, Math.round((usedGb / quotaGb) * 100)),
-        label: `${usedGb.toFixed(1)} GB de ${quotaGb} GB utilizados`,
+        label: `${formatStorageUsed(usedBytes)} de ${quotaGb} GB utilizados`,
       }
     }
   }
   if (fallbackProject && fallbackProject.quotaGb > 0) {
     return {
       percent: fallbackProject.percent,
-      label: `${fallbackProject.usedGb.toFixed(1)} GB de ${fallbackProject.quotaGb} GB utilizados`,
+      label: `${formatStorageUsed(fallbackProject.usedGb * 1024 ** 3)} de ${fallbackProject.quotaGb} GB utilizados`,
     }
   }
   return { percent: 0, label: "Nenhum storage de projeto configurado." }
+}
+
+function formatStorageUsed(bytes: number) {
+  if (bytes <= 0) return "0.0 GB"
+  const gb = bytes / 1024 ** 3
+  if (gb >= 0.1) return `${gb.toFixed(1)} GB`
+  const mb = bytes / 1024 ** 2
+  if (mb >= 1) return `${mb.toFixed(1)} MB`
+  return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString("pt-BR")} KB`
 }
 
 function numberFromUnknown(value: unknown) {

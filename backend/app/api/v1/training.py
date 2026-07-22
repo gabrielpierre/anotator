@@ -1,21 +1,30 @@
 import asyncio
 import json
+import mimetypes
 from collections.abc import AsyncIterator
+from pathlib import PurePosixPath
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, db_session
+from app.api.deps import current_user, db_session, require_project_access
+from app.api.project_scope import (
+    filter_visible_training_runs,
+    project_for_release,
+    project_payload,
+    require_release_access,
+    require_training_access,
+)
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.core.database import SessionLocal
 from app.models import ArtifactRecord, AuditEvent, DatasetRelease, JobRecord, ModelVersion, TrainingRun, User, utcnow
 from app.schemas import TrainingRunCreate, TrainingRunRead
 from app.services.artifacts import S3ArtifactStore, parse_s3_uri
-from app.services.jobs import attach_celery_task, cancel_job, create_job
+from app.services.jobs import attach_celery_task, cancel_job, create_job, fail_stale_active_jobs
 from app.services.training import ensure_training_device_available, normalize_training_device
 from app.tasks import training_run_task
 
@@ -25,26 +34,42 @@ ACTIVE_JOB_STATUSES = {"queued", "running", "paused"}
 
 
 @router.get("", response_model=list[TrainingRunRead])
-def list_training_runs(db: Session = Depends(db_session)) -> list[TrainingRun]:
-    return list(db.scalars(select(TrainingRun).order_by(TrainingRun.created_at.desc())).all())
+def list_training_runs(
+    project_id: str | None = Query(default=None, max_length=64),
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> list[TrainingRun]:
+    fail_stale_active_jobs(db)
+    runs = list(db.scalars(select(TrainingRun).order_by(TrainingRun.created_at.desc())).all())
+    if project_id:
+        project = require_project_access(db, user, project_id)
+        scoped_runs: list[TrainingRun] = []
+        for run in runs:
+            owner = project_for_release(db, db.get(DatasetRelease, run.dataset_release_id))
+            if owner is not None and owner.id == project.id:
+                scoped_runs.append(run)
+        runs = scoped_runs
+    return filter_visible_training_runs(db, user, runs)
 
 
 @router.get("/{run_id}", response_model=TrainingRunRead)
-def get_training_run(run_id: str, db: Session = Depends(db_session)) -> TrainingRun:
-    run = db.get(TrainingRun, run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="Training run not found")
-    return run
+def get_training_run(
+    run_id: str,
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> TrainingRun:
+    fail_stale_active_jobs(db)
+    return require_training_access(db, user, run_id)
 
 
 @router.post("", response_model=TrainingRunRead)
 def create_training_run(
     payload: TrainingRunCreate,
     db: Session = Depends(db_session),
+    user: User = Depends(current_user),
 ) -> TrainingRun:
-    release = db.get(DatasetRelease, payload.dataset_release_id)
-    if release is None:
-        raise HTTPException(status_code=404, detail="Dataset release not found")
+    fail_stale_active_jobs(db)
+    release = require_release_access(db, user, payload.dataset_release_id)
     if not release.immutable or release.status != "ready" or not release.artifact_uri:
         raise HTTPException(
             status_code=409,
@@ -55,13 +80,17 @@ def create_training_run(
         ensure_training_device_available(device)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    settings = get_settings()
+    workers = payload.workers
+    if device == "cpu":
+        workers = min(workers, max(0, settings.training_cpu_max_workers))
     run_config = {
         **payload.config,
         "epochs": payload.epochs,
         "image_size": payload.image_size,
         "batch_size": payload.batch_size,
         "device": device,
-        "workers": payload.workers,
+        "workers": workers,
         "patience": payload.patience,
         "seed": payload.seed,
     }
@@ -75,16 +104,17 @@ def create_training_run(
     )
     db.add(run)
     db.flush()
+    release_project = project_for_release(db, release)
     job = create_job(
         db,
         kind="training",
         name=f"Training {payload.base_model}",
         detail=f"Dataset release {release.name}",
-        raw={"operation": "training_run", "training_run_id": run.id},
+        raw={"operation": "training_run", "training_run_id": run.id, **project_payload(release_project)},
     )
     db.add(
         AuditEvent(
-            actor="system",
+            actor=user.email,
             action="training_run_created",
             target=run.id,
             payload={"dataset_release_id": payload.dataset_release_id, "base_model": payload.base_model},
@@ -103,7 +133,8 @@ def pause_training_run(
     db: Session = Depends(db_session),
     actor: User = Depends(current_user),
 ) -> TrainingRun:
-    run = _require_training_run(db, run_id)
+    fail_stale_active_jobs(db)
+    run = require_training_access(db, actor, run_id)
     if run.status in FINAL_RUN_STATUSES:
         return run
 
@@ -137,7 +168,8 @@ def stop_training_run(
     db: Session = Depends(db_session),
     actor: User = Depends(current_user),
 ) -> TrainingRun:
-    run = _require_training_run(db, run_id)
+    fail_stale_active_jobs(db)
+    run = require_training_access(db, actor, run_id)
     if run.status in FINAL_RUN_STATUSES:
         return run
 
@@ -168,7 +200,8 @@ def delete_training_run(
     db: Session = Depends(db_session),
     actor: User = Depends(current_user),
 ) -> dict[str, Any]:
-    run = _require_training_run(db, run_id)
+    fail_stale_active_jobs(db)
+    run = require_training_access(db, actor, run_id)
     jobs = _training_jobs(db, run.id)
     canceled_jobs: list[str] = []
     for job in jobs:
@@ -245,14 +278,18 @@ def delete_training_run(
 
 
 @router.get("/{run_id}/events")
-async def training_events(run_id: str, db: Session = Depends(db_session)) -> StreamingResponse:
-    run = db.get(TrainingRun, run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="Training run not found")
+async def training_events(
+    run_id: str,
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> StreamingResponse:
+    fail_stale_active_jobs(db)
+    require_training_access(db, user, run_id)
 
     async def event_stream() -> AsyncIterator[str]:
         while True:
             with SessionLocal() as event_db:
+                fail_stale_active_jobs(event_db)
                 current = event_db.get(TrainingRun, run_id)
                 if current is None:
                     yield f"event: error\ndata: {json.dumps({'detail': 'Training run not found'})}\n\n"
@@ -268,6 +305,39 @@ async def training_events(run_id: str, db: Session = Depends(db_session)) -> Str
             await asyncio.sleep(1)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.get("/{run_id}/artifacts/{artifact_path:path}/download")
+def download_training_artifact(
+    run_id: str,
+    artifact_path: str,
+    inline: bool = Query(default=False),
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> Response:
+    run = require_training_access(db, user, run_id)
+    artifact = _training_artifact_by_path(run, artifact_path)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Training artifact not found")
+    uri = str(artifact.get("uri") or "")
+    if not uri:
+        raise HTTPException(status_code=404, detail="Training artifact not found")
+    try:
+        blob = S3ArtifactStore(get_settings()).get(uri)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Training artifact not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    name = str(artifact.get("name") or PurePosixPath(artifact_path).name or "artifact")
+    media_type = blob.content_type
+    if not media_type or media_type == "application/octet-stream":
+        media_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    disposition = "inline" if inline else "attachment"
+    return Response(
+        content=blob.content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'{disposition}; filename="{name}"'},
+    )
 
 
 def _require_training_run(db: Session, run_id: str) -> TrainingRun:
@@ -327,6 +397,18 @@ def _training_artifact_uris(run: TrainingRun) -> set[str]:
     for value in _nested_s3_uris(run.metrics):
         uris.add(value)
     return uris
+
+
+def _training_artifact_by_path(run: TrainingRun, artifact_path: str) -> dict[str, Any] | None:
+    normalized_path = artifact_path.strip("/")
+    for artifact in run.artifacts if isinstance(run.artifacts, list) else []:
+        if not isinstance(artifact, dict):
+            continue
+        path = str(artifact.get("path") or "").strip("/")
+        name = str(artifact.get("name") or "").strip("/")
+        if normalized_path and normalized_path in {path, name}:
+            return artifact
+    return None
 
 
 def _training_artifact_prefixes(run: TrainingRun, artifact_uris: set[str]) -> set[str]:

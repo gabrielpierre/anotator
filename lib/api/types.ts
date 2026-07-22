@@ -364,6 +364,7 @@ export type BackendInferenceRunCreate = {
   confirm_replace?: boolean
   user_id?: string
   write_to_cvat?: boolean
+  dedupe_key?: string | null
 }
 
 export type BackendInferenceSuggestion = {
@@ -514,6 +515,7 @@ export type BackendModelVersionCreate = {
   version: string
   family?: string
   base_model?: string
+  project_id?: string | null
   dataset_release_id?: string | null
   artifact_uri?: string | null
   metrics?: Record<string, unknown>
@@ -555,6 +557,7 @@ export type BackendPipelineRun = {
 export type BackendPipelineRunCreate = {
   name: string
   definition_id?: string | null
+  project_id?: string | null
   source_release_id?: string | null
   target_release_name?: string | null
   task_external_ids?: string[]
@@ -613,6 +616,7 @@ export type BackendImportTaskCreate = {
   name: string
   assignee_user_id?: string | null
   labels?: Record<string, unknown>[]
+  class_mappings?: Record<string, unknown>[]
   source_path?: string | null
   estimated_bytes?: number | null
   sync_after_import?: boolean

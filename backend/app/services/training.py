@@ -1,6 +1,7 @@
 import csv
 import io
 import math
+import os
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.models import AuditEvent, DatasetRelease, ModelVersion, TrainingRun
+from app.models import AuditEvent, DatasetRelease, ModelVersion, Project, TrainingRun
 from app.schemas import TrainingRunCreate
 from app.services.artifacts import S3ArtifactStore
 from app.services.compute import available_training_device_ids
@@ -118,6 +119,7 @@ def ultralytics_training_runner(
         if payload.patience is not None:
             train_args["patience"] = payload.patience
         train_args.update(payload.config.get("ultralytics", {}))
+        params.update(_apply_training_resource_policy(train_args, payload, settings))
 
         with mlflow.start_run(run_name=f"{payload.base_model}-{context['run_id']}") as mlflow_run:
             mlflow.log_params(params)
@@ -159,6 +161,43 @@ def ultralytics_training_runner(
                 "artifacts": artifacts,
                 "params": params,
             }
+
+
+def _apply_training_resource_policy(
+    train_args: dict[str, Any],
+    payload: TrainingRunCreate,
+    settings: Settings,
+) -> dict[str, Any]:
+    device = normalize_training_device(payload.device)
+    if device != "cpu":
+        return {}
+
+    max_workers = max(0, settings.training_cpu_max_workers)
+    try:
+        requested_workers = int(train_args.get("workers") or 0)
+    except (TypeError, ValueError):
+        requested_workers = 0
+    if requested_workers > max_workers:
+        train_args["workers"] = max_workers
+
+    max_threads = max(1, settings.training_cpu_max_threads)
+    os.environ.setdefault("OMP_NUM_THREADS", str(max_threads))
+    os.environ.setdefault("MKL_NUM_THREADS", str(max_threads))
+    try:
+        import torch
+
+        torch.set_num_threads(max_threads)
+        try:
+            torch.set_num_interop_threads(max(1, min(2, max_threads)))
+        except RuntimeError:
+            pass
+    except Exception:
+        pass
+    return {
+        "resource_policy": "cpu_limited",
+        "effective_workers": train_args.get("workers", 0),
+        "cpu_threads": max_threads,
+    }
 
 
 def prepare_training_dataset(context: dict[str, Any], tmp_path: Path) -> Path:
@@ -225,7 +264,7 @@ def register_model_version(
     model.mlflow_run_id = run.mlflow_run_id
     model.artifact_uri = result.get("artifact_uri") or _best_artifact_uri(result.get("artifacts") or [])
     model.metrics = _normalize_metrics(result.get("metrics") or run.metrics or {})
-    model.params = result.get("params") or training_params(_payload_from_run(run), release)
+    model.params = {**(result.get("params") or training_params(_payload_from_run(run), release)), **_release_project_payload(db, release)}
     model.status = "registered"
     db.add(model)
     db.flush()
@@ -246,6 +285,15 @@ def training_params(payload: TrainingRunCreate, release: DatasetRelease) -> dict
         "dataset_release_id": release.id,
         "dataset_artifact_uri": release.artifact_uri,
     }
+
+
+def _release_project_payload(db: Session, release: DatasetRelease) -> dict[str, str]:
+    if not release.project_id:
+        return {}
+    project = db.get(Project, release.project_id)
+    if project is None:
+        return {}
+    return {"project_id": project.id, "project_external_id": project.external_id}
 
 
 def extract_ultralytics_metrics(results: Any) -> dict[str, float]:

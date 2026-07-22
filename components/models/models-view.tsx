@@ -11,6 +11,7 @@ import { PageHeader, StatusBadge } from "@/components/app/primitives"
 import { MetricLineChart } from "@/components/app/charts"
 import { deleteModelVersion, downloadBackendFile, fetchModelVersions, modelDownloadPath } from "@/lib/api/client"
 import { formatDateTimePt } from "@/lib/api/status"
+import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendModelVersion } from "@/lib/api/types"
 
 const familyTone: Record<string, "info" | "accent" | "neutral"> = {
@@ -113,12 +114,14 @@ export function ModelsView() {
   const [actionMenuId, setActionMenuId] = React.useState<string | null>(null)
   const [deletingModelId, setDeletingModelId] = React.useState<string | null>(null)
   const [actionError, setActionError] = React.useState<string | null>(null)
+  const { activeProject, projects } = useCurrentUser()
+  const currentProjectId = activeProject?.id ?? projects[0]?.id ?? null
 
   const loadModels = React.useCallback((signal?: AbortSignal) => {
-    fetchModelVersions(signal)
+    fetchModelVersions({ projectId: currentProjectId }, signal)
       .then(setBackendModels)
       .catch(() => setBackendModels(null))
-  }, [])
+  }, [currentProjectId])
 
   React.useEffect(() => {
     const controller = new AbortController()

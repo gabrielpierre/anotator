@@ -2,12 +2,14 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { usePathname } from "next/navigation"
-import { PanelLeftClose, PanelLeft } from "lucide-react"
+import { usePathname, useRouter } from "next/navigation"
+import { PanelLeft, PanelLeftClose, Plus } from "lucide-react"
 import { Brand } from "@/components/app/brand"
-import { navEntries } from "@/components/app/nav-config"
-import { fetchReviewQueueCount } from "@/lib/api/client"
-import { useCurrentUser } from "@/lib/auth/user-context"
+import { adminNavEntries } from "@/components/app/nav-config"
+import { Button } from "@/components/ui/button"
+import { ProjectDialog } from "@/components/projects/project-dialog"
+import { projectRecordFromBackend, useCurrentUser } from "@/lib/auth/user-context"
+import type { BackendProject } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
 export function AppSidebar({
@@ -18,34 +20,26 @@ export function AppSidebar({
   onClose?: () => void
 }) {
   const pathname = usePathname()
-  const { isAdmin, projects } = useCurrentUser()
+  const router = useRouter()
+  const {
+    isAdmin,
+    projects,
+    activeProject,
+    addProject,
+    setActiveProjectId,
+  } = useCurrentUser()
   const [collapsed, setCollapsed] = React.useState(false)
-  const [reviewPendingCount, setReviewPendingCount] = React.useState<number | null>(null)
-  const entries = navEntries.filter((item) => !item.adminOnly || isAdmin)
+  const [projectDialogOpen, setProjectDialogOpen] = React.useState(false)
+  const visibleAdminEntries = adminNavEntries.filter((item) => !item.adminOnly || isAdmin)
 
-  const refreshReviewCount = React.useCallback((signal?: AbortSignal) => {
-    fetchReviewQueueCount(signal)
-      .then((summary) => setReviewPendingCount(summary.pending))
-      .catch(() => {
-        if (!signal?.aborted) setReviewPendingCount(null)
-      })
-  }, [])
-
-  React.useEffect(() => {
-    const controller = new AbortController()
-    refreshReviewCount(controller.signal)
-    const interval = window.setInterval(() => refreshReviewCount(), 30_000)
-    const onFocus = () => refreshReviewCount()
-    const onReviewQueueUpdated = () => refreshReviewCount()
-    window.addEventListener("focus", onFocus)
-    window.addEventListener("review-queue-updated", onReviewQueueUpdated)
-    return () => {
-      controller.abort()
-      window.clearInterval(interval)
-      window.removeEventListener("focus", onFocus)
-      window.removeEventListener("review-queue-updated", onReviewQueueUpdated)
-    }
-  }, [refreshReviewCount])
+  function handleCreated(project: BackendProject, _mode: "create" | "edit", annotatorIds: string[]) {
+    const record = projectRecordFromBackend(project, annotatorIds)
+    void addProject({ ...record, annotatorIds }).then(() => {
+      setActiveProjectId(project.id)
+      router.push(`/?project=${encodeURIComponent(project.id)}`)
+      onClose?.()
+    })
+  }
 
   return (
     <>
@@ -73,11 +67,10 @@ export function AppSidebar({
           )}
         >
           {collapsed ? (
-            /* Símbolo que revela o botão de expandir ao passar o mouse (desktop) */
             <button
               type="button"
-              onClick={(e) => {
-                e.stopPropagation()
+              onClick={(event) => {
+                event.stopPropagation()
                 setCollapsed(false)
               }}
               aria-label="Expandir navegação"
@@ -90,15 +83,13 @@ export function AppSidebar({
               <PanelLeft className="absolute size-4.5 text-muted-foreground opacity-0 transition-opacity duration-200 group-hover:opacity-100 group-hover:text-foreground" />
             </button>
           ) : (
-            <Link href="/" aria-label="CVAT++ — Visão geral" className="hidden lg:block">
+            <Link href="/" aria-label="CVAT++ - Visão geral" className="hidden lg:block">
               <Brand showWordmark />
             </Link>
           )}
-          {/* Símbolo/logo no mobile (drawer) */}
-          <Link href="/" aria-label="CVAT++ — Visão geral" className="lg:hidden">
+          <Link href="/" aria-label="CVAT++ - Visão geral" className="lg:hidden">
             <Brand showWordmark />
           </Link>
-          {/* Fechar (mobile) */}
           <button
             type="button"
             onClick={onClose}
@@ -107,7 +98,6 @@ export function AppSidebar({
           >
             <PanelLeftClose className="size-4.5" />
           </button>
-          {/* Retrair (desktop, apenas quando expandido) */}
           {!collapsed && (
             <button
               type="button"
@@ -121,56 +111,136 @@ export function AppSidebar({
           )}
         </div>
 
-        <nav className={cn("flex flex-1 flex-col gap-1 overflow-y-auto p-3", collapsed && "lg:items-center")}>
-          <p
-            className={cn(
-              "px-3 py-2 text-xs font-medium tracking-wide text-muted-foreground transition-opacity",
-              collapsed && "lg:hidden",
-            )}
-          >
-            NAVEGAÇÃO
-          </p>
-          {entries.map((item) => {
-            const active =
-              item.href === "/" ? pathname === "/" : pathname.startsWith(item.href)
-            const Icon = item.icon
-            const href = item.href === "/" && isAdmin && projects.length === 0 ? "/projetos" : item.href
-            const badge = item.href === "/revisar" ? reviewPendingCount : item.badge
-            return (
-              <Link
-                key={item.href}
-                href={href}
-                onClick={(e) => {
-                  // Evita que o clique no link também dispare a expansão da barra retraída.
-                  e.stopPropagation()
-                  onClose?.()
-                }}
-                title={collapsed ? item.label : undefined}
-                className={cn(
-                  "flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors",
-                  collapsed && "lg:w-10 lg:justify-center lg:px-0",
-                  active
-                    ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
-                    : "text-foreground hover:bg-sidebar-accent",
-                )}
-              >
-                <Icon className="size-4.5 shrink-0" />
-                <span className={cn("flex-1 truncate", collapsed && "lg:hidden")}>{item.label}</span>
-                {badge != null && badge > 0 && (
-                  <span
+        <nav className={cn("flex flex-1 flex-col gap-5 overflow-y-auto p-3", collapsed && "lg:items-center")}>
+          <section className="flex min-h-0 flex-1 flex-col gap-2">
+            <div
+              className={cn(
+                "flex items-center justify-between px-3 py-1 text-xs font-medium tracking-wide text-muted-foreground",
+                collapsed && "lg:hidden",
+              )}
+            >
+              <span>PROJETOS</span>
+              <span className="tabular-nums">{projects.length}</span>
+            </div>
+
+            <div className="flex min-h-0 flex-col gap-1 overflow-y-auto">
+              {projects.map((project) => {
+                const active = activeProject?.id === project.id
+                return (
+                  <Link
+                    key={project.id}
+                    href={`/?project=${encodeURIComponent(project.id)}`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      setActiveProjectId(project.id)
+                      onClose?.()
+                    }}
+                    title={collapsed ? project.name : undefined}
                     className={cn(
-                      "rounded-full bg-warning/15 px-1.5 py-0.5 text-xs font-medium tabular-nums text-warning",
-                      collapsed && "lg:hidden",
+                      "flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors",
+                      collapsed && "lg:w-10 lg:justify-center lg:px-0",
+                      active
+                        ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+                        : "text-foreground hover:bg-sidebar-accent",
                     )}
                   >
-                    {badge}
-                  </span>
+                    <ProjectAvatar name={project.name} active={active} />
+                    <span className={cn("min-w-0 flex-1 truncate", collapsed && "lg:hidden")}>{project.name}</span>
+                  </Link>
+                )
+              })}
+
+              {projects.length === 0 && (
+                <div
+                  className={cn(
+                    "rounded-lg border border-dashed border-sidebar-border px-3 py-4 text-sm text-muted-foreground",
+                    collapsed && "lg:hidden",
+                  )}
+                >
+                  Nenhum projeto ativo.
+                </div>
+              )}
+            </div>
+
+            {isAdmin && (
+              <Button
+                type="button"
+                variant="outline"
+                size={collapsed ? "icon" : "sm"}
+                className={cn("mt-1", collapsed ? "lg:size-10 lg:px-0" : "justify-start")}
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setProjectDialogOpen(true)
+                }}
+                title={collapsed ? "Novo projeto" : undefined}
+              >
+                <Plus className="size-4" />
+                <span className={cn(collapsed && "lg:hidden")}>Novo projeto</span>
+              </Button>
+            )}
+          </section>
+
+          {visibleAdminEntries.length > 0 && (
+            <section className="flex flex-col gap-1 border-t border-sidebar-border pt-3">
+              <p
+                className={cn(
+                  "px-3 py-1 text-xs font-medium tracking-wide text-muted-foreground",
+                  collapsed && "lg:hidden",
                 )}
-              </Link>
-            )
-          })}
+              >
+                ADMIN
+              </p>
+              {visibleAdminEntries.map((item) => {
+                const active = pathname.startsWith(item.href)
+                const Icon = item.icon
+                return (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      onClose?.()
+                    }}
+                    title={collapsed ? item.label : undefined}
+                    className={cn(
+                      "flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors",
+                      collapsed && "lg:w-10 lg:justify-center lg:px-0",
+                      active
+                        ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+                        : "text-foreground hover:bg-sidebar-accent",
+                    )}
+                  >
+                    <Icon className="size-4.5 shrink-0" />
+                    <span className={cn("min-w-0 flex-1 truncate", collapsed && "lg:hidden")}>{item.label}</span>
+                  </Link>
+                )
+              })}
+            </section>
+          )}
         </nav>
       </aside>
+
+      <ProjectDialog
+        open={projectDialogOpen}
+        mode="create"
+        project={null}
+        onClose={() => setProjectDialogOpen(false)}
+        onSaved={handleCreated}
+      />
     </>
+  )
+}
+
+function ProjectAvatar({ name, active }: { name: string; active: boolean }) {
+  const initial = name.trim().slice(0, 1).toUpperCase() || "P"
+  return (
+    <span
+      className={cn(
+        "flex size-7 shrink-0 items-center justify-center rounded-lg text-xs font-semibold",
+        active ? "bg-brand-blue text-white" : "bg-surface-blue text-brand-blue",
+      )}
+    >
+      {initial}
+    </span>
   )
 }

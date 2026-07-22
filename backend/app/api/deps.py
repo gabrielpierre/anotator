@@ -61,7 +61,7 @@ def current_admin(user: User = Depends(current_user)) -> User:
 
 def require_project_access(db: Session, user: User, project_id: str) -> Project:
     project = db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
-    if project is None:
+    if project is None or project.status != "active":
         raise HTTPException(status_code=404, detail="Project not found")
     if user.role == "admin":
         return project

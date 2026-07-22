@@ -348,6 +348,7 @@ class InferenceRunCreate(BaseModel):
     confirm_replace: bool = False
     user_id: str = "local-user"
     write_to_cvat: bool = False
+    dedupe_key: str | None = Field(default=None, max_length=512)
 
 
 class InferenceSuggestionRead(OrmModel):
@@ -599,6 +600,7 @@ class ModelVersionCreate(BaseModel):
     version: str = Field(min_length=1, max_length=128)
     family: str = Field(default="detection", max_length=64)
     base_model: str = Field(default="manual", max_length=255)
+    project_id: str | None = None
     dataset_release_id: str | None = None
     artifact_uri: str | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
@@ -611,6 +613,7 @@ class ModelVersionUpdate(BaseModel):
     version: str | None = Field(default=None, min_length=1, max_length=128)
     family: str | None = Field(default=None, max_length=64)
     base_model: str | None = Field(default=None, max_length=255)
+    project_id: str | None = None
     dataset_release_id: str | None = None
     artifact_uri: str | None = None
     metrics: dict[str, Any] | None = None
@@ -644,6 +647,7 @@ class PipelineDefinitionRead(OrmModel):
 class PipelineRunCreate(BaseModel):
     name: str
     definition_id: str | None = None
+    project_id: str | None = None
     source_release_id: str | None = None
     target_release_name: str | None = None
     task_external_ids: list[str] = Field(default_factory=list)
@@ -728,6 +732,7 @@ class ImportTaskCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     assignee_user_id: str | None = None
     labels: list[dict[str, Any]] = Field(default_factory=list)
+    class_mappings: list[dict[str, Any]] = Field(default_factory=list)
     source_path: str | None = Field(default=None, max_length=2048)
     estimated_bytes: int | None = Field(default=None, ge=0)
     sync_after_import: bool = True

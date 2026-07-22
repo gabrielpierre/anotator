@@ -78,6 +78,15 @@ def test_task_delete_impact_and_delete_preserves_immutable_history() -> None:
                 task_external_id="21",
             )
         )
+        db.add(
+            JobRecord(
+                kind="import",
+                status="succeeded",
+                progress=100,
+                name="Import CVAT task Lote 20/07/2026",
+                raw={"cvat_task_id": "21", "payload": {"name": "Lote 20/07/2026"}},
+            )
+        )
         release = DatasetRelease(
             name="release_001",
             status="ready",
@@ -132,6 +141,7 @@ def test_task_delete_impact_and_delete_preserves_immutable_history() -> None:
         assert result.deleted["task_data_meta"] == 1
         assert result.deleted["task_previews"] == 1
         assert result.deleted["cvat_jobs"] == 1
+        assert result.deleted["jobs"] == 2
         assert result.preserved == {"dataset_releases": 1, "derived_assets": 1, "pipeline_runs": 1}
 
         assert db.scalar(select(Task).where(Task.external_id == "21")) is None
@@ -140,6 +150,7 @@ def test_task_delete_impact_and_delete_preserves_immutable_history() -> None:
         assert db.scalar(select(CvatLabel)) is None
         assert db.scalar(select(TaskDataMeta)) is None
         assert db.scalar(select(TaskPreview)) is None
+        assert db.scalar(select(JobRecord)) is None
         assert db.scalar(select(DatasetRelease)) is not None
         assert db.scalar(select(DerivedAsset)) is not None
         event = db.scalar(select(AuditEvent).where(AuditEvent.action == "task_deleted"))

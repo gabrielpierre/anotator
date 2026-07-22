@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import {
   Check,
   X,
@@ -20,7 +21,12 @@ import {
   ArrowRight,
   ArrowLeft,
   ArrowUp,
+  Database,
+  FolderKanban,
+  PenLine,
+  type LucideIcon,
 } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import { apiAssetUrl, createReviewDecision, fetchReviewQueue, fetchTasks } from "@/lib/api/client"
 import { labelsFromTasks, type ApiClassItem } from "@/lib/api/status"
 import { useCurrentUser } from "@/lib/auth/user-context"
@@ -267,7 +273,9 @@ const emptyAnnotation: ReviewAnnotation = {
 export function ReviewWorkspace() {
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [reviewQueue, setReviewQueue] = React.useState<BackendReviewQueueItem[] | null>(null)
-  const { currentUser } = useCurrentUser()
+  const { currentUser, activeProject, projects } = useCurrentUser()
+  const currentProjectId = activeProject?.id ?? projects[0]?.id ?? null
+  const currentProjectExternalId = activeProject?.externalId ?? projects[0]?.externalId ?? null
   const classCatalog = React.useMemo<ApiClassItem[]>(() => {
     const cvatClasses = labelsFromTasks(tasks)
     return cvatClasses.length > 0 ? cvatClasses : []
@@ -319,10 +327,15 @@ export function ReviewWorkspace() {
 
   React.useEffect(() => {
     const controller = new AbortController()
-    fetchTasks(controller.signal).then(setTasks).catch(() => setTasks(null))
-    fetchReviewQueue(controller.signal).then(setReviewQueue).catch(() => setReviewQueue(null))
+    if (!currentProjectExternalId) {
+      setTasks([])
+      setReviewQueue([])
+      return () => controller.abort()
+    }
+    fetchTasks({ projectExternalId: currentProjectExternalId }, controller.signal).then(setTasks).catch(() => setTasks(null))
+    fetchReviewQueue({ projectExternalId: currentProjectExternalId }, controller.signal).then(setReviewQueue).catch(() => setReviewQueue(null))
     return () => controller.abort()
-  }, [])
+  }, [currentProjectExternalId])
 
   React.useEffect(() => {
     if (classCatalog.length > 0) {
@@ -693,6 +706,85 @@ export function ReviewWorkspace() {
   }, [visibleAnnotations, selectedId])
 
   const alts = alternatives(current.cls, current.conf, classCatalog)
+  const isLoadingReview = Boolean(currentProjectExternalId) && (tasks === null || reviewQueue === null)
+  const hasTasks = (tasks?.length ?? 0) > 0
+  const hasReviewItems = reviewItems.length > 0
+  const filtersActive =
+    onlyUnreviewed ||
+    onlyThisClass ||
+    minConf > 0 ||
+    hasBoxSizeFilter ||
+    (classCatalog.length > 0 && checkedClasses.size < classCatalog.length)
+  const clearReviewFilters = () => {
+    setCheckedClasses(new Set(classCatalog.map((c) => c.name)))
+    setOnlyUnreviewed(false)
+    setOnlyThisClass(false)
+    setMinConf(0)
+    setConfidenceInput("")
+    setSizeFilter("all")
+    setBoxAreaMinInput("")
+    setBoxAreaMaxInput("")
+  }
+  const dataHref = projectScopedHref("/dados", currentProjectId)
+  const annotateHref = projectScopedHref("/anotar", currentProjectId)
+
+  if (!hasVisibleAnnotations) {
+    if (!currentProjectExternalId) {
+      return (
+        <ReviewEmptyState
+          icon={FolderKanban}
+          title="Nenhum projeto ativo"
+          description="Selecione ou crie um projeto antes de revisar anotacoes."
+          primary={{ label: "Ir para projetos", href: "/projetos" }}
+        />
+      )
+    }
+
+    if (isLoadingReview) {
+      return (
+        <ReviewEmptyState
+          icon={FolderKanban}
+          title="Carregando revisao"
+          description="Buscando lotes e anotacoes do projeto ativo."
+          loading
+        />
+      )
+    }
+
+    if (!hasTasks) {
+      return (
+        <ReviewEmptyState
+          icon={Database}
+          title="Suba um lote antes de revisar"
+          description="As imagens aparecem automaticamente na tela Anotar depois que o lote termina de importar."
+          primary={{ label: "Ir para dados", href: dataHref }}
+        />
+      )
+    }
+
+    if (!hasReviewItems) {
+      return (
+        <ReviewEmptyState
+          icon={PenLine}
+          title="Anote imagens antes de revisar"
+          description="Abra a tela Anotar e salve ao menos uma anotacao. Depois disso, os objetos aparecem aqui para revisao."
+          primary={{ label: "Ir para anotar", href: annotateHref }}
+          secondary={{ label: "Subir lote", href: dataHref }}
+        />
+      )
+    }
+
+    if (filtersActive) {
+      return (
+        <ReviewEmptyState
+          icon={PenLine}
+          title="Nenhuma anotacao nos filtros atuais"
+          description="Remova os filtros ou selecione mais classes para voltar a ver a fila de revisao."
+          primary={{ label: "Limpar filtros", onClick: clearReviewFilters }}
+        />
+      )
+    }
+  }
 
   return (
     <div className="flex h-[calc(100svh-4rem)] flex-col bg-background">
@@ -1442,6 +1534,79 @@ function DecisionButton({
       {children}
     </button>
   )
+}
+
+function ReviewEmptyState({
+  icon: Icon,
+  title,
+  description,
+  primary,
+  secondary,
+  loading = false,
+}: {
+  icon: LucideIcon
+  title: string
+  description: string
+  primary?: EmptyAction
+  secondary?: EmptyAction
+  loading?: boolean
+}) {
+  return (
+    <div className="flex h-[calc(100svh-4rem)] items-center justify-center bg-background p-6">
+      <div className="flex max-w-md flex-col items-center gap-4 text-center">
+        <span className="flex size-12 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
+          {loading ? (
+            <span className="size-5 animate-spin rounded-full border-2 border-brand-blue/30 border-t-brand-blue" />
+          ) : (
+            <Icon className="size-6" />
+          )}
+        </span>
+        <div className="flex flex-col gap-1">
+          <p className="text-base font-semibold text-foreground">{title}</p>
+          <p className="text-sm leading-6 text-muted-foreground">{description}</p>
+        </div>
+        {(primary || secondary) && (
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            {secondary && <EmptyActionButton action={secondary} variant="outline" />}
+            {primary && <EmptyActionButton action={primary} variant="default" />}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+type EmptyAction = {
+  label: string
+  href?: string
+  onClick?: () => void
+}
+
+function EmptyActionButton({ action, variant }: { action: EmptyAction; variant: "default" | "outline" }) {
+  if (action.href) {
+    return (
+      <Link
+        href={action.href}
+        className={cn(
+          "inline-flex h-8 items-center justify-center rounded-lg border px-3 text-sm font-medium transition-colors",
+          variant === "default"
+            ? "border-transparent bg-primary text-primary-foreground hover:bg-primary/80"
+            : "border-border bg-background hover:bg-muted hover:text-foreground",
+        )}
+      >
+        {action.label}
+      </Link>
+    )
+  }
+  return (
+    <Button type="button" variant={variant} onClick={action.onClick}>
+      {action.label}
+    </Button>
+  )
+}
+
+function projectScopedHref(path: string, projectId: string | null) {
+  return projectId ? `${path}?project=${encodeURIComponent(projectId)}` : path
 }
 
 function parseOptionalDecimal(value: string) {

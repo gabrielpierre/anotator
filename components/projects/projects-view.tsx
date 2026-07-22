@@ -2,22 +2,41 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Plus, FolderKanban, HardDrive, Pencil, ArrowRight, FolderOpen, Users } from "lucide-react"
+import { useRouter } from "next/navigation"
+import {
+  AlertTriangle,
+  ArrowRight,
+  Database,
+  FolderKanban,
+  FolderOpen,
+  HardDrive,
+  Loader2,
+  Pencil,
+  Plus,
+  Trash2,
+  Users,
+} from "lucide-react"
 import { Card, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { Avatar } from "@/components/snowui/avatar"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, ProgressBar } from "@/components/app/primitives"
 import { AdminOnly } from "@/components/app/admin-only"
+import { ImportDatasetDialog } from "@/components/data/import-dataset-dialog"
 import { ProjectDialog, type ProjectDialogTarget } from "@/components/projects/project-dialog"
 import { useCurrentUser, projectRecordFromBackend, type ProjectRecord } from "@/lib/auth/user-context"
 import type { BackendProject } from "@/lib/api/types"
 
 export function ProjectsView() {
-  const { users, projects, addProject, updateProject } = useCurrentUser()
+  const router = useRouter()
+  const { users, projects, addProject, updateProject, removeProject, setActiveProjectId } = useCurrentUser()
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [dialogMode, setDialogMode] = React.useState<"create" | "edit">("create")
   const [editTarget, setEditTarget] = React.useState<ProjectDialogTarget | null>(null)
+  const [datasetImportOpen, setDatasetImportOpen] = React.useState(false)
+  const [deleteTarget, setDeleteTarget] = React.useState<ProjectRecord | null>(null)
+  const [deleteSubmitting, setDeleteSubmitting] = React.useState(false)
+  const [deleteError, setDeleteError] = React.useState<string | null>(null)
 
   const usersById = React.useMemo(() => new Map(users.map((user) => [user.id, user])), [users])
 
@@ -60,6 +79,20 @@ export function ProjectsView() {
     }
   }
 
+  async function confirmDeleteProject() {
+    if (!deleteTarget) return
+    setDeleteSubmitting(true)
+    setDeleteError(null)
+    try {
+      await removeProject(deleteTarget.id)
+      setDeleteTarget(null)
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : "Nao foi possivel excluir o projeto.")
+    } finally {
+      setDeleteSubmitting(false)
+    }
+  }
+
   return (
     <AdminOnly>
     <div className="flex flex-col gap-6 p-4 md:p-6">
@@ -67,10 +100,16 @@ export function ProjectsView() {
         title="Projetos"
         subtitle="Gerencie os projetos de anotação, o storage reservado e os acessos da equipe."
         actions={
-          <Button size="lg" onClick={openCreate}>
-            <Plus className="size-4" />
-            Novo projeto
-          </Button>
+          <>
+            <Button size="lg" variant="outline" onClick={() => setDatasetImportOpen(true)}>
+              <Database className="size-4" />
+              Importar dataset
+            </Button>
+            <Button size="lg" onClick={openCreate}>
+              <Plus className="size-4" />
+              Novo projeto
+            </Button>
+          </>
         }
       />
 
@@ -97,6 +136,28 @@ export function ProjectsView() {
         onClose={() => setDialogOpen(false)}
         onSaved={handleSaved}
       />
+      <ImportDatasetDialog
+        open={datasetImportOpen}
+        onClose={() => setDatasetImportOpen(false)}
+        onImported={(_, projectId) => {
+          setDatasetImportOpen(false)
+          if (projectId) {
+            setActiveProjectId(projectId)
+            router.push(`/dados?project=${encodeURIComponent(projectId)}`)
+          }
+        }}
+      />
+      <DeleteProjectDialog
+        project={deleteTarget}
+        submitting={deleteSubmitting}
+        error={deleteError}
+        onClose={() => {
+          if (deleteSubmitting) return
+          setDeleteTarget(null)
+          setDeleteError(null)
+        }}
+        onConfirm={confirmDeleteProject}
+      />
 
       {items.length === 0 ? (
         <Card>
@@ -121,7 +182,8 @@ export function ProjectsView() {
           {items.map((item) => (
             <Link
               key={item.id}
-              href="/"
+              href={`/?project=${encodeURIComponent(item.id)}`}
+              onClick={() => setActiveProjectId(item.id)}
               className="group block rounded-2xl outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
               aria-label={`Abrir visão geral de ${item.name}`}
             >
@@ -136,19 +198,36 @@ export function ProjectsView() {
                       <p className="text-xs text-muted-foreground">Criado em {item.createdAt}</p>
                     </div>
                   </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={(event) => {
-                      event.preventDefault()
-                      event.stopPropagation()
-                      openEdit(item)
-                    }}
-                    aria-label={`Editar ${item.name}`}
-                  >
-                    <Pencil className="size-4" />
-                    Editar
-                  </Button>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        openEdit(item)
+                      }}
+                      aria-label={`Editar ${item.name}`}
+                    >
+                      <Pencil className="size-4" />
+                      Editar
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-destructive hover:border-destructive/50 hover:bg-destructive/10 hover:text-destructive"
+                      onClick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        setDeleteTarget(item)
+                        setDeleteError(null)
+                      }}
+                      aria-label={`Excluir ${item.name}`}
+                    >
+                      <Trash2 className="size-4" />
+                      Excluir
+                    </Button>
+                  </div>
                 </div>
 
                 <div className="flex items-center gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
@@ -220,5 +299,60 @@ export function ProjectsView() {
       )}
     </div>
     </AdminOnly>
+  )
+}
+
+function DeleteProjectDialog({
+  project,
+  submitting,
+  error,
+  onClose,
+  onConfirm,
+}: {
+  project: ProjectRecord | null
+  submitting: boolean
+  error: string | null
+  onClose: () => void
+  onConfirm: () => void
+}) {
+  if (!project) return null
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Excluir projeto ${project.name}`}
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+    >
+      <button type="button" aria-label="Fechar" onClick={onClose} className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
+      <div className="relative z-10 w-full max-w-md overflow-hidden rounded-2xl border border-border bg-card shadow-xl">
+        <div className="flex items-start gap-3 border-b border-border p-5">
+          <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-destructive/10 text-destructive">
+            <AlertTriangle className="size-5" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold text-foreground">Excluir projeto</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              O projeto <span className="font-medium text-foreground">{project.name}</span> sairá da lista e os acessos dos anotadores serão removidos.
+            </p>
+          </div>
+        </div>
+        <div className="p-5">
+          <p className="text-sm text-muted-foreground">
+            Os registros vinculados ficam preservados no banco para auditoria.
+          </p>
+          {error && <p className="mt-3 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
+        </div>
+        <div className="flex justify-end gap-2 border-t border-border p-4">
+          <Button type="button" variant="outline" onClick={onClose} disabled={submitting}>
+            Cancelar
+          </Button>
+          <Button type="button" onClick={onConfirm} disabled={submitting} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
+            {submitting ? <Loader2 className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+            Excluir
+          </Button>
+        </div>
+      </div>
+    </div>
   )
 }

@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.api.deps import db_session
+from app.api.deps import current_admin, current_user, db_session
 from app.core.config import get_settings
-from app.models import JobRecord
+from app.models import JobRecord, User
 from app.schemas import CvatStatusRead, JobRead, SyncResult
 from app.services.cvat_client import CvatClient
 from app.services.jobs import attach_celery_task, create_job
@@ -14,7 +14,7 @@ router = APIRouter()
 
 
 @router.get("/status", response_model=CvatStatusRead)
-def cvat_status() -> CvatStatusRead:
+def cvat_status(_: User = Depends(current_user)) -> CvatStatusRead:
     settings = get_settings()
     client = CvatClient(settings)
     try:
@@ -51,13 +51,19 @@ def cvat_status() -> CvatStatusRead:
 
 
 @router.post("/sync", response_model=SyncResult)
-def sync_cvat(db: Session = Depends(db_session)) -> SyncResult:
+def sync_cvat(
+    db: Session = Depends(db_session),
+    _: User = Depends(current_admin),
+) -> SyncResult:
     service = CvatSyncService(db, CvatClient(get_settings()))
     return service.sync_all()
 
 
 @router.post("/sync/jobs", response_model=JobRead)
-def queue_cvat_sync(db: Session = Depends(db_session)) -> JobRecord:
+def queue_cvat_sync(
+    db: Session = Depends(db_session),
+    _: User = Depends(current_admin),
+) -> JobRecord:
     job = create_job(
         db,
         kind="sync",
