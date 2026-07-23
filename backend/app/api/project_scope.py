@@ -27,11 +27,17 @@ from app.models import (
 def resolve_project(db: Session, project_id: str | None) -> Project | None:
     if not project_id:
         return None
-    return db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
+    return db.get(Project, project_id) or db.scalar(
+        select(Project).where(Project.external_id == project_id)
+    )
 
 
 def project_values(project: Project | None) -> set[str]:
-    return {value for value in {project.id if project else None, project.external_id if project else None} if value}
+    return {
+        value
+        for value in {project.id if project else None, project.external_id if project else None}
+        if value
+    }
 
 
 def project_payload(project: Project | None) -> dict[str, str]:
@@ -46,9 +52,9 @@ def accessible_projects(db: Session, user: User) -> list[Project]:
         return list(db.scalars(query).all())
     return list(
         db.scalars(
-            query
-            .join(ProjectMember, ProjectMember.project_id == Project.id)
-            .where(ProjectMember.user_id == user.id)
+            query.join(ProjectMember, ProjectMember.project_id == Project.id).where(
+                ProjectMember.user_id == user.id
+            )
         ).all()
     )
 
@@ -92,7 +98,9 @@ def require_task_access(db: Session, user: User, task_id: str) -> Task:
         raise HTTPException(status_code=404, detail="Task not found")
     if not task.project_external_id:
         raise HTTPException(status_code=404, detail="Task not found")
-    require_project_for_user(db, user, project_for_task(db, task), orphan_detail="Task has no project ownership")
+    require_project_for_user(
+        db, user, project_for_task(db, task), orphan_detail="Task has no project ownership"
+    )
     return task
 
 
@@ -105,7 +113,9 @@ def visible_task_external_ids(
         project = require_project_access(db, user, project_external_id)
         return [
             task.external_id
-            for task in db.scalars(select(Task).where(Task.project_external_id == project.external_id)).all()
+            for task in db.scalars(
+                select(Task).where(Task.project_external_id == project.external_id)
+            ).all()
         ]
     if user.role == "admin":
         return []
@@ -114,7 +124,9 @@ def visible_task_external_ids(
         return []
     return [
         task.external_id
-        for task in db.scalars(select(Task).where(Task.project_external_id.in_(project_external_ids))).all()
+        for task in db.scalars(
+            select(Task).where(Task.project_external_id.in_(project_external_ids))
+        ).all()
     ]
 
 
@@ -225,10 +237,18 @@ def require_training_access(db: Session, user: User, run_id: str) -> TrainingRun
 def project_for_model(db: Session, model: ModelVersion | None) -> Project | None:
     if model is None:
         return None
-    project = project_for_release(db, db.get(DatasetRelease, model.dataset_release_id)) if model.dataset_release_id else None
+    project = (
+        project_for_release(db, db.get(DatasetRelease, model.dataset_release_id))
+        if model.dataset_release_id
+        else None
+    )
     if project is not None:
         return project
-    project = project_for_training(db, db.get(TrainingRun, model.training_run_id)) if model.training_run_id else None
+    project = (
+        project_for_training(db, db.get(TrainingRun, model.training_run_id))
+        if model.training_run_id
+        else None
+    )
     if project is not None:
         return project
     params = model.params if isinstance(model.params, dict) else {}
@@ -261,10 +281,14 @@ def project_for_pipeline(db: Session, run: PipelineRun | None) -> Project | None
         return project
     for source_key in ("source_release_id", "derived_release_id"):
         release_id = _first_str(lineage, source_key) or _first_str(definition, source_key)
-        project = project_for_release(db, db.get(DatasetRelease, release_id)) if release_id else None
+        project = (
+            project_for_release(db, db.get(DatasetRelease, release_id)) if release_id else None
+        )
         if project is not None:
             return project
-    task_ids = _list_str(definition.get("task_external_ids")) or _list_str(lineage.get("task_external_ids"))
+    task_ids = _list_str(definition.get("task_external_ids")) or _list_str(
+        lineage.get("task_external_ids")
+    )
     return _single_task_project(db, task_ids)
 
 
@@ -284,7 +308,11 @@ def require_pipeline_access(db: Session, user: User, run_id: str) -> PipelineRun
 def project_for_asset(db: Session, asset: DerivedAsset | None) -> Project | None:
     if asset is None:
         return None
-    project = project_for_release(db, db.get(DatasetRelease, asset.dataset_release_id)) if asset.dataset_release_id else None
+    project = (
+        project_for_release(db, db.get(DatasetRelease, asset.dataset_release_id))
+        if asset.dataset_release_id
+        else None
+    )
     if project is not None:
         return project
     project = project_for_task(db, resolve_task(db, asset.source_task_external_id))
@@ -294,7 +322,9 @@ def project_for_asset(db: Session, asset: DerivedAsset | None) -> Project | None
 
 
 def require_asset_access(db: Session, user: User, asset_id: str) -> DerivedAsset:
-    asset = db.get(DerivedAsset, asset_id) or db.scalar(select(DerivedAsset).where(DerivedAsset.external_id == asset_id))
+    asset = db.get(DerivedAsset, asset_id) or db.scalar(
+        select(DerivedAsset).where(DerivedAsset.external_id == asset_id)
+    )
     if asset is None:
         raise HTTPException(status_code=404, detail="Derived asset not found")
     require_project_for_user(
@@ -346,22 +376,35 @@ def project_values_for_job(db: Session, job: JobRecord) -> set[str]:
     projects: list[Project | None] = []
     task_ids = {
         job.task_external_id,
-        _first_str(raw, "task_external_id"),
+        _first_str(raw, "task_external_id", "cvat_task_id"),
         _nested_first_str(raw, "payload", "task_external_id"),
         _nested_first_str(raw, "lineage", "task_external_id"),
     }
+    task_ids.update(_list_str(raw.get("cvat_task_ids")))
     for task_id in task_ids:
         projects.append(project_for_task(db, resolve_task(db, task_id)))
     for release_id in {
-        _first_str(raw, "dataset_release_id", "release_id", "source_release_id", "derived_release_id"),
+        _first_str(
+            raw, "dataset_release_id", "release_id", "source_release_id", "derived_release_id"
+        ),
         _nested_first_str(raw, "payload", "dataset_release_id", "release_id", "source_release_id"),
         _nested_first_str(raw, "lineage", "source_release_id", "derived_release_id"),
     }:
-        projects.append(project_for_release(db, db.get(DatasetRelease, release_id)) if release_id else None)
-    training_id = _first_str(raw, "training_run_id") or _nested_first_str(raw, "payload", "training_run_id")
-    projects.append(project_for_training(db, db.get(TrainingRun, training_id)) if training_id else None)
-    pipeline_id = _first_str(raw, "pipeline_run_id") or _nested_first_str(raw, "payload", "pipeline_run_id")
-    projects.append(project_for_pipeline(db, db.get(PipelineRun, pipeline_id)) if pipeline_id else None)
+        projects.append(
+            project_for_release(db, db.get(DatasetRelease, release_id)) if release_id else None
+        )
+    training_id = _first_str(raw, "training_run_id") or _nested_first_str(
+        raw, "payload", "training_run_id"
+    )
+    projects.append(
+        project_for_training(db, db.get(TrainingRun, training_id)) if training_id else None
+    )
+    pipeline_id = _first_str(raw, "pipeline_run_id") or _nested_first_str(
+        raw, "payload", "pipeline_run_id"
+    )
+    projects.append(
+        project_for_pipeline(db, db.get(PipelineRun, pipeline_id)) if pipeline_id else None
+    )
     model_id = _first_str(raw, "model_id") or _nested_first_str(raw, "payload", "model_id")
     projects.append(project_for_model(db, db.get(ModelVersion, model_id)) if model_id else None)
 
@@ -381,19 +424,27 @@ def job_matches_project(db: Session, job: JobRecord, project: Project) -> bool:
     return bool(project_values_for_job(db, job) & project_values(project))
 
 
-def filter_visible_models(db: Session, user: User, models: Iterable[ModelVersion]) -> list[ModelVersion]:
+def filter_visible_models(
+    db: Session, user: User, models: Iterable[ModelVersion]
+) -> list[ModelVersion]:
     return [model for model in models if _project_visible(db, user, project_for_model(db, model))]
 
 
-def filter_visible_training_runs(db: Session, user: User, runs: Iterable[TrainingRun]) -> list[TrainingRun]:
+def filter_visible_training_runs(
+    db: Session, user: User, runs: Iterable[TrainingRun]
+) -> list[TrainingRun]:
     return [run for run in runs if _project_visible(db, user, project_for_training(db, run))]
 
 
-def filter_visible_pipelines(db: Session, user: User, runs: Iterable[PipelineRun]) -> list[PipelineRun]:
+def filter_visible_pipelines(
+    db: Session, user: User, runs: Iterable[PipelineRun]
+) -> list[PipelineRun]:
     return [run for run in runs if _project_visible(db, user, project_for_pipeline(db, run))]
 
 
-def filter_visible_assets(db: Session, user: User, assets: Iterable[DerivedAsset]) -> list[DerivedAsset]:
+def filter_visible_assets(
+    db: Session, user: User, assets: Iterable[DerivedAsset]
+) -> list[DerivedAsset]:
     return [asset for asset in assets if _project_visible(db, user, project_for_asset(db, asset))]
 
 

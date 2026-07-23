@@ -56,7 +56,11 @@ def list_projects(
 
 @router.post("", response_model=ProjectRead, dependencies=[Depends(current_admin)])
 def create_project(payload: ProjectCreate, db: Session = Depends(db_session)) -> Project:
-    external_id = payload.external_id.strip() if payload.external_id else _unique_external_id(db, payload.name)
+    external_id = (
+        payload.external_id.strip()
+        if payload.external_id
+        else _unique_external_id(db, payload.name)
+    )
     if db.scalar(select(Project).where(Project.external_id == external_id)) is not None:
         raise HTTPException(status_code=409, detail="Project external_id already exists")
 
@@ -99,7 +103,9 @@ def create_project(payload: ProjectCreate, db: Session = Depends(db_session)) ->
 
 
 @router.patch("/{project_id}", response_model=ProjectRead, dependencies=[Depends(current_admin)])
-def update_project(project_id: str, payload: ProjectUpdate, db: Session = Depends(db_session)) -> Project:
+def update_project(
+    project_id: str, payload: ProjectUpdate, db: Session = Depends(db_session)
+) -> Project:
     project = db.get(Project, project_id) or db.scalar(
         select(Project).where(Project.external_id == project_id)
     )
@@ -148,7 +154,9 @@ def delete_project(
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> Project:
-    project = db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
+    project = db.get(Project, project_id) or db.scalar(
+        select(Project).where(Project.external_id == project_id)
+    )
     if project is None or project.status == "deleted":
         raise HTTPException(status_code=404, detail="Project not found")
 
@@ -159,7 +167,9 @@ def delete_project(
     raw["deleted_tasks"] = task_cleanup
     project.status = "deleted"
     project.raw = raw
-    for member in db.scalars(select(ProjectMember).where(ProjectMember.project_id == project.id)).all():
+    for member in db.scalars(
+        select(ProjectMember).where(ProjectMember.project_id == project.id)
+    ).all():
         db.delete(member)
     db.add(project)
     db.add(
@@ -215,7 +225,9 @@ def _delete_project_tasks(db: Session, project: Project) -> dict[str, Any]:
 def _project_tasks_for_cleanup(db: Session, project: Project) -> list[Task]:
     task_by_external_id = {
         task.external_id: task
-        for task in db.scalars(select(Task).where(Task.project_external_id == project.external_id)).all()
+        for task in db.scalars(
+            select(Task).where(Task.project_external_id == project.external_id)
+        ).all()
         if task.external_id
     }
     project_refs = {project.id, project.external_id}
@@ -231,12 +243,10 @@ def _project_tasks_for_cleanup(db: Session, project: Project) -> list[Task]:
         }
         if not (project_refs & {ref for ref in refs if ref}):
             continue
-        cvat_task_id = raw.get("cvat_task_id") or payload.get("cvat_task_id")
-        if cvat_task_id is None:
-            continue
-        task = db.scalar(select(Task).where(Task.external_id == str(cvat_task_id)))
-        if task is not None and task.external_id:
-            task_by_external_id.setdefault(task.external_id, task)
+        for cvat_task_id in _job_cvat_task_ids(raw, payload):
+            task = db.scalar(select(Task).where(Task.external_id == cvat_task_id))
+            if task is not None and task.external_id:
+                task_by_external_id.setdefault(task.external_id, task)
     return list(task_by_external_id.values())
 
 
@@ -248,7 +258,9 @@ def project_dashboard(
 ) -> ProjectDashboardRead:
     if project_id == "default":
         if user.role == "admin":
-            project = db.scalar(select(Project).where(Project.status == "active").order_by(Project.created_at))
+            project = db.scalar(
+                select(Project).where(Project.status == "active").order_by(Project.created_at)
+            )
         else:
             project = db.scalar(
                 select(Project)
@@ -265,7 +277,9 @@ def project_dashboard(
     if project is None:
         tasks = []
     else:
-        tasks = list(db.scalars(select(Task).where(Task.project_external_id == project.external_id)).all())
+        tasks = list(
+            db.scalars(select(Task).where(Task.project_external_id == project.external_id)).all()
+        )
 
     labels: dict[str, int] = {}
     for task in tasks:
@@ -285,15 +299,25 @@ def project_dashboard(
         ClassDistribution(name=name, count=count, share=round((count / total_labels) * 100, 2))
         for name, count in sorted(labels.items())
     ]
-    pending_review_query = select(func.count(AnnotationRecord.id)).where(AnnotationRecord.review_state == "pending")
+    pending_review_query = select(func.count(AnnotationRecord.id)).where(
+        AnnotationRecord.review_state == "pending"
+    )
     task_external_ids = [task.external_id for task in tasks]
     if task_external_ids:
-        pending_review_query = pending_review_query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
+        pending_review_query = pending_review_query.where(
+            AnnotationRecord.task_external_id.in_(task_external_ids)
+        )
     elif project:
-        pending_review_query = pending_review_query.where(AnnotationRecord.task_external_id == "__none__")
+        pending_review_query = pending_review_query.where(
+            AnnotationRecord.task_external_id == "__none__"
+        )
 
     releases = list(db.scalars(select(DatasetRelease)).all())
-    project_releases = [release for release in releases if project is not None and _release_belongs_to_project(db, release, project)]
+    project_releases = [
+        release
+        for release in releases
+        if project is not None and _release_belongs_to_project(db, release, project)
+    ]
     project_release_ids = {release.id for release in project_releases}
     training_runs = (
         list(
@@ -336,12 +360,16 @@ def list_project_members(
     db: Session = Depends(db_session),
     _: User = Depends(current_admin),
 ) -> list[ProjectMember]:
-    project = db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
+    project = db.get(Project, project_id) or db.scalar(
+        select(Project).where(Project.external_id == project_id)
+    )
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return list(
         db.scalars(
-            select(ProjectMember).where(ProjectMember.project_id == project.id).order_by(ProjectMember.created_at)
+            select(ProjectMember)
+            .where(ProjectMember.project_id == project.id)
+            .order_by(ProjectMember.created_at)
         ).all()
     )
 
@@ -353,14 +381,25 @@ def put_project_members(
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> list[ProjectMember]:
-    project = db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
+    project = db.get(Project, project_id) or db.scalar(
+        select(Project).where(Project.external_id == project_id)
+    )
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
-    users = list(db.scalars(select(User).where(User.id.in_(payload.user_ids))).all()) if payload.user_ids else []
+    users = (
+        list(db.scalars(select(User).where(User.id.in_(payload.user_ids))).all())
+        if payload.user_ids
+        else []
+    )
     if len(users) != len(set(payload.user_ids)):
         raise HTTPException(status_code=400, detail="One or more users were not found")
 
-    current = {member.user_id: member for member in db.scalars(select(ProjectMember).where(ProjectMember.project_id == project.id))}
+    current = {
+        member.user_id: member
+        for member in db.scalars(
+            select(ProjectMember).where(ProjectMember.project_id == project.id)
+        )
+    }
     requested = set(payload.user_ids)
     for user_id, member in list(current.items()):
         if user_id not in requested:
@@ -381,7 +420,9 @@ def put_project_members(
     db.commit()
     return list(
         db.scalars(
-            select(ProjectMember).where(ProjectMember.project_id == project.id).order_by(ProjectMember.created_at)
+            select(ProjectMember)
+            .where(ProjectMember.project_id == project.id)
+            .order_by(ProjectMember.created_at)
         ).all()
     )
 
@@ -393,17 +434,23 @@ def delete_project_member(
     db: Session = Depends(db_session),
     actor: User = Depends(current_admin),
 ) -> dict[str, bool]:
-    project = db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
+    project = db.get(Project, project_id) or db.scalar(
+        select(Project).where(Project.external_id == project_id)
+    )
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     member = db.scalar(
-        select(ProjectMember).where(ProjectMember.project_id == project.id, ProjectMember.user_id == user_id)
+        select(ProjectMember).where(
+            ProjectMember.project_id == project.id, ProjectMember.user_id == user_id
+        )
     )
     if member is not None:
         db.delete(member)
     remaining = [
         row
-        for row in db.scalars(select(ProjectMember.user_id).where(ProjectMember.project_id == project.id)).all()
+        for row in db.scalars(
+            select(ProjectMember.user_id).where(ProjectMember.project_id == project.id)
+        ).all()
         if row != user_id
     ]
     _sync_project_annotators(db, project, remaining)
@@ -484,6 +531,24 @@ def _job_uploaded_bytes(job: JobRecord) -> int:
         if isinstance(artifact, dict):
             total += _int_value(artifact.get("size_bytes")) or 0
     return total
+
+
+def _job_cvat_task_ids(raw: dict[str, Any], payload: dict[str, Any]) -> list[str]:
+    task_ids: list[str] = []
+    for source in (raw, payload):
+        raw_task_ids = source.get("cvat_task_ids")
+        if isinstance(raw_task_ids, list):
+            task_ids.extend(str(task_id) for task_id in raw_task_ids if task_id)
+        raw_task_id = source.get("cvat_task_id")
+        if raw_task_id:
+            task_ids.append(str(raw_task_id))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for task_id in task_ids:
+        if task_id not in seen:
+            seen.add(task_id)
+            deduped.append(task_id)
+    return deduped
 
 
 def _int_value(value: object) -> int | None:

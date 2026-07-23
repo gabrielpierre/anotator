@@ -15,10 +15,15 @@ class Settings(BaseSettings):
     cvat_access_token: str | None = Field(default=None, alias="CVAT_ACCESS_TOKEN")
     cvat_auth_scheme: str = Field(default="Token", alias="CVAT_AUTH_SCHEME")
     cvat_host_header: str | None = Field(default=None, alias="CVAT_HOST_HEADER")
-    cvat_request_timeout_seconds: float = Field(default=20.0, alias="CVAT_REQUEST_TIMEOUT_SECONDS")
+    cvat_request_timeout_seconds: float = Field(default=600.0, alias="CVAT_REQUEST_TIMEOUT_SECONDS")
+    import_cvat_max_upload_bytes: int = Field(
+        default=805_306_368, alias="IMPORT_CVAT_MAX_UPLOAD_BYTES"
+    )
     annotation_frame_max_side: int = Field(default=1920, alias="ANNOTATION_FRAME_MAX_SIDE")
     annotation_frame_jpeg_quality: int = Field(default=84, alias="ANNOTATION_FRAME_JPEG_QUALITY")
-    annotation_frame_source_quality: str = Field(default="compressed", alias="ANNOTATION_FRAME_SOURCE_QUALITY")
+    annotation_frame_source_quality: str = Field(
+        default="compressed", alias="ANNOTATION_FRAME_SOURCE_QUALITY"
+    )
     annotation_frame_cache_dir: str = Field(
         default="/tmp/anotator-frame-cache",
         alias="ANNOTATION_FRAME_CACHE_DIR",
@@ -32,7 +37,9 @@ class Settings(BaseSettings):
     s3_region: str = Field(default="us-east-1", alias="S3_REGION")
     dataset_export_format: str = Field(default="CVAT for images 1.1", alias="DATASET_EXPORT_FORMAT")
     cvat_request_poll_attempts: int = Field(default=30, alias="CVAT_REQUEST_POLL_ATTEMPTS")
-    cvat_request_poll_interval_seconds: float = Field(default=1.0, alias="CVAT_REQUEST_POLL_INTERVAL_SECONDS")
+    cvat_request_poll_interval_seconds: float = Field(
+        default=1.0, alias="CVAT_REQUEST_POLL_INTERVAL_SECONDS"
+    )
 
     cors_origins_raw: str = Field(default="http://localhost:3000", alias="CORS_ORIGINS")
     auto_create_tables: bool = Field(default=False, alias="AUTO_CREATE_TABLES")
@@ -50,7 +57,9 @@ class Settings(BaseSettings):
     training_cpu_max_threads: int = Field(default=4, alias="TRAINING_CPU_MAX_THREADS")
     training_gpu_max_workers: int = Field(default=4, alias="TRAINING_GPU_MAX_WORKERS")
     training_gpu_max_batch_size: int = Field(default=8, alias="TRAINING_GPU_MAX_BATCH_SIZE")
-    training_gpu_target_memory_fraction: float = Field(default=0.7, alias="TRAINING_GPU_TARGET_MEMORY_FRACTION")
+    training_gpu_target_memory_fraction: float = Field(
+        default=0.7, alias="TRAINING_GPU_TARGET_MEMORY_FRACTION"
+    )
     training_min_shm_per_worker_mb: int = Field(default=256, alias="TRAINING_MIN_SHM_PER_WORKER_MB")
     training_heartbeat_seconds: int = Field(default=20, alias="TRAINING_HEARTBEAT_SECONDS")
     training_isolate_process: bool = Field(default=True, alias="TRAINING_ISOLATE_PROCESS")

@@ -11,7 +11,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.models import AnnotationRecord, AuditEvent, CvatLabel, JobRecord, Project, ProjectMember, Task, TaskDataMeta, User
+from app.models import (
+    AnnotationRecord,
+    AuditEvent,
+    CvatLabel,
+    JobRecord,
+    Project,
+    ProjectMember,
+    Task,
+    TaskDataMeta,
+    User,
+)
 from app.schemas import ImportTaskCreate
 from app.services.annotations import sync_job_annotations
 from app.services.artifacts import ArtifactStore
@@ -115,7 +125,9 @@ class DuplicateImportImagesError(ValueError):
         super().__init__(_duplicate_import_message(conflicts))
 
 
-def validate_import_quota(db: Session, payload: ImportTaskCreate, uploaded_bytes: int | None = None) -> Project | None:
+def validate_import_quota(
+    db: Session, payload: ImportTaskCreate, uploaded_bytes: int | None = None
+) -> Project | None:
     project = _resolve_project(db, payload.project_id)
     if project is None:
         return None
@@ -190,60 +202,167 @@ def run_import_task_job(
         artifact_store=artifact_store,
         current_job_id=job.id,
     )
+    max_upload_bytes = _cvat_import_max_upload_bytes(settings)
+    media_batches = _media_file_batches(media_files, max_upload_bytes)
+    total_batches = len(media_batches)
+    total_bytes = _files_size(media_files)
+    batching_payload = {
+        "batch_count": total_batches,
+        "total_images": len(media_files),
+        "total_bytes": total_bytes,
+        "max_upload_bytes": max_upload_bytes,
+    }
+    if total_batches > 1:
+        update_job_progress(
+            db,
+            job_id,
+            25,
+            detail=f"Dataset dividido em {total_batches} tasks CVAT menores.",
+            metrics={"import_batch_count": total_batches, "import_total_bytes": total_bytes},
+        )
     cvat_project_id = _cvat_project_id(project)
-    task_payload = client.create_task(name=payload.name, labels=payload.labels, project_id=cvat_project_id)
-    task_id = task_payload.get("id")
-    if task_id is None:
-        raise RuntimeError("CVAT did not return a task id")
-    job.task_external_id = str(task_id)
-    job.raw = {**(job.raw or {}), "cvat_task_id": str(task_id)}
-    db.add(job)
-    db.commit()
-    update_job_progress(db, job_id, 35, detail=f"Created CVAT task {task_id}.")
-    upload_result: dict[str, Any] | None = None
-    upload_request: dict[str, Any] | None = None
-    upload_result = client.upload_task_data(task_id, files=media_files)
-    update_job_progress(db, job_id, 55, detail=f"Uploaded {len(media_files)} images to CVAT task {task_id}.")
-    request_id = _request_id_from_payload(upload_result)
-    if request_id:
-        upload_request = _wait_for_cvat_request(client, request_id, settings)
-    update_job_progress(db, job_id, 70, detail=f"CVAT processed {len(media_files)} images for task {task_id}.")
+    task_ids: list[str] = []
+    task_payloads: list[dict[str, Any]] = []
+    import_batches: list[dict[str, Any]] = []
+
+    for index, batch_files in enumerate(media_batches, start=1):
+        task_name = _batch_task_name(payload.name, index, total_batches)
+        batch_manifest = build_import_file_manifest(batch_files)
+        batch_size = _files_size(batch_files)
+        update_job_progress(
+            db,
+            job_id,
+            _import_batch_progress(index, total_batches, phase=0),
+            detail=f"Criando task CVAT {index}/{total_batches}.",
+            metrics={
+                "import_batch_index": index,
+                "import_batch_count": total_batches,
+                "import_batch_bytes": batch_size,
+            },
+        )
+        task_payload = client.create_task(
+            name=task_name, labels=payload.labels, project_id=cvat_project_id
+        )
+        task_id = task_payload.get("id")
+        if task_id is None:
+            raise RuntimeError("CVAT did not return a task id")
+
+        task_id_str = str(task_id)
+        task_ids.append(task_id_str)
+        task_payloads.append(task_payload)
+        batch_payload: dict[str, Any] = {
+            "index": index,
+            "total": total_batches,
+            "task_name": task_name,
+            "cvat_task_id": task_id_str,
+            "image_count": len(batch_files),
+            "size_bytes": batch_size,
+            "files": batch_manifest,
+            "cvat_task": task_payload,
+        }
+        import_batches.append(batch_payload)
+        _persist_import_task_progress(
+            db,
+            job,
+            first_task_external_id=task_ids[0],
+            task_ids=task_ids,
+            batching_payload=batching_payload,
+            import_batches=import_batches,
+        )
+        update_job_progress(
+            db,
+            job_id,
+            _import_batch_progress(index, total_batches, phase=1),
+            detail=f"Task CVAT {index}/{total_batches} criada ({len(batch_files)} imagens).",
+        )
+
+        upload_result = client.upload_task_data(task_id, files=batch_files)
+        batch_payload["upload_result"] = upload_result
+        _persist_import_task_progress(
+            db,
+            job,
+            first_task_external_id=task_ids[0],
+            task_ids=task_ids,
+            batching_payload=batching_payload,
+            import_batches=import_batches,
+        )
+        update_job_progress(
+            db,
+            job_id,
+            _import_batch_progress(index, total_batches, phase=2),
+            detail=f"Enviado lote {index}/{total_batches} para o CVAT.",
+        )
+
+        request_id = _request_id_from_payload(upload_result)
+        if request_id:
+            batch_payload["upload_request"] = _wait_for_cvat_request(client, request_id, settings)
+            _persist_import_task_progress(
+                db,
+                job,
+                first_task_external_id=task_ids[0],
+                task_ids=task_ids,
+                batching_payload=batching_payload,
+                import_batches=import_batches,
+            )
+        update_job_progress(
+            db,
+            job_id,
+            _import_batch_progress(index, total_batches, phase=3),
+            detail=f"CVAT processou lote {index}/{total_batches}.",
+        )
+
     sync_result = None
     if payload.sync_after_import:
-        sync_result = CvatSyncService(db, client, job_id=job_id).sync_all().model_dump(mode="json")
-        update_job_progress(db, job_id, 95, detail="Synchronized imported CVAT task.")
-    assignee = _finalize_imported_task(
-        db,
-        str(task_id),
-        payload.assignee_user_id,
-        task_payload,
-        project,
-        import_manifest,
-    )
-    annotation_import = _materialize_dataset_annotations(
-        db,
-        client,
-        task_external_id=str(task_id),
-        payload=payload,
-        files=files,
-        media_files=media_files,
-    )
-    if annotation_import.get("imported"):
+        sync_result = CvatSyncService(db, client).sync_all().model_dump(mode="json")
+        update_job_progress(db, job_id, 90, detail="CVAT sincronizado apos a importacao.")
+
+    assignees: list[dict[str, str] | None] = []
+    annotation_imports: list[dict[str, Any]] = []
+    for batch, batch_files, task_payload in zip(
+        import_batches, media_batches, task_payloads, strict=True
+    ):
+        task_external_id = str(batch["cvat_task_id"])
+        assignee = _finalize_imported_task(
+            db,
+            task_external_id,
+            payload.assignee_user_id,
+            task_payload,
+            project,
+            batch["files"],
+        )
+        assignees.append(assignee)
+        annotation_import = _materialize_dataset_annotations(
+            db,
+            client,
+            task_external_id=task_external_id,
+            payload=payload,
+            files=files,
+            media_files=batch_files,
+        )
+        annotation_imports.append({"cvat_task_id": task_external_id, **annotation_import})
+
+    dataset_import = _summarize_annotation_imports(annotation_imports)
+    if dataset_import.get("imported"):
         update_job_progress(
             db,
             job_id,
             98,
-            detail=f"Imported {annotation_import['imported']} dataset annotations.",
+            detail=f"Importadas {dataset_import['imported']} anotacoes do dataset.",
         )
 
     raw_update = {
-        "cvat_task_id": str(task_id),
-        "cvat_task": task_payload,
-        "assignee": assignee,
-        "import_manifest": {"files": import_manifest},
-        "dataset_import": annotation_import,
-        "upload_result": upload_result,
-        "upload_request": upload_request,
+        "cvat_task_id": task_ids[0],
+        "cvat_task_ids": task_ids,
+        "cvat_task": task_payloads[0],
+        "cvat_tasks": task_payloads,
+        "assignee": next((assignee for assignee in assignees if assignee), None),
+        "assignees": assignees,
+        "import_batching": batching_payload,
+        "import_manifest": {"files": import_manifest, "batches": import_batches},
+        "dataset_import": dataset_import,
+        "dataset_imports": annotation_imports,
+        "upload_result": import_batches[0].get("upload_result") if import_batches else None,
+        "upload_request": import_batches[0].get("upload_request") if import_batches else None,
         "sync_result": sync_result,
     }
     db.add(
@@ -254,7 +373,11 @@ def run_import_task_job(
             payload=raw_update,
         )
     )
-    return succeed_job(db, job_id, detail=f"Imported CVAT task {task_id}.", raw_update=raw_update)
+    if len(task_ids) == 1:
+        detail = f"Importada task CVAT {task_ids[0]}."
+    else:
+        detail = f"Importadas {len(media_files)} imagens em {len(task_ids)} tasks CVAT."
+    return succeed_job(db, job_id, detail=detail, raw_update=raw_update)
 
 
 def _files_from_job(job: JobRecord, artifact_store: ArtifactStore) -> list[tuple[str, bytes, str]]:
@@ -268,7 +391,11 @@ def _files_from_job(job: JobRecord, artifact_store: ArtifactStore) -> list[tuple
         blob = artifact_store.get(str(upload["uri"]))
         files.append(
             (
-                str(upload.get("relative_path") or upload.get("filename") or Path(str(upload["uri"])).name),
+                str(
+                    upload.get("relative_path")
+                    or upload.get("filename")
+                    or Path(str(upload["uri"])).name
+                ),
                 blob.content,
                 str(upload.get("content_type") or blob.content_type or "application/octet-stream"),
             )
@@ -287,6 +414,103 @@ def _image_files(files: list[tuple[str, bytes, str]]) -> list[tuple[str, bytes, 
         for filename, content, content_type in files
         if is_import_image_file(filename, content_type)
     ]
+
+
+def _media_file_batches(
+    media_files: list[tuple[str, bytes, str]],
+    max_upload_bytes: int,
+) -> list[list[tuple[str, bytes, str]]]:
+    ordered_files = sorted(media_files, key=lambda item: _safe_relative_path(item[0]).casefold())
+    if max_upload_bytes <= 0:
+        return [ordered_files]
+
+    batches: list[list[tuple[str, bytes, str]]] = []
+    current: list[tuple[str, bytes, str]] = []
+    current_size = 0
+    for media_file in ordered_files:
+        filename, content, _content_type = media_file
+        file_size = len(content)
+        if file_size > max_upload_bytes:
+            raise RuntimeError(
+                f"Arquivo {filename} tem {_format_bytes(file_size)} e excede o limite seguro "
+                f"por task CVAT ({_format_bytes(max_upload_bytes)})."
+            )
+        if current and current_size + file_size > max_upload_bytes:
+            batches.append(current)
+            current = []
+            current_size = 0
+        current.append(media_file)
+        current_size += file_size
+
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _cvat_import_max_upload_bytes(settings: Settings) -> int:
+    value = _int_value(getattr(settings, "import_cvat_max_upload_bytes", None))
+    return value if value is not None else 805_306_368
+
+
+def _files_size(files: list[tuple[str, bytes, str]]) -> int:
+    return sum(len(content) for _filename, content, _content_type in files)
+
+
+def _batch_task_name(base_name: str, index: int, total: int) -> str:
+    if total <= 1:
+        return base_name
+    suffix = f" - parte {index:02d}-{total:02d}"
+    return f"{base_name[: max(1, 255 - len(suffix))]}{suffix}"
+
+
+def _import_batch_progress(index: int, total: int, *, phase: int) -> float:
+    if total <= 0:
+        return 30
+    phase_weights = {0: 0.05, 1: 0.25, 2: 0.72, 3: 0.95}
+    batch_fraction = (index - 1 + phase_weights.get(phase, 0.95)) / total
+    return 25 + (batch_fraction * 60)
+
+
+def _persist_import_task_progress(
+    db: Session,
+    job: JobRecord,
+    *,
+    first_task_external_id: str,
+    task_ids: list[str],
+    batching_payload: dict[str, Any],
+    import_batches: list[dict[str, Any]],
+) -> None:
+    live_job = db.get(JobRecord, job.id) or job
+    live_job.task_external_id = first_task_external_id
+    live_job.raw = {
+        **(live_job.raw or {}),
+        "cvat_task_id": first_task_external_id,
+        "cvat_task_ids": list(task_ids),
+        "import_batching": batching_payload,
+        "import_batches": import_batches,
+    }
+    db.add(live_job)
+    db.commit()
+    db.refresh(live_job)
+
+
+def _summarize_annotation_imports(annotation_imports: list[dict[str, Any]]) -> dict[str, Any]:
+    if not annotation_imports:
+        return {"format": None, "imported": 0, "skipped": 0, "cvat_synced": False, "tasks": []}
+    formats = sorted({str(item.get("format")) for item in annotation_imports if item.get("format")})
+    errors = [
+        {"cvat_task_id": item.get("cvat_task_id"), "error": item.get("cvat_error")}
+        for item in annotation_imports
+        if item.get("cvat_error")
+    ]
+    return {
+        "format": formats[0] if len(formats) == 1 else formats or None,
+        "imported": sum(int(item.get("imported") or 0) for item in annotation_imports),
+        "skipped": sum(int(item.get("skipped") or 0) for item in annotation_imports),
+        "cvat_synced": all(bool(item.get("cvat_synced")) for item in annotation_imports),
+        "tasks": annotation_imports,
+        "errors": errors,
+    }
 
 
 def build_import_file_manifest(files: list[tuple[str, bytes, str]]) -> list[dict[str, Any]]:
@@ -338,7 +562,9 @@ def _files_from_source_path(path: Path) -> list[tuple[str, bytes, str]]:
     candidates = [path]
     root = path if path.is_dir() else path.parent
     if path.is_dir():
-        candidates = sorted(file for file in path.rglob("*") if file.suffix.lower() in DATASET_IMPORT_EXTENSIONS)
+        candidates = sorted(
+            file for file in path.rglob("*") if file.suffix.lower() in DATASET_IMPORT_EXTENSIONS
+        )
     files = []
     for file in candidates:
         if file.is_file():
@@ -350,7 +576,9 @@ def _files_from_source_path(path: Path) -> list[tuple[str, bytes, str]]:
 def _resolve_project(db: Session, project_id: str | None) -> Project | None:
     if not project_id:
         return None
-    return db.get(Project, project_id) or db.scalar(select(Project).where(Project.external_id == project_id))
+    return db.get(Project, project_id) or db.scalar(
+        select(Project).where(Project.external_id == project_id)
+    )
 
 
 def _cvat_project_id(project: Project | None) -> str | int | None:
@@ -409,13 +637,17 @@ def _finalize_imported_task(
     return assignee_payload
 
 
-def _ensure_project_membership(db: Session, task: Task, assignee: User, project: Project | None) -> None:
+def _ensure_project_membership(
+    db: Session, task: Task, assignee: User, project: Project | None
+) -> None:
     if project is None and task.project_external_id:
         project = db.scalar(select(Project).where(Project.external_id == task.project_external_id))
     if project is None:
         return
     membership = db.scalar(
-        select(ProjectMember).where(ProjectMember.project_id == project.id, ProjectMember.user_id == assignee.id)
+        select(ProjectMember).where(
+            ProjectMember.project_id == project.id, ProjectMember.user_id == assignee.id
+        )
     )
     if membership is not None:
         return
@@ -487,8 +719,12 @@ def _materialize_dataset_annotations(
         label_name, label_color = _target_label(item["source_name"], class_mapping)
         label = label_lookup.get(label_name.casefold())
         label_id = _label_raw_id(label)
-        width = _float_value(frame_info.get("width")) or _float_value(item.get("image_width")) or 1.0
-        height = _float_value(frame_info.get("height")) or _float_value(item.get("image_height")) or 1.0
+        width = (
+            _float_value(frame_info.get("width")) or _float_value(item.get("image_width")) or 1.0
+        )
+        height = (
+            _float_value(frame_info.get("height")) or _float_value(item.get("image_height")) or 1.0
+        )
         shape = _shape_from_dataset_item(item, width, height)
         if shape is None:
             skipped += 1
@@ -750,7 +986,11 @@ def _dataset_class_names(files: list[tuple[str, bytes, str]]) -> dict[int, str]:
 def _explicit_dataset_class_names(files: list[tuple[str, bytes, str]]) -> dict[int, str]:
     for filename, content, _content_type in files:
         safe_name = _safe_filename(filename).casefold()
-        if safe_name not in CLASS_FILE_NAMES and Path(safe_name).suffix.lower() not in {".yaml", ".yml", ".names"}:
+        if safe_name not in CLASS_FILE_NAMES and Path(safe_name).suffix.lower() not in {
+            ".yaml",
+            ".yml",
+            ".names",
+        }:
             continue
         try:
             text = content.decode("utf-8")
@@ -759,7 +999,11 @@ def _explicit_dataset_class_names(files: list[tuple[str, bytes, str]]) -> dict[i
         if safe_name.endswith((".yaml", ".yml")):
             names = _names_from_yaml(text)
         else:
-            names = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+            names = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
         if names:
             return {index: name for index, name in enumerate(names)}
     return {}
@@ -787,7 +1031,10 @@ def _names_from_yaml(text: str) -> list[str]:
 
 
 def _looks_like_coco_dataset(files: list[tuple[str, bytes, str]]) -> bool:
-    names = [f"/{_safe_relative_path(filename).casefold()}" for filename, _content, _content_type in files]
+    names = [
+        f"/{_safe_relative_path(filename).casefold()}"
+        for filename, _content, _content_type in files
+    ]
     if any("/coco128/" in name or "/coco/" in name for name in names):
         return True
     class_ids: set[int] = set()
@@ -823,7 +1070,9 @@ def _class_mapping_by_source(mappings: list[dict[str, Any]]) -> dict[str, dict[s
     return by_source
 
 
-def _target_label(source_name: str, class_mapping: dict[str, dict[str, str | None]]) -> tuple[str, str | None]:
+def _target_label(
+    source_name: str, class_mapping: dict[str, dict[str, str | None]]
+) -> tuple[str, str | None]:
     mapped = class_mapping.get(source_name.casefold())
     if not mapped:
         return source_name, None
@@ -847,7 +1096,10 @@ def _ensure_dataset_labels(
         name = str(label.get("name") or label.get("label") or "").strip()
         if not name:
             continue
-        labels[name.casefold()] = {"name": name, "color": str(label.get("color") or "").strip() or None}
+        labels[name.casefold()] = {
+            "name": name,
+            "color": str(label.get("color") or "").strip() or None,
+        }
 
     existing_task_labels = {
         str(item.get("name") or item.get("label") or "").casefold()
@@ -901,7 +1153,9 @@ def _ensure_label_row(db: Session, task: Task, name: str, color: str) -> None:
         db.add(project_label)
 
     task_label = db.scalar(
-        select(CvatLabel).where(CvatLabel.task_external_id == task.external_id, CvatLabel.name == name)
+        select(CvatLabel).where(
+            CvatLabel.task_external_id == task.external_id, CvatLabel.name == name
+        )
     )
     if task_label is None:
         digest = hashlib.sha1(f"{task.external_id}:{name}".encode()).hexdigest()[:16]
@@ -918,7 +1172,9 @@ def _ensure_label_row(db: Session, task: Task, name: str, color: str) -> None:
 
 
 def _label_lookup(db: Session, task: Task) -> dict[str, CvatLabel]:
-    labels = list(db.scalars(select(CvatLabel).where(CvatLabel.task_external_id == task.external_id)).all())
+    labels = list(
+        db.scalars(select(CvatLabel).where(CvatLabel.task_external_id == task.external_id)).all()
+    )
     if task.project_external_id:
         labels.extend(
             list(
@@ -954,7 +1210,12 @@ def _dataset_frame_index(
     for frame_index, frame in enumerate(frames):
         if not isinstance(frame, dict):
             continue
-        filename = frame.get("name") or frame.get("filename") or frame.get("file_name") or frame.get("path")
+        filename = (
+            frame.get("name")
+            or frame.get("filename")
+            or frame.get("file_name")
+            or frame.get("path")
+        )
         if not filename:
             continue
         stem = Path(_safe_filename(str(filename))).stem.casefold()
@@ -980,7 +1241,9 @@ def _dataset_frame_index(
     return indexed
 
 
-def _media_dimensions_by_stem(media_files: list[tuple[str, bytes, str]]) -> dict[str, dict[str, float]]:
+def _media_dimensions_by_stem(
+    media_files: list[tuple[str, bytes, str]],
+) -> dict[str, dict[str, float]]:
     dimensions: dict[str, dict[str, float]] = {}
     for filename, content, content_type in media_files:
         if not is_import_image_file(filename, content_type):
@@ -1001,13 +1264,17 @@ def _image_dimensions(content: bytes) -> tuple[float, float] | None:
         return None
 
 
-def _shape_from_dataset_item(item: dict[str, Any], frame_width: float, frame_height: float) -> dict[str, Any] | None:
+def _shape_from_dataset_item(
+    item: dict[str, Any], frame_width: float, frame_height: float
+) -> dict[str, Any] | None:
     if item.get("format") == "coco":
         return _shape_from_coco_item(item, frame_width, frame_height)
     return _shape_from_yolo_item(item, frame_width, frame_height)
 
 
-def _shape_from_yolo_item(item: dict[str, Any], frame_width: float, frame_height: float) -> dict[str, Any] | None:
+def _shape_from_yolo_item(
+    item: dict[str, Any], frame_width: float, frame_height: float
+) -> dict[str, Any] | None:
     cx = _float_value(item.get("cx"))
     cy = _float_value(item.get("cy"))
     width = _float_value(item.get("width"))
@@ -1037,7 +1304,9 @@ def _shape_from_yolo_item(item: dict[str, Any], frame_width: float, frame_height
     }
 
 
-def _shape_from_coco_item(item: dict[str, Any], frame_width: float, frame_height: float) -> dict[str, Any] | None:
+def _shape_from_coco_item(
+    item: dict[str, Any], frame_width: float, frame_height: float
+) -> dict[str, Any] | None:
     bbox = item.get("bbox")
     if not isinstance(bbox, list) or len(bbox) < 4:
         return None
@@ -1085,7 +1354,9 @@ def _shape_from_coco_item(item: dict[str, Any], frame_width: float, frame_height
     }
 
 
-def _dataset_annotation_external_id(task_external_id: str, record_payload: dict[str, Any], index: int) -> str:
+def _dataset_annotation_external_id(
+    task_external_id: str, record_payload: dict[str, Any], index: int
+) -> str:
     raw = (
         f"{task_external_id}:{record_payload.get('frame')}:{record_payload.get('source_file')}:"
         f"{record_payload.get('source_class_id')}:{record_payload.get('points_norm')}:{index}"
@@ -1178,11 +1449,15 @@ def _incoming_manifest_conflicts(manifest: list[dict[str, Any]]) -> list[dict[st
         name_key = str(item.get("normalized_filename") or "")
         sha256 = str(item.get("sha256") or "")
         if name_key and name_key in seen_names:
-            conflicts.append(_conflict_payload(item, seen_names[name_key], reason="nome", scope="upload"))
+            conflicts.append(
+                _conflict_payload(item, seen_names[name_key], reason="nome", scope="upload")
+            )
         else:
             seen_names[name_key] = item
         if sha256 and sha256 in seen_hashes:
-            conflicts.append(_conflict_payload(item, seen_hashes[sha256], reason="conteudo", scope="upload"))
+            conflicts.append(
+                _conflict_payload(item, seen_hashes[sha256], reason="conteudo", scope="upload")
+            )
         else:
             seen_hashes[sha256] = item
     return conflicts
@@ -1215,9 +1490,13 @@ def _existing_manifest_conflicts(
         sha256 = str(item.get("sha256") or "")
         name_key = str(item.get("normalized_filename") or "")
         if sha256 and sha256 in by_hash:
-            conflicts.append(_conflict_payload(item, by_hash[sha256], reason="conteudo", scope="projeto"))
+            conflicts.append(
+                _conflict_payload(item, by_hash[sha256], reason="conteudo", scope="projeto")
+            )
         elif name_key and name_key in by_name:
-            conflicts.append(_conflict_payload(item, by_name[name_key], reason="nome", scope="projeto"))
+            conflicts.append(
+                _conflict_payload(item, by_name[name_key], reason="nome", scope="projeto")
+            )
     return conflicts
 
 
@@ -1243,7 +1522,7 @@ def _existing_import_images(
     for job in import_jobs:
         if job.id == current_job_id or job.status not in ACTIVE_IMPORT_STATUSES:
             continue
-        if (job.raw or {}).get("cvat_task_id"):
+        if _job_cvat_task_ids(job):
             continue
         raw_payload = (job.raw or {}).get("payload")
         if not isinstance(raw_payload, dict):
@@ -1270,10 +1549,27 @@ def _scoped_task_query(project: Project | None):
 def _upload_jobs_by_task(jobs: list[JobRecord]) -> dict[str, list[JobRecord]]:
     grouped: dict[str, list[JobRecord]] = {}
     for job in jobs:
-        task_external_id = str((job.raw or {}).get("cvat_task_id") or "")
-        if task_external_id:
+        for task_external_id in _job_cvat_task_ids(job):
             grouped.setdefault(task_external_id, []).append(job)
     return grouped
+
+
+def _job_cvat_task_ids(job: JobRecord) -> list[str]:
+    raw = job.raw if isinstance(job.raw, dict) else {}
+    task_ids: list[str] = []
+    raw_task_ids = raw.get("cvat_task_ids")
+    if isinstance(raw_task_ids, list):
+        task_ids.extend(str(task_id) for task_id in raw_task_ids if task_id)
+    raw_task_id = raw.get("cvat_task_id")
+    if raw_task_id:
+        task_ids.append(str(raw_task_id))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for task_id in task_ids:
+        if task_id not in seen:
+            seen.add(task_id)
+            deduped.append(task_id)
+    return deduped
 
 
 def _images_from_task(db: Session, task: Task) -> list[dict[str, Any]]:
@@ -1283,7 +1579,11 @@ def _images_from_task(db: Session, task: Task) -> list[dict[str, Any]]:
     if isinstance(manifest, dict) and isinstance(manifest.get("files"), list):
         for item in manifest["files"]:
             if isinstance(item, dict):
-                images.append(_existing_image_payload(item, task_name=task.name, task_external_id=task.external_id))
+                images.append(
+                    _existing_image_payload(
+                        item, task_name=task.name, task_external_id=task.external_id
+                    )
+                )
 
     meta = db.scalar(select(TaskDataMeta).where(TaskDataMeta.task_external_id == task.external_id))
     if meta is not None:
@@ -1296,7 +1596,12 @@ def _images_from_frame_meta(frames: list[Any], task: Task) -> list[dict[str, Any
     for frame in frames:
         if not isinstance(frame, dict):
             continue
-        filename = frame.get("name") or frame.get("filename") or frame.get("file_name") or frame.get("path")
+        filename = (
+            frame.get("name")
+            or frame.get("filename")
+            or frame.get("file_name")
+            or frame.get("path")
+        )
         if not filename:
             continue
         images.append(
@@ -1317,7 +1622,8 @@ def _images_from_upload_artifacts(
     uploads = (job.raw or {}).get("upload_artifacts")
     if not isinstance(uploads, list):
         return []
-    task_external_id = str((job.raw or {}).get("cvat_task_id") or "") or None
+    task_ids = _job_cvat_task_ids(job)
+    task_external_id = task_ids[0] if len(task_ids) == 1 else None
     images: list[dict[str, Any]] = []
     for upload in uploads:
         if not isinstance(upload, dict):
@@ -1333,7 +1639,9 @@ def _images_from_upload_artifacts(
         )
         if not item.get("sha256") and artifact_store is not None and upload.get("uri"):
             try:
-                item["sha256"] = hashlib.sha256(artifact_store.get(str(upload["uri"])).content).hexdigest()
+                item["sha256"] = hashlib.sha256(
+                    artifact_store.get(str(upload["uri"])).content
+                ).hexdigest()
             except Exception:
                 pass
         images.append(item)
@@ -1360,12 +1668,16 @@ def _existing_image_payload(
     task_name: str | None,
     task_external_id: str | None,
 ) -> dict[str, Any]:
-    filename = str(item.get("relative_path") or item.get("filename") or item.get("name") or "upload.bin")
+    filename = str(
+        item.get("relative_path") or item.get("filename") or item.get("name") or "upload.bin"
+    )
     safe_filename = _safe_filename(filename)
     return {
         "filename": safe_filename,
         "relative_path": _safe_relative_path(filename),
-        "normalized_filename": str(item.get("normalized_filename") or _normalized_filename(filename)),
+        "normalized_filename": str(
+            item.get("normalized_filename") or _normalized_filename(filename)
+        ),
         "sha256": item.get("sha256"),
         "size_bytes": item.get("size_bytes"),
         "content_type": item.get("content_type"),
@@ -1391,7 +1703,9 @@ def _conflict_payload(
     }
 
 
-def _same_project_scope(project_id: str | None, current_project_id: str | None, project: Project | None) -> bool:
+def _same_project_scope(
+    project_id: str | None, current_project_id: str | None, project: Project | None
+) -> bool:
     if project is None:
         return not project_id and not current_project_id
     valid_ids = {project.id, project.external_id}
@@ -1433,7 +1747,9 @@ def _duplicate_import_message(conflicts: list[dict[str, Any]]) -> str:
     return f"Imagens duplicadas ou ja importadas neste projeto: {', '.join(parts)}{suffix}."
 
 
-def _wait_for_cvat_request(client: CvatClient, request_id: str, settings: Settings) -> dict[str, Any]:
+def _wait_for_cvat_request(
+    client: CvatClient, request_id: str, settings: Settings
+) -> dict[str, Any]:
     last_payload: dict[str, Any] = {}
     terminal_statuses = {"finished", "completed", "succeeded", "failed", "error"}
     for _ in range(settings.cvat_request_poll_attempts):
@@ -1471,3 +1787,13 @@ def _int_value(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _format_bytes(value: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    amount = float(max(value, 0))
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} B"
+        amount /= 1024
+    return f"{value} B"

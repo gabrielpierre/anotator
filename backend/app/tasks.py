@@ -10,7 +10,6 @@ from app.services.artifacts import S3ArtifactStore
 from app.services.cvat_client import CvatClient
 from app.services.imports import run_import_task_job
 from app.services.inference import run_inference
-from app.services.json_safety import sanitize_json_dict, sanitize_json_payload
 from app.services.jobs import (
     JobCanceled,
     ensure_not_canceled,
@@ -21,6 +20,7 @@ from app.services.jobs import (
     succeed_job,
     update_job_progress,
 )
+from app.services.json_safety import sanitize_json_dict, sanitize_json_payload
 from app.services.pipelines import run_pipeline
 from app.services.releases import build_dataset_release
 from app.services.sync import CvatSyncService
@@ -37,9 +37,16 @@ def sync_cvat_task(job_id: str | None = None) -> dict[str, Any]:
         payload = result.model_dump(mode="json")
         if job_id:
             if result.job.status == "succeeded":
-                succeed_job(db, job_id, detail=result.job.detail, raw_update={"sync_result": payload})
+                succeed_job(
+                    db, job_id, detail=result.job.detail, raw_update={"sync_result": payload}
+                )
             else:
-                fail_job(db, job_id, reason=result.job.detail or "CVAT sync failed", raw_update={"sync_result": payload})
+                fail_job(
+                    db,
+                    job_id,
+                    reason=result.job.detail or "CVAT sync failed",
+                    raw_update={"sync_result": payload},
+                )
         return payload
     except JobCanceled:
         return {"status": "canceled"}
@@ -63,7 +70,13 @@ def import_task_job_task(job_id: str) -> dict[str, Any]:
             artifact_store=S3ArtifactStore(settings),
             client=CvatClient(settings),
         )
-        return {"status": job.status, "job_id": job.id, "cvat_task_id": (job.raw or {}).get("cvat_task_id")}
+        raw = job.raw or {}
+        return {
+            "status": job.status,
+            "job_id": job.id,
+            "cvat_task_id": raw.get("cvat_task_id"),
+            "cvat_task_ids": raw.get("cvat_task_ids") or [],
+        }
     except JobCanceled:
         return {"status": "canceled", "job_id": job_id}
     except Exception as exc:
@@ -116,7 +129,11 @@ def build_dataset_release_task(job_id: str) -> dict[str, Any]:
                 reason=str((release.snapshot or {}).get("error") or "Dataset release failed"),
                 raw_update={"dataset_release_id": release.id},
             )
-        return {"status": release.status, "release_id": release.id, "artifact_uri": release.artifact_uri}
+        return {
+            "status": release.status,
+            "release_id": release.id,
+            "artifact_uri": release.artifact_uri,
+        }
     except JobCanceled:
         return {"status": "canceled"}
     except Exception as exc:
@@ -154,10 +171,16 @@ def training_run_task(job_id: str) -> dict[str, Any]:
                 update_job_progress(db, job_id, progress, detail=detail)
                 live_run = db.get(TrainingRun, run_id)
                 if live_run is not None:
-                    existing_metrics = live_run.metrics if isinstance(live_run.metrics, dict) else {}
+                    existing_metrics = (
+                        live_run.metrics if isinstance(live_run.metrics, dict) else {}
+                    )
                     incoming_metrics = sanitize_json_dict(metrics)
                     incoming_artifacts = incoming_metrics.pop("artifacts", None)
-                    logs = existing_metrics.get("logs") if isinstance(existing_metrics.get("logs"), list) else []
+                    logs = (
+                        existing_metrics.get("logs")
+                        if isinstance(existing_metrics.get("logs"), list)
+                        else []
+                    )
                     if detail:
                         incoming_metrics["logs"] = [
                             *logs,
@@ -202,7 +225,11 @@ def training_run_task(job_id: str) -> dict[str, Any]:
                 "artifacts": completed.artifacts,
             },
         )
-        return {"status": completed.status, "training_run_id": completed.id, "mlflow_run_id": completed.mlflow_run_id}
+        return {
+            "status": completed.status,
+            "training_run_id": completed.id,
+            "mlflow_run_id": completed.mlflow_run_id,
+        }
     except JobCanceled:
         db.rollback()
         _mark_training_canceled(db, job_id)
@@ -247,7 +274,9 @@ def _start_training_heartbeat(
                 run = heartbeat_db.get(TrainingRun, run_id)
                 if run is not None and run.status == "running":
                     existing_metrics = run.metrics if isinstance(run.metrics, dict) else {}
-                    run.metrics = sanitize_json_dict({**existing_metrics, "heartbeat_at": heartbeat_at})
+                    run.metrics = sanitize_json_dict(
+                        {**existing_metrics, "heartbeat_at": heartbeat_at}
+                    )
                     run.updated_at = utcnow()
                     heartbeat_db.add(run)
                     heartbeat_db.commit()
@@ -329,12 +358,23 @@ def _mark_training_failed(db, job_id: str, reason: str) -> None:
         if run is not None:
             run.status = "failed"
             existing_metrics = run.metrics if isinstance(run.metrics, dict) else {}
-            logs = existing_metrics.get("logs") if isinstance(existing_metrics.get("logs"), list) else []
-            run.metrics = sanitize_json_dict({
-                **existing_metrics,
-                "error": reason,
-                "logs": [*logs, _training_log_entry(run.progress, f"Training failed: {reason}", {"level": "ERROR"})][-500:],
-            })
+            logs = (
+                existing_metrics.get("logs")
+                if isinstance(existing_metrics.get("logs"), list)
+                else []
+            )
+            run.metrics = sanitize_json_dict(
+                {
+                    **existing_metrics,
+                    "error": reason,
+                    "logs": [
+                        *logs,
+                        _training_log_entry(
+                            run.progress, f"Training failed: {reason}", {"level": "ERROR"}
+                        ),
+                    ][-500:],
+                }
+            )
             db.add(run)
             db.commit()
 
@@ -374,7 +414,9 @@ def _mark_pipeline_failed(db, job_id: str, reason: str) -> None:
                 release = db.get(DatasetRelease, str(release_id))
                 if release is not None and release.status not in {"ready", "failed", "canceled"}:
                     release.status = "failed"
-                    release.snapshot = sanitize_json_dict({**(release.snapshot or {}), "error": reason})
+                    release.snapshot = sanitize_json_dict(
+                        {**(release.snapshot or {}), "error": reason}
+                    )
                     db.add(release)
             db.commit()
 
@@ -387,7 +429,11 @@ def _training_log_entry(
     payload = metrics or {}
     epoch = _number_from_metrics(payload, "epoch")
     epochs = _number_from_metrics(payload, "epochs")
-    parts = [_training_log_metric(payload, "mAP50-95", "map5095", "metrics/mAP50-95(B)", "box_map", "fitness")]
+    parts = [
+        _training_log_metric(
+            payload, "mAP50-95", "map5095", "metrics/mAP50-95(B)", "box_map", "fitness"
+        )
+    ]
     parts.append(_training_log_metric(payload, "mAP50", "map50", "metrics/mAP50(B)", "box_map50"))
     parts.append(_training_log_metric(payload, "precision", "precision", "metrics/precision(B)"))
     parts.append(_training_log_metric(payload, "recall", "recall", "metrics/recall(B)"))
@@ -419,11 +465,17 @@ def _number_from_metrics(payload: dict[str, Any], *keys: str) -> float | None:
         value = payload.get(key)
         if isinstance(value, (int, float)):
             parsed = float(value)
-            return parsed if parsed == parsed and parsed not in {float("inf"), float("-inf")} else None
+            return (
+                parsed if parsed == parsed and parsed not in {float("inf"), float("-inf")} else None
+            )
         if isinstance(value, str):
             try:
                 parsed = float(value)
-                return parsed if parsed == parsed and parsed not in {float("inf"), float("-inf")} else None
+                return (
+                    parsed
+                    if parsed == parsed and parsed not in {float("inf"), float("-inf")}
+                    else None
+                )
             except ValueError:
                 continue
     return None
@@ -431,7 +483,7 @@ def _number_from_metrics(payload: dict[str, Any], *keys: str) -> float | None:
 
 def _merge_training_artifacts(existing: Any, incoming: list[Any]) -> list[dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
-    for source in (existing if isinstance(existing, list) else []):
+    for source in existing if isinstance(existing, list) else []:
         if isinstance(source, dict):
             key = str(source.get("path") or source.get("uri") or source.get("name") or len(rows))
             rows[key] = source

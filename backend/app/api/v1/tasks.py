@@ -5,7 +5,17 @@ from sqlalchemy.orm import Session
 from app.api.deps import current_admin, current_user, db_session, require_project_access
 from app.api.project_scope import require_task_access
 from app.core.config import get_settings
-from app.models import AnnotationRecord, AuditEvent, CvatLabel, JobRecord, Project, ProjectMember, Task, TaskDataMeta, User
+from app.models import (
+    AnnotationRecord,
+    AuditEvent,
+    CvatLabel,
+    JobRecord,
+    Project,
+    ProjectMember,
+    Task,
+    TaskDataMeta,
+    User,
+)
 from app.schemas import (
     TaskAssigneeUpdate,
     TaskDataMetaRead,
@@ -15,7 +25,11 @@ from app.schemas import (
 )
 from app.services.cvat_client import CvatClient, CvatClientError
 from app.services.frame_previews import retrieve_annotation_frame_preview
-from app.services.tasks import ActiveTaskJobsError, build_task_delete_impact, delete_task_with_dependencies
+from app.services.tasks import (
+    ActiveTaskJobsError,
+    build_task_delete_impact,
+    delete_task_with_dependencies,
+)
 
 router = APIRouter()
 
@@ -34,8 +48,10 @@ def list_tasks(
         query = query.where(Task.project_external_id == "__none__")
     elif user.role != "admin":
         project_external_ids = _accessible_project_external_ids(db, user)
-        query = query.where(Task.project_external_id.in_(project_external_ids)) if project_external_ids else query.where(
-            Task.project_external_id == "__none__"
+        query = (
+            query.where(Task.project_external_id.in_(project_external_ids))
+            if project_external_ids
+            else query.where(Task.project_external_id == "__none__")
         )
     tasks = list(db.scalars(query.order_by(Task.updated_at.desc())).all())
     _backfill_import_assignees(db, tasks)
@@ -257,7 +273,9 @@ def _attach_annotation_progress(db: Session, tasks: list[Task]) -> None:
     annotated_frame_counts = {
         str(task_external_id): int(count or 0)
         for task_external_id, count in db.execute(
-            select(AnnotationRecord.task_external_id, func.count(func.distinct(AnnotationRecord.frame)))
+            select(
+                AnnotationRecord.task_external_id, func.count(func.distinct(AnnotationRecord.frame))
+            )
             .where(
                 AnnotationRecord.task_external_id.in_(external_ids),
                 AnnotationRecord.frame.is_not(None),
@@ -297,9 +315,9 @@ def _backfill_import_assignees(db: Session, tasks: list[Task]) -> None:
     ).all()
     jobs_by_task: dict[str, JobRecord] = {}
     for job in import_jobs:
-        cvat_task_id = str((job.raw or {}).get("cvat_task_id") or "")
-        if cvat_task_id in external_ids and cvat_task_id not in jobs_by_task:
-            jobs_by_task[cvat_task_id] = job
+        for cvat_task_id in _job_cvat_task_ids(job):
+            if cvat_task_id in external_ids and cvat_task_id not in jobs_by_task:
+                jobs_by_task[cvat_task_id] = job
 
     changed = False
     for task in candidates:
@@ -357,6 +375,24 @@ def _merge_task_labels(current_labels: list, task_labels: list[CvatLabel]) -> li
     return next_labels
 
 
+def _job_cvat_task_ids(job: JobRecord) -> list[str]:
+    raw = job.raw if isinstance(job.raw, dict) else {}
+    task_ids: list[str] = []
+    raw_task_ids = raw.get("cvat_task_ids")
+    if isinstance(raw_task_ids, list):
+        task_ids.extend(str(task_id) for task_id in raw_task_ids if task_id)
+    raw_task_id = raw.get("cvat_task_id")
+    if raw_task_id:
+        task_ids.append(str(raw_task_id))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for task_id in task_ids:
+        if task_id not in seen:
+            seen.add(task_id)
+            deduped.append(task_id)
+    return deduped
+
+
 def _local_assignee(task: Task) -> dict | None:
     assignee = (task.raw or {}).get("local_assignee")
     return assignee if isinstance(assignee, dict) else None
@@ -383,7 +419,9 @@ def _import_job_actor(db: Session, job: JobRecord) -> User | None:
     if not actor_email:
         return None
     return db.scalar(
-        select(User).where(User.email == str(actor_email), User.status == "active", User.role == "anotador")
+        select(User).where(
+            User.email == str(actor_email), User.status == "active", User.role == "anotador"
+        )
     )
 
 
@@ -403,7 +441,9 @@ def _ensure_project_membership(db: Session, task: Task, assignee: User) -> None:
     if project is None:
         return
     membership = db.scalar(
-        select(ProjectMember).where(ProjectMember.project_id == project.id, ProjectMember.user_id == assignee.id)
+        select(ProjectMember).where(
+            ProjectMember.project_id == project.id, ProjectMember.user_id == assignee.id
+        )
     )
     if membership is not None:
         return
@@ -412,6 +452,10 @@ def _ensure_project_membership(db: Session, task: Task, assignee: User) -> None:
             project_id=project.id,
             user_id=assignee.id,
             role="anotador",
-            raw={"source": "task_assignment", "task_id": task.id, "task_external_id": task.external_id},
+            raw={
+                "source": "task_assignment",
+                "task_id": task.id,
+                "task_external_id": task.external_id,
+            },
         )
     )

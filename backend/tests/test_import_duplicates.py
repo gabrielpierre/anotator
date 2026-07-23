@@ -7,6 +7,8 @@ from app.models import JobRecord, Project, Task, TaskDataMeta
 from app.schemas import ImportTaskCreate
 from app.services.imports import (
     DuplicateImportImagesError,
+    _batch_task_name,
+    _media_file_batches,
     build_import_file_manifest,
     validate_import_file_manifest_unique,
 )
@@ -20,6 +22,25 @@ def _session_factory():
 
 def _manifest(filename: str, content: bytes = b"image") -> list[dict]:
     return build_import_file_manifest([(filename, content, "image/jpeg")])
+
+
+def test_import_batches_split_large_dataset_by_safe_upload_size() -> None:
+    files = [
+        ("b.jpg", b"b" * 5, "image/jpeg"),
+        ("a.jpg", b"a" * 5, "image/jpeg"),
+        ("c.jpg", b"c" * 4, "image/jpeg"),
+    ]
+
+    batches = _media_file_batches(files, max_upload_bytes=10)
+
+    assert [[filename for filename, _content, _type in batch] for batch in batches] == [
+        ["a.jpg", "b.jpg"],
+        ["c.jpg"],
+    ]
+
+
+def test_import_batch_task_name_keeps_single_task_name() -> None:
+    assert _batch_task_name("Lote 23/07/2026", 1, 1) == "Lote 23/07/2026"
 
 
 def test_import_rejects_same_image_content_in_existing_project_task() -> None:
@@ -49,7 +70,9 @@ def test_import_rejects_same_filename_from_legacy_task_metadata() -> None:
         project = Project(external_id="5", name="Projeto")
         db.add(project)
         db.add(Task(external_id="21", project_external_id="5", name="Lote antigo"))
-        db.add(TaskDataMeta(task_external_id="21", frame_count=1, frames=[{"name": "camera_01.png"}]))
+        db.add(
+            TaskDataMeta(task_external_id="21", frame_count=1, frames=[{"name": "camera_01.png"}])
+        )
         db.commit()
 
         payload = ImportTaskCreate(project_id=project.id, name="Novo lote")
@@ -111,9 +134,9 @@ def test_import_rejects_duplicate_against_active_import_job() -> None:
                 progress=5,
                 name="Import CVAT task Lote em andamento",
                 raw={
-                    "payload": ImportTaskCreate(project_id=project.id, name="Lote em andamento").model_dump(
-                        mode="json"
-                    ),
+                    "payload": ImportTaskCreate(
+                        project_id=project.id, name="Lote em andamento"
+                    ).model_dump(mode="json"),
                     "upload_artifacts": _manifest("torre.jpg", b"same"),
                 },
             )

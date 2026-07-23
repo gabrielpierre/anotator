@@ -216,6 +216,7 @@ export function AnnotateView() {
   const selectedIdRef = useRef(selectedId)
   selectedIdRef.current = selectedId
   const [view, setView] = useState({ s: 1, tx: 0, ty: 0 })
+  const [isPanning, setIsPanning] = useState(false)
   const [draft, setDraft] = useState<{ x: number; y: number; w: number; h: number } | null>(null)
   const [polyDraft, setPolyDraft] = useState<{ x: number; y: number }[] | null>(null)
   const polyDraftRef = useRef(polyDraft)
@@ -701,14 +702,15 @@ export function AnnotateView() {
       const mx = e.clientX - cx
       const my = e.clientY - cy
       const { s, tx, ty } = viewRef.current
-      const factor = Math.exp(-e.deltaY * 0.0015)
+      const deltaY = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? rect.height : 1)
+      const factor = Math.exp(-deltaY * 0.0015)
       const ns = clamp(s * factor, MIN_SCALE, MAX_SCALE)
       const k = ns / s
       setView({ s: ns, tx: mx - k * (mx - tx), ty: my - k * (my - ty) })
     }
     el.addEventListener("wheel", onWheel, { passive: false })
     return () => el.removeEventListener("wheel", onWheel)
-  }, [])
+  }, [currentTask?.id])
 
   const zoomBy = useCallback((factor: number) => {
     setView((v) => ({ ...v, s: clamp(v.s * factor, MIN_SCALE, MAX_SCALE) }))
@@ -750,15 +752,35 @@ export function AnnotateView() {
     }
   }, [stageAspectRatio])
 
-  const dragWindow = (onMove: (e: PointerEvent) => void, onUp?: (e: PointerEvent) => void) => {
+  const dragWindow = (
+    onMove: (e: PointerEvent) => void,
+    onUp?: (e: PointerEvent) => void,
+    pointerCapture?: { target: Element; pointerId: number },
+  ) => {
+    const doc = containerRef.current?.ownerDocument ?? document
     const move = (e: PointerEvent) => onMove(e)
-    const up = (e: PointerEvent) => {
-      window.removeEventListener("pointermove", move)
-      window.removeEventListener("pointerup", up)
-      onUp?.(e)
+    const releasePointer = () => {
+      if (!pointerCapture) return
+      try {
+        if (pointerCapture.target.hasPointerCapture?.(pointerCapture.pointerId)) {
+          pointerCapture.target.releasePointerCapture(pointerCapture.pointerId)
+        }
+      } catch {
+        // The browser may already have released the pointer.
+      }
     }
-    window.addEventListener("pointermove", move)
-    window.addEventListener("pointerup", up)
+    const up = (e: PointerEvent | Event) => {
+      doc.removeEventListener("pointermove", move)
+      doc.removeEventListener("pointerup", up)
+      doc.removeEventListener("pointercancel", up)
+      window.removeEventListener("blur", up)
+      releasePointer()
+      onUp?.(e as PointerEvent)
+    }
+    doc.addEventListener("pointermove", move)
+    doc.addEventListener("pointerup", up)
+    doc.addEventListener("pointercancel", up)
+    window.addEventListener("blur", up)
   }
 
   // Resolve a classe a usar ao desenhar:
@@ -1055,12 +1077,45 @@ export function AnnotateView() {
 
   // Pan por arrasto — usado pela ferramenta mão e pelo botão do meio do mouse.
   const startPan = useCallback(
-    (e: { clientX: number; clientY: number }) => {
+    (
+      e: {
+        clientX: number
+        clientY: number
+        pointerId?: number
+        currentTarget?: EventTarget | null
+        preventDefault?: () => void
+        stopPropagation?: () => void
+      },
+      options: { temporary?: boolean } = {},
+    ) => {
+      e.preventDefault?.()
+      e.stopPropagation?.()
+      const useTemporaryPan = Boolean(options.temporary && toolRef.current !== "pan")
+      if (useTemporaryPan) setTempTool("pan")
+      setIsPanning(true)
+      const pointerCapture =
+        typeof e.pointerId === "number" && e.currentTarget instanceof Element
+          ? { target: e.currentTarget, pointerId: e.pointerId }
+          : undefined
+      if (pointerCapture) {
+        try {
+          pointerCapture.target.setPointerCapture(pointerCapture.pointerId)
+        } catch {
+          // Some elements cannot capture the pointer; document listeners still handle the drag.
+        }
+      }
       const start = { x: e.clientX, y: e.clientY }
       const base = { ...viewRef.current }
-      dragWindow((ev) => {
-        setView({ s: base.s, tx: base.tx + (ev.clientX - start.x), ty: base.ty + (ev.clientY - start.y) })
-      })
+      dragWindow(
+        (ev) => {
+          setView({ s: base.s, tx: base.tx + (ev.clientX - start.x), ty: base.ty + (ev.clientY - start.y) })
+        },
+        () => {
+          setIsPanning(false)
+          if (useTemporaryPan) setTempTool(null)
+        },
+        pointerCapture,
+      )
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -1070,8 +1125,7 @@ export function AnnotateView() {
   const onStagePointerDown = (e: React.PointerEvent) => {
     // Botão do meio (scroll pressionado): sempre move a imagem, em qualquer ferramenta.
     if (e.button === 1) {
-      e.preventDefault()
-      startPan(e)
+      startPan(e, { temporary: true })
       return
     }
     if (e.button !== 0) return
@@ -1085,11 +1139,8 @@ export function AnnotateView() {
 
     if (t === "select") {
       setSelectedId(null)
-      if (returnToolAfterSelect) {
-        setTool(returnToolAfterSelect)
-        setTempTool(null)
-        setReturnToolAfterSelect(null)
-      }
+      setReturnToolAfterSelect(null)
+      startPan(e, { temporary: true })
       return
     }
 
@@ -1172,9 +1223,7 @@ export function AnnotateView() {
   const startMove = (e: React.PointerEvent, shape: Shape) => {
     // Botão do meio: pan da imagem mesmo sobre um objeto.
     if (e.button === 1) {
-      e.preventDefault()
-      e.stopPropagation()
-      startPan(e)
+      startPan(e, { temporary: true })
       return
     }
     if (e.button !== 0) return
@@ -1244,6 +1293,11 @@ export function AnnotateView() {
 
   // Resize a box from any of the 8 handles (delta-based, matches the review workspace).
   const startResize = (e: React.PointerEvent, box: Extract<Shape, { type: "box" }>, mode: Handle) => {
+    if (e.button === 1) {
+      startPan(e, { temporary: true })
+      return
+    }
+    if (e.button !== 0) return
     e.stopPropagation()
     setSelectedId(box.id)
     const start = { x: box.x, y: box.y, w: box.w, h: box.h }
@@ -1455,8 +1509,15 @@ export function AnnotateView() {
     return () => window.clearTimeout(timeout)
   }, [classPicker, currentFrameKey, persistCurrentFrame, shapes])
 
+  const activeCanvasTool = tempTool ?? tool
   const cursor =
-    tool === "pan" ? "grab" : tool === "box" || tool === "polygon" || tool === "point" ? "crosshair" : "default"
+    isPanning
+      ? "grabbing"
+      : activeCanvasTool === "pan"
+      ? "grab"
+      : activeCanvasTool === "box" || activeCanvasTool === "polygon" || activeCanvasTool === "point"
+        ? "crosshair"
+        : "default"
 
   const pct = (v: number) => `${v * 100}%`
 
@@ -1611,6 +1672,43 @@ export function AnnotateView() {
         <div
           ref={containerRef}
           className="relative flex flex-1 items-center justify-center overflow-hidden bg-[#0b0d10] p-6 touch-none select-none"
+          onPointerDownCapture={(e) => {
+            if (e.button !== 0) return
+            if (toolRef.current !== "select") return
+            const target = e.target as HTMLElement | null
+            if (
+              target?.closest(
+                "[data-annotation-hit],button,input,textarea,select,[role='dialog'],[data-canvas-scroll-area]",
+              )
+            ) {
+              return
+            }
+            setSelectedId(null)
+            setReturnToolAfterSelect(null)
+            startPan(e, { temporary: true })
+          }}
+          onPointerDown={(e) => {
+            if (e.target !== e.currentTarget) return
+            if (e.button === 1) {
+              startPan(e, { temporary: true })
+              return
+            }
+            if (e.button !== 0) return
+            const currentTool = toolRef.current
+            if (currentTool === "select") {
+              setSelectedId(null)
+              setReturnToolAfterSelect(null)
+              startPan(e, { temporary: true })
+            } else if (currentTool === "pan") {
+              startPan(e)
+            }
+          }}
+          onAuxClick={(e) => {
+            if (e.button === 1) e.preventDefault()
+          }}
+          onMouseDownCapture={(e) => {
+            if (e.button === 1) e.preventDefault()
+          }}
         >
           {showSuggestionHint && (
             <button
@@ -1666,6 +1764,7 @@ export function AnnotateView() {
                 return (
                   <div
                     key={s.id}
+                    data-annotation-hit
                     onPointerDown={(e) => startMove(e, s)}
                     onDoubleClick={(e) => {
                       e.stopPropagation()
@@ -1697,6 +1796,7 @@ export function AnnotateView() {
                       handles.map((h) => (
                         <span
                           key={h.id}
+                          data-annotation-hit
                           onPointerDown={(e) => startResize(e, s, h.id)}
                           className={cn("absolute rounded-sm border border-white bg-brand-blue", h.cls)}
                           style={{
@@ -1714,6 +1814,7 @@ export function AnnotateView() {
                   <button
                     key={s.id}
                     type="button"
+                    data-annotation-hit
                     onPointerDown={(e) => startMove(e, s)}
                     className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white"
                     style={{
@@ -1738,6 +1839,7 @@ export function AnnotateView() {
                   className="pointer-events-none absolute inset-0 size-full"
                 >
                   <polygon
+                    data-annotation-hit
                     points={pointsAttr}
                     fill={color}
                     fillOpacity={selected ? 0.28 : 0.16}
@@ -1766,11 +1868,16 @@ export function AnnotateView() {
               return (
                 <div
                   key={`sug-${s.backendId}`}
+                  data-annotation-hit
                   role="button"
                   tabIndex={0}
                   title="Clique para aceitar. Botão direito rejeita."
                   className="pointer-events-auto absolute cursor-pointer rounded-[3px] border-2 border-dashed transition-[box-shadow,background-color] hover:shadow-[0_0_0_3px_rgba(79,140,255,0.28)]"
                   onPointerDown={(event) => {
+                    if (event.button === 1) {
+                      startPan(event, { temporary: true })
+                      return
+                    }
                     if (event.button !== 0) {
                       event.stopPropagation()
                       return

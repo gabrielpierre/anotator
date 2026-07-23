@@ -294,6 +294,7 @@ export function ReviewWorkspace() {
   const [autoAdvance, setAutoAdvance] = React.useState(true)
   const [scale, setScale] = React.useState(1)
   const [pan, setPan] = React.useState({ x: 0, y: 0 })
+  const [isPanning, setIsPanning] = React.useState(false)
   const [tab, setTab] = React.useState<"anotacoes" | "tracks" | "tags" | "comentarios">("anotacoes")
   const [checkedClasses, setCheckedClasses] = React.useState<Set<string>>(() => new Set())
   const [boxState, setBoxState] = React.useState<Record<number, Box>>(initialBoxes)
@@ -541,21 +542,57 @@ export function ReviewWorkspace() {
     [selectedId, visibleAnnotations],
   )
 
-  const startPan = React.useCallback((e: { clientX: number; clientY: number; preventDefault?: () => void; stopPropagation?: () => void }) => {
+  const startPan = React.useCallback((e: {
+    clientX: number
+    clientY: number
+    pointerId?: number
+    currentTarget?: EventTarget | null
+    preventDefault?: () => void
+    stopPropagation?: () => void
+  }) => {
     e.preventDefault?.()
     e.stopPropagation?.()
+    setIsPanning(true)
+    const doc = canvasRef.current?.ownerDocument ?? document
+    const pointerCapture =
+      typeof e.pointerId === "number" && e.currentTarget instanceof Element
+        ? { target: e.currentTarget, pointerId: e.pointerId }
+        : undefined
+    if (pointerCapture) {
+      try {
+        pointerCapture.target.setPointerCapture(pointerCapture.pointerId)
+      } catch {
+        // Document listeners still handle the drag if capture is unavailable.
+      }
+    }
     const startX = e.clientX
     const startY = e.clientY
     const base = panRef.current
     const onMove = (ev: PointerEvent) => {
       setPan({ x: base.x + ev.clientX - startX, y: base.y + ev.clientY - startY })
     }
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove)
-      window.removeEventListener("pointerup", onUp)
+    const releasePointer = () => {
+      if (!pointerCapture) return
+      try {
+        if (pointerCapture.target.hasPointerCapture?.(pointerCapture.pointerId)) {
+          pointerCapture.target.releasePointerCapture(pointerCapture.pointerId)
+        }
+      } catch {
+        // The browser may already have released the pointer.
+      }
     }
-    window.addEventListener("pointermove", onMove)
-    window.addEventListener("pointerup", onUp)
+    const onUp = () => {
+      doc.removeEventListener("pointermove", onMove)
+      doc.removeEventListener("pointerup", onUp)
+      doc.removeEventListener("pointercancel", onUp)
+      window.removeEventListener("blur", onUp)
+      releasePointer()
+      setIsPanning(false)
+    }
+    doc.addEventListener("pointermove", onMove)
+    doc.addEventListener("pointerup", onUp)
+    doc.addEventListener("pointercancel", onUp)
+    window.addEventListener("blur", onUp)
   }, [])
 
   const beginDrag = React.useCallback(
@@ -737,10 +774,30 @@ export function ReviewWorkspace() {
     return () => window.removeEventListener("keydown", onKey)
   }, [correcting, decide, deleteSelectedAnnotation, selectedId, startCorrection, undo])
 
-  const onWheelZoom = React.useCallback((e: React.WheelEvent) => {
-    e.preventDefault()
-    setScale((s) => Math.min(4, Math.max(0.5, s - e.deltaY * 0.0015)))
-  }, [])
+  React.useEffect(() => {
+    const el = canvasRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const rect = el.getBoundingClientRect()
+      const cx = rect.left + rect.width / 2
+      const cy = rect.top + rect.height / 2
+      const mx = e.clientX - cx
+      const my = e.clientY - cy
+      const currentScale = scaleRef.current
+      const deltaY = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? rect.height : 1)
+      const nextScale = Math.min(4, Math.max(0.5, currentScale * Math.exp(-deltaY * 0.0015)))
+      const ratio = nextScale / currentScale
+      const currentPan = panRef.current
+      setScale(nextScale)
+      setPan({
+        x: mx - ratio * (mx - currentPan.x),
+        y: my - ratio * (my - currentPan.y),
+      })
+    }
+    el.addEventListener("wheel", onWheel, { passive: false })
+    return () => el.removeEventListener("wheel", onWheel)
+  }, [hasVisibleAnnotations])
 
   // keep selection on a visible annotation when classes are toggled off
   React.useEffect(() => {
@@ -1099,9 +1156,23 @@ export function ReviewWorkspace() {
           <div
             ref={canvasRef}
             className="relative min-h-0 flex-1 overflow-hidden bg-black"
-            onWheel={onWheelZoom}
+            style={{ cursor: isPanning ? "grabbing" : "grab" }}
+            onPointerDownCapture={(e) => {
+              if (e.button !== 0 && e.button !== 1) return
+              const target = e.target as HTMLElement | null
+              if (target?.closest("[data-review-hit],button,input,textarea,select,[role='dialog']")) return
+              startPan(e)
+            }}
+            onAuxClick={(e) => {
+              if (e.button === 1) e.preventDefault()
+            }}
+            onMouseDownCapture={(e) => {
+              if (e.button === 1) e.preventDefault()
+            }}
             onPointerDown={(e) => {
-              if (e.button === 1) startPan(e)
+              const target = e.target as HTMLElement | null
+              if (target?.closest("button,input,textarea,select,[role='dialog']")) return
+              if (e.button === 1 || e.button === 0) startPan(e)
             }}
           >
             <div
@@ -1124,11 +1195,15 @@ export function ReviewWorkspace() {
                   return (
                     <div
                       key={a.id}
+                      data-review-hit
                       onPointerDown={(e) => {
                         if (e.button === 1) {
                           startPan(e)
                           return
                         }
+                        if (e.button !== 0) return
+                        e.preventDefault()
+                        e.stopPropagation()
                         if (correcting && active) {
                           beginDrag(e, a.id, "move")
                           return
@@ -1168,6 +1243,7 @@ export function ReviewWorkspace() {
                         handles.map((h) => (
                           <span
                             key={h.id}
+                            data-review-hit
                             onPointerDown={(e) => {
                               if (e.button === 1) {
                                 startPan(e)

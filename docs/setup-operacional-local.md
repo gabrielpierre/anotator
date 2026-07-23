@@ -69,8 +69,7 @@ Use `./stop.sh --volumes` somente quando quiser apagar banco, MinIO, MLflow e da
 ## Subida via PowerShell
 
 ```powershell
-$env:CVAT_ACCESS_TOKEN = "<token>"
-.\scripts\dev\up.ps1
+.\start.ps1
 ```
 
 O Compose executa `alembic upgrade head` antes de iniciar backend e workers. Para rodar manualmente:
@@ -83,8 +82,19 @@ alembic upgrade head
 Se o banco local antigo precisar ser recriado para a baseline limpa, use:
 
 ```powershell
-.\scripts\dev\up.ps1 -ResetDb
+.\start.ps1 -ResetDb
 ```
+
+Para finalizar tudo no Windows sem apagar dados locais:
+
+```powershell
+.\stop.ps1
+```
+
+Os atalhos da raiz devem permanecer em paridade:
+
+- Linux/WSL: `./start.sh` e `./stop.sh`.
+- Windows PowerShell: `.\start.ps1` e `.\stop.ps1`.
 
 URLs:
 
@@ -150,7 +160,7 @@ Para proteger a API local, defina a mesma chave para backend e frontend:
 ```powershell
 $env:INTERNAL_API_KEY = "dev-local-secret"
 $env:NEXT_PUBLIC_INTERNAL_API_KEY = "dev-local-secret"
-.\scripts\dev\up.ps1
+.\start.ps1
 ```
 
 `INTERNAL_API_KEY` continua disponivel para automacao/dev, mas nao substitui RBAC de usuario. O backend aceita:

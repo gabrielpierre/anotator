@@ -60,6 +60,8 @@ const batchStatusTone: Record<string, string> = {
   QA: "text-warning",
 }
 
+const IMPORT_REFRESH_TIMEOUT_MS = 60 * 60 * 1000
+
 export function DataView() {
   const router = useRouter()
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
@@ -110,21 +112,26 @@ export function DataView() {
     (job?: BackendImportJob) => {
       clearImportRefreshTimers()
       const jobId = job?.job.id
+      const startedAt = Date.now()
       let attempts = 0
       const tick = () => {
         attempts += 1
         loadData()
-        if (!jobId || attempts >= 18) return
+        if (!jobId) return
         fetchImportJob(jobId)
           .then((latest) => {
             if (["succeeded", "failed", "canceled"].includes(latest.job.status)) {
               loadData()
               return
             }
-            importRefreshTimers.current.push(setTimeout(tick, attempts < 8 ? 1000 : 2500))
+            if (Date.now() - startedAt >= IMPORT_REFRESH_TIMEOUT_MS) return
+            const delay = attempts < 10 ? 1000 : attempts < 60 ? 2500 : 5000
+            importRefreshTimers.current.push(setTimeout(tick, delay))
           })
           .catch(() => {
-            if (attempts < 18) importRefreshTimers.current.push(setTimeout(tick, 2500))
+            if (Date.now() - startedAt < IMPORT_REFRESH_TIMEOUT_MS) {
+              importRefreshTimers.current.push(setTimeout(tick, 5000))
+            }
           })
       }
       importRefreshTimers.current.push(setTimeout(tick, 500))
@@ -136,6 +143,19 @@ export function DataView() {
     const controller = new AbortController()
     loadData(controller.signal)
     return () => controller.abort()
+  }, [loadData])
+
+  React.useEffect(() => {
+    const refresh = () => loadData()
+    const refreshWhenVisible = () => {
+      if (!document.hidden) loadData()
+    }
+    window.addEventListener("focus", refresh)
+    document.addEventListener("visibilitychange", refreshWhenVisible)
+    return () => {
+      window.removeEventListener("focus", refresh)
+      document.removeEventListener("visibilitychange", refreshWhenVisible)
+    }
   }, [loadData])
 
   React.useEffect(() => clearImportRefreshTimers, [clearImportRefreshTimers])
