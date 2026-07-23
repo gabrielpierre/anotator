@@ -1,3 +1,4 @@
+import threading
 from typing import Any
 
 from app.core.celery_app import celery_app
@@ -9,10 +10,12 @@ from app.services.artifacts import S3ArtifactStore
 from app.services.cvat_client import CvatClient
 from app.services.imports import run_import_task_job
 from app.services.inference import run_inference
+from app.services.json_safety import sanitize_json_dict, sanitize_json_payload
 from app.services.jobs import (
     JobCanceled,
     ensure_not_canceled,
     fail_job,
+    heartbeat_job,
     mark_job_running,
     require_job,
     succeed_job,
@@ -125,50 +128,67 @@ def build_dataset_release_task(job_id: str) -> dict[str, Any]:
 
 @celery_app.task(name="app.tasks.training_run")
 def training_run_task(job_id: str) -> dict[str, Any]:
+    heartbeat_stop: threading.Event | None = None
+    heartbeat_thread: threading.Thread | None = None
     db = SessionLocal()
     try:
+        settings = get_settings()
         job = mark_job_running(db, job_id, "Preparing training run.")
         run_id = str((job.raw or {}).get("training_run_id"))
         run = db.get(TrainingRun, run_id)
         if run is None:
             raise LookupError(f"TrainingRun {run_id} not found")
+        heartbeat_stop, heartbeat_thread = _start_training_heartbeat(
+            job_id,
+            run_id,
+            interval_seconds=settings.training_heartbeat_seconds,
+        )
 
         def report_progress(
             progress: float,
             detail: str | None = None,
             metrics: dict[str, Any] | None = None,
         ) -> None:
-            ensure_not_canceled(db, job_id)
-            update_job_progress(db, job_id, progress, detail=detail)
-            live_run = db.get(TrainingRun, run_id)
-            if live_run is not None:
-                existing_metrics = live_run.metrics if isinstance(live_run.metrics, dict) else {}
-                incoming_metrics = dict(metrics or {})
-                incoming_artifacts = incoming_metrics.pop("artifacts", None)
-                logs = existing_metrics.get("logs") if isinstance(existing_metrics.get("logs"), list) else []
-                if detail:
-                    incoming_metrics["logs"] = [
-                        *logs,
-                        _training_log_entry(progress, detail, incoming_metrics),
-                    ][-500:]
-                if isinstance(incoming_artifacts, list):
-                    live_run.artifacts = _merge_training_artifacts(live_run.artifacts, incoming_artifacts)
-                if progress >= 100:
-                    live_run.progress = 100
-                else:
-                    live_run.status = "running"
-                    live_run.progress = min(99, max(0, progress))
-                mlflow_run_id = incoming_metrics.get("mlflow_run_id")
-                if isinstance(mlflow_run_id, str) and mlflow_run_id:
-                    live_run.mlflow_run_id = mlflow_run_id
-                live_run.metrics = {**existing_metrics, **incoming_metrics}
-                db.add(live_run)
-                db.commit()
+            try:
+                ensure_not_canceled(db, job_id)
+                update_job_progress(db, job_id, progress, detail=detail)
+                live_run = db.get(TrainingRun, run_id)
+                if live_run is not None:
+                    existing_metrics = live_run.metrics if isinstance(live_run.metrics, dict) else {}
+                    incoming_metrics = sanitize_json_dict(metrics)
+                    incoming_artifacts = incoming_metrics.pop("artifacts", None)
+                    logs = existing_metrics.get("logs") if isinstance(existing_metrics.get("logs"), list) else []
+                    if detail:
+                        incoming_metrics["logs"] = [
+                            *logs,
+                            _training_log_entry(progress, detail, incoming_metrics),
+                        ][-500:]
+                    if isinstance(incoming_artifacts, list):
+                        live_run.artifacts = sanitize_json_payload(
+                            _merge_training_artifacts(live_run.artifacts, incoming_artifacts)
+                        )
+                    if progress >= 100:
+                        live_run.progress = 100
+                    else:
+                        live_run.status = "running"
+                        live_run.progress = min(99, max(0, progress))
+                    mlflow_run_id = incoming_metrics.get("mlflow_run_id")
+                    if isinstance(mlflow_run_id, str) and mlflow_run_id:
+                        live_run.mlflow_run_id = mlflow_run_id
+                    live_run.metrics = sanitize_json_dict({**existing_metrics, **incoming_metrics})
+                    db.add(live_run)
+                    db.commit()
+            except JobCanceled:
+                db.rollback()
+                raise
+            except Exception as exc:
+                db.rollback()
+                raise RuntimeError(f"Failed to persist training progress: {exc}") from exc
 
         completed = run_training(
             db,
             run_id=run.id,
-            settings=get_settings(),
+            settings=settings,
             progress_callback=report_progress,
         )
         succeed_job(
@@ -184,14 +204,61 @@ def training_run_task(job_id: str) -> dict[str, Any]:
         )
         return {"status": completed.status, "training_run_id": completed.id, "mlflow_run_id": completed.mlflow_run_id}
     except JobCanceled:
+        db.rollback()
         _mark_training_canceled(db, job_id)
         return {"status": "canceled"}
     except Exception as exc:
+        db.rollback()
         fail_job(db, job_id, reason=str(exc))
         _mark_training_failed(db, job_id, str(exc))
         raise
     finally:
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=2)
         db.close()
+
+
+def _start_training_heartbeat(
+    job_id: str,
+    run_id: str,
+    *,
+    interval_seconds: int,
+) -> tuple[threading.Event | None, threading.Thread | None]:
+    if interval_seconds <= 0:
+        return None, None
+
+    stop = threading.Event()
+
+    def _beat() -> None:
+        while not stop.wait(interval_seconds):
+            heartbeat_at = utcnow().isoformat()
+            heartbeat_db = SessionLocal()
+            try:
+                job = heartbeat_job(
+                    heartbeat_db,
+                    job_id,
+                    raw_update={"training_run_id": run_id},
+                    metrics={"training_worker_alive": True},
+                )
+                if job.status in {"failed", "canceled", "succeeded"}:
+                    return
+                run = heartbeat_db.get(TrainingRun, run_id)
+                if run is not None and run.status == "running":
+                    existing_metrics = run.metrics if isinstance(run.metrics, dict) else {}
+                    run.metrics = sanitize_json_dict({**existing_metrics, "heartbeat_at": heartbeat_at})
+                    run.updated_at = utcnow()
+                    heartbeat_db.add(run)
+                    heartbeat_db.commit()
+            except Exception:
+                heartbeat_db.rollback()
+            finally:
+                heartbeat_db.close()
+
+    thread = threading.Thread(target=_beat, name=f"training-heartbeat-{job_id[:8]}", daemon=True)
+    thread.start()
+    return stop, thread
 
 
 @celery_app.task(name="app.tasks.pipeline_run")
@@ -263,11 +330,11 @@ def _mark_training_failed(db, job_id: str, reason: str) -> None:
             run.status = "failed"
             existing_metrics = run.metrics if isinstance(run.metrics, dict) else {}
             logs = existing_metrics.get("logs") if isinstance(existing_metrics.get("logs"), list) else []
-            run.metrics = {
+            run.metrics = sanitize_json_dict({
                 **existing_metrics,
                 "error": reason,
                 "logs": [*logs, _training_log_entry(run.progress, f"Training failed: {reason}", {"level": "ERROR"})][-500:],
-            }
+            })
             db.add(run)
             db.commit()
 
@@ -286,7 +353,9 @@ def _mark_pipeline_canceled(db, job_id: str) -> None:
                 release = db.get(DatasetRelease, str(release_id))
                 if release is not None and release.status not in {"ready", "failed", "canceled"}:
                     release.status = "canceled"
-                    release.snapshot = {**(release.snapshot or {}), "error": "Pipeline job canceled"}
+                    release.snapshot = sanitize_json_dict(
+                        {**(release.snapshot or {}), "error": "Pipeline job canceled"}
+                    )
                     db.add(release)
             db.commit()
 
@@ -298,14 +367,14 @@ def _mark_pipeline_failed(db, job_id: str, reason: str) -> None:
         run = db.get(PipelineRun, str(run_id))
         if run is not None:
             run.status = "failed"
-            run.lineage = {**(run.lineage or {}), "error": reason}
+            run.lineage = sanitize_json_dict({**(run.lineage or {}), "error": reason})
             db.add(run)
             release_id = (run.lineage or {}).get("derived_release_id")
             if release_id:
                 release = db.get(DatasetRelease, str(release_id))
                 if release is not None and release.status not in {"ready", "failed", "canceled"}:
                     release.status = "failed"
-                    release.snapshot = {**(release.snapshot or {}), "error": reason}
+                    release.snapshot = sanitize_json_dict({**(release.snapshot or {}), "error": reason})
                     db.add(release)
             db.commit()
 
@@ -349,10 +418,12 @@ def _number_from_metrics(payload: dict[str, Any], *keys: str) -> float | None:
     for key in keys:
         value = payload.get(key)
         if isinstance(value, (int, float)):
-            return float(value)
+            parsed = float(value)
+            return parsed if parsed == parsed and parsed not in {float("inf"), float("-inf")} else None
         if isinstance(value, str):
             try:
-                return float(value)
+                parsed = float(value)
+                return parsed if parsed == parsed and parsed not in {float("inf"), float("-inf")} else None
             except ValueError:
                 continue
     return None

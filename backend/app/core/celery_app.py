@@ -18,4 +18,9 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    task_default_queue="celery",
+    task_routes={
+        "app.tasks.training_run": {"queue": "training"},
+    },
+    worker_prefetch_multiplier=1,
 )

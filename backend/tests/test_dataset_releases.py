@@ -3,7 +3,7 @@ from fastapi import HTTPException
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app.api.v1.training import create_training_run
+from app.api.v1.training import create_training_run, retry_training_run
 from app.core.config import Settings
 from app.core.database import Base
 from app.models import (
@@ -14,6 +14,7 @@ from app.models import (
     JobRecord,
     Task,
     TrainingRun,
+    User,
 )
 from app.schemas import DatasetReleaseCreate, TrainingRunCreate
 from app.services.artifacts import ArtifactStore
@@ -169,6 +170,13 @@ def test_training_requires_ready_immutable_release_with_artifact(monkeypatch: py
     session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
     with session_factory() as db:
+        admin = User(
+            name="Admin",
+            email="admin@example.com",
+            role="admin",
+            password_hash="hash",
+        )
+        db.add(admin)
         db.add(DatasetRelease(name="failed_release", status="failed", immutable=True))
         ready_release = DatasetRelease(
             name="ready_release",
@@ -186,14 +194,73 @@ def test_training_requires_ready_immutable_release_with_artifact(monkeypatch: py
             create_training_run(
                 TrainingRunCreate(dataset_release_id=failed_release.id, base_model="yolo11n.pt"),
                 db,
+                admin,
             )
         assert exc_info.value.status_code == 409
 
         run = create_training_run(
             TrainingRunCreate(dataset_release_id=ready_release.id, base_model="yolo11n.pt"),
             db,
+            admin,
         )
 
         assert run.status == "queued"
         assert db.scalar(select(TrainingRun).where(TrainingRun.id == run.id)) is not None
         assert db.scalar(select(JobRecord).where(JobRecord.kind == "training")) is not None
+
+
+def test_failed_training_run_can_be_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeAsyncResult:
+        id = "celery-training-retry"
+
+    monkeypatch.setattr(
+        "app.api.v1.training.training_run_task.delay",
+        lambda job_id: FakeAsyncResult(),
+    )
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    with session_factory() as db:
+        admin = User(
+            name="Admin",
+            email="admin@example.com",
+            role="admin",
+            password_hash="hash",
+        )
+        release = DatasetRelease(
+            name="ready_release",
+            status="ready",
+            artifact_uri="s3://bucket/dataset-releases/ready.zip",
+            immutable=True,
+        )
+        db.add_all([admin, release])
+        db.commit()
+        db.refresh(release)
+
+        run = TrainingRun(
+            dataset_release_id=release.id,
+            model_family="yolo",
+            base_model="yolo11n.pt",
+            config={"device": "cpu", "epochs": 10},
+            status="failed",
+            progress=20,
+            mlflow_run_id="old-run",
+            metrics={"error": "previous failure"},
+            artifacts=[{"name": "old.pt", "uri": "s3://bucket/old.pt"}],
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+
+        retried = retry_training_run(run.id, db, admin)
+
+        assert retried.status == "queued"
+        assert retried.progress == 0
+        assert retried.mlflow_run_id is None
+        assert retried.artifacts == []
+        jobs = db.scalars(select(JobRecord).where(JobRecord.kind == "training")).all()
+        assert len(jobs) == 1
+        assert jobs[0].raw["training_run_id"] == run.id
+        assert jobs[0].raw["celery_task_id"] == "celery-training-retry"
+        assert db.scalar(select(AuditEvent).where(AuditEvent.action == "training_run_retried")) is not None

@@ -1,4 +1,5 @@
 import io
+import json
 import zipfile
 
 import pytest
@@ -8,9 +9,15 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import Settings
 from app.core.database import Base
 from app.models import AuditEvent, DatasetRelease, ModelVersion, TrainingRun
+from app.schemas import TrainingRunCreate
 from app.services.artifacts import ArtifactBlob
+from app.services.json_safety import sanitize_json_dict
 from app.services.training import (
+    _apply_training_resource_policy,
+    _put_float,
+    effective_training_batch_size,
     ensure_training_device_available,
+    effective_training_workers,
     mlflow_safe_metrics,
     normalize_training_device,
     prepare_training_dataset,
@@ -150,6 +157,72 @@ def test_training_device_validation_rejects_unavailable_gpu(monkeypatch: pytest.
         ensure_training_device_available("0")
 
 
+def test_training_workers_are_limited_for_dedicated_gpu_worker() -> None:
+    workers, policy = effective_training_workers(8, "0", Settings(), in_daemon_process=False, shared_memory_mb=2048)
+
+    assert workers == 4
+    assert policy["dataloader_policy"] == "gpu_limited"
+    assert policy["requested_workers"] == 8
+    assert policy["effective_workers"] == 4
+    assert policy["max_workers"] == 4
+
+
+def test_training_workers_are_limited_by_shared_memory() -> None:
+    workers, policy = effective_training_workers(8, "0", Settings(), in_daemon_process=False, shared_memory_mb=64)
+
+    assert workers == 0
+    assert policy["dataloader_policy"] == "gpu_limited"
+    assert policy["requested_workers"] == 8
+    assert policy["effective_workers"] == 0
+    assert policy["shm_limited_workers"] == 0
+
+
+def test_training_batch_is_limited_for_mid_model_on_8gb_gpu() -> None:
+    batch, policy = effective_training_batch_size(
+        16,
+        "yolo11m.pt",
+        640,
+        "0",
+        Settings(),
+        gpu_memory_bytes=8 * 1024**3,
+    )
+
+    assert batch == 4
+    assert policy["batch_policy"] == "gpu_limited"
+    assert policy["requested_batch_size"] == 16
+    assert policy["effective_batch_size"] == 4
+    assert policy["reason"] == "gpu_memory_or_configured_batch_limit"
+
+
+def test_training_batch_is_not_limited_for_cpu() -> None:
+    batch, policy = effective_training_batch_size(16, "yolo11m.pt", 640, "cpu", Settings())
+
+    assert batch == 16
+    assert policy["batch_policy"] == "as_requested"
+
+
+def test_training_runner_forces_workers_zero_inside_daemon_process() -> None:
+    payload = TrainingRunCreate(
+        dataset_release_id="release-1",
+        base_model="yolo11n.pt",
+        device="0",
+        workers=8,
+        config={"ultralytics": {"workers": 8}},
+    )
+    train_args = {"workers": 8, "batch": 16}
+
+    policy = _apply_training_resource_policy(
+        train_args,
+        payload,
+        Settings(),
+        in_daemon_process=True,
+    )
+
+    assert train_args["workers"] == 0
+    assert policy["dataloader_policy"] == "single_process"
+    assert policy["requested_workers"] == 8
+
+
 def test_prepare_training_dataset_rewrites_prepared_yaml_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -196,6 +269,31 @@ def test_mlflow_safe_metrics_sanitizes_ultralytics_keys() -> None:
     assert "ignored" not in metrics
 
 
+def test_put_float_ignores_non_finite_values() -> None:
+    metrics: dict[str, float] = {}
+
+    _put_float(metrics, "nan", float("nan"))
+    _put_float(metrics, "inf", float("inf"))
+    _put_float(metrics, "negative_inf", float("-inf"))
+    _put_float(metrics, "ok", "1.5")
+
+    assert metrics == {"ok": 1.5}
+
+
+def test_training_json_sanitizer_removes_non_finite_values_recursively() -> None:
+    payload = sanitize_json_dict(
+        {
+            "ok": 1.0,
+            "nan": float("nan"),
+            "nested": {"inf": float("inf"), "value": 2},
+            "rows": [1, float("-inf"), {"bad": float("nan"), "good": 3}],
+        }
+    )
+
+    assert payload == {"ok": 1.0, "nested": {"value": 2}, "rows": [1, {"good": 3}]}
+    json.dumps(payload, allow_nan=False)
+
+
 def test_training_history_from_results_csv_text_normalizes_epoch_metrics() -> None:
     history = training_history_from_results_csv_text(
         "\n".join(
@@ -236,6 +334,31 @@ def test_training_history_from_results_csv_text_normalizes_epoch_metrics() -> No
             "loss": 3.5,
         },
     ]
+
+
+def test_training_history_from_results_csv_text_omits_nan_metrics() -> None:
+    history = training_history_from_results_csv_text(
+        "\n".join(
+            [
+                "epoch,time,train/box_loss,train/cls_loss,train/dfl_loss,"
+                "metrics/precision(B),metrics/recall(B),metrics/mAP50(B),metrics/mAP50-95(B),val/box_loss",
+                "1,5.4,NaN,3.0,inf,0.25,0.50,0.75,0.40,-inf",
+            ]
+        )
+    )
+
+    assert history == [
+        {
+            "epoch": 1.0,
+            "time": 5.4,
+            "precision": 0.25,
+            "recall": 0.5,
+            "map50": 0.75,
+            "map5095": 0.4,
+            "train_cls_loss": 3.0,
+        }
+    ]
+    json.dumps(history, allow_nan=False)
 
 
 def test_run_training_rejects_live_or_incomplete_dataset_release() -> None:

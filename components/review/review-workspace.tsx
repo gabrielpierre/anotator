@@ -305,7 +305,9 @@ export function ReviewWorkspace() {
   const [boxAreaMinInput, setBoxAreaMinInput] = React.useState("")
   const [boxAreaMaxInput, setBoxAreaMaxInput] = React.useState("")
   const [openFilter, setOpenFilter] = React.useState<"conf" | "size" | null>(null)
+  const [canvasSize, setCanvasSize] = React.useState({ width: 0, height: 0 })
   const canvasRef = React.useRef<HTMLDivElement>(null)
+  const imageFrameRef = React.useRef<HTMLDivElement>(null)
   const scaleRef = React.useRef(scale)
   scaleRef.current = scale
   const panRef = React.useRef(pan)
@@ -355,6 +357,28 @@ export function ReviewWorkspace() {
       setSelectedId(reviewItems[0]?.id ?? selectedId)
     }
   }, [reviewItems, reviewQueue?.length, selectedId])
+
+  React.useEffect(() => {
+    const node = canvasRef.current
+    if (!node) return
+    const update = () => {
+      const rect = node.getBoundingClientRect()
+      setCanvasSize((previous) => {
+        const width = Math.round(rect.width)
+        const height = Math.round(rect.height)
+        if (previous.width === width && previous.height === height) return previous
+        return { width, height }
+      })
+    }
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(node)
+    window.addEventListener("resize", update)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener("resize", update)
+    }
+  }, [])
 
   const clsOf = React.useCallback(
     (a: { id: number; cls: string }) => clsOverride[a.id] ?? a.cls,
@@ -459,6 +483,27 @@ export function ReviewWorkspace() {
   const queuePos = queueTotal === 0 ? 0 : Math.max(1, currentQueueIndex + 1)
   const queuePct = reviewItems.length === 0 ? 0 : Math.round((reviewedCount / reviewItems.length) * 100)
   const currentPreviewSrc = current.previewUrl ?? "/placeholder.svg"
+  const imageFrameStyle = React.useMemo<React.CSSProperties>(() => {
+    const dimensions = current.frameDimensions
+    if (!dimensions || canvasSize.width <= 0 || canvasSize.height <= 0) {
+      return { width: "100%", height: "100%" }
+    }
+    const imageAspect = dimensions.width / dimensions.height
+    const canvasAspect = canvasSize.width / canvasSize.height
+    if (!Number.isFinite(imageAspect) || !Number.isFinite(canvasAspect) || imageAspect <= 0 || canvasAspect <= 0) {
+      return { width: "100%", height: "100%" }
+    }
+    if (canvasAspect > imageAspect) {
+      return {
+        height: "100%",
+        width: `${(imageAspect / canvasAspect) * 100}%`,
+      }
+    }
+    return {
+      width: "100%",
+      height: `${(canvasAspect / imageAspect) * 100}%`,
+    }
+  }, [canvasSize.height, canvasSize.width, current.frameDimensions])
 
   const selectNext = React.useCallback(() => {
     const i = visibleAnnotations.findIndex((a) => a.id === selectedId)
@@ -518,15 +563,14 @@ export function ReviewWorkspace() {
       e.preventDefault()
       e.stopPropagation()
       setSelectedId(id)
-      const rect = canvasRef.current?.getBoundingClientRect()
+      const rect = imageFrameRef.current?.getBoundingClientRect() ?? canvasRef.current?.getBoundingClientRect()
       const start = boxState[id]
       if (!rect || !start) return
       const startX = e.clientX
       const startY = e.clientY
       const onMove = (ev: PointerEvent) => {
-        const s = scaleRef.current
-        const dx = ((ev.clientX - startX) / (rect.width * s)) * 100
-        const dy = ((ev.clientY - startY) / (rect.height * s)) * 100
+        const dx = ((ev.clientX - startX) / rect.width) * 100
+        const dy = ((ev.clientY - startY) / rect.height) * 100
         setBoxState((prev) => {
           const b = { ...start }
           if (mode === "move") {
@@ -1061,88 +1105,95 @@ export function ReviewWorkspace() {
             }}
           >
             <div
-              className="absolute inset-0 origin-center"
+              className="absolute inset-0 flex origin-center items-center justify-center"
               style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})` }}
             >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={currentPreviewSrc}
-                alt="Imagem em revisão"
-                draggable={false}
-                className="size-full select-none object-contain"
-              />
-              {currentFrameAnnotations.map((a) => {
-                const b = boxState[a.id]
-                const active = a.id === selectedId
-                const d = decisions[a.id]
-                return (
-                  <div
-                    key={a.id}
-                    onPointerDown={(e) => {
-                      if (e.button === 1) {
-                        startPan(e)
-                        return
-                      }
-                      if (correcting && active) {
-                        beginDrag(e, a.id, "move")
-                        return
-                      }
-                      setSelectedId(a.id)
-                    }}
-                    onDoubleClick={(e) => {
-                      e.stopPropagation()
-                      openClassEditor(a.id)
-                    }}
-                    className={cn("absolute select-none transition-opacity", active ? "z-10" : "z-0")}
-                    style={{
-                      left: `${b.x}%`,
-                      top: `${b.y}%`,
-                      width: `${b.w}%`,
-                      height: `${b.h}%`,
-                      borderWidth: active ? 3 : 2,
-                      borderStyle: "solid",
-                      borderColor: clsColor(clsOf(a)),
-                      opacity: active ? 1 : d ? 0.45 : 0.85,
-                      boxShadow: active ? "0 0 0 2px rgba(0,0,0,0.4)" : undefined,
-                      cursor: correcting && active ? "move" : "pointer",
-                    }}
-                  >
-                    <span
-                      className="pointer-events-none absolute -top-5 left-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-semibold text-white"
-                      style={{ background: clsColor(clsOf(a)), fontSize: `${10 / scale}px` }}
+              <div ref={imageFrameRef} className="relative overflow-hidden bg-black" style={imageFrameStyle}>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={currentPreviewSrc}
+                  alt="Imagem em revisão"
+                  draggable={false}
+                  className="size-full select-none object-fill"
+                />
+                {currentFrameAnnotations.map((a) => {
+                  const b = boxState[a.id]
+                  const active = a.id === selectedId
+                  const d = decisions[a.id]
+                  const color = clsColor(clsOf(a))
+                  return (
+                    <div
+                      key={a.id}
+                      onPointerDown={(e) => {
+                        if (e.button === 1) {
+                          startPan(e)
+                          return
+                        }
+                        if (correcting && active) {
+                          beginDrag(e, a.id, "move")
+                          return
+                        }
+                        setSelectedId(a.id)
+                      }}
+                      onDoubleClick={(e) => {
+                        e.stopPropagation()
+                        openClassEditor(a.id)
+                      }}
+                      className={cn(
+                        "absolute select-none transition-opacity",
+                        active ? "review-inspected-pulse z-10" : "z-0",
+                      )}
+                      style={{
+                        "--review-active-color": color,
+                        left: `${b.x}%`,
+                        top: `${b.y}%`,
+                        width: `${b.w}%`,
+                        height: `${b.h}%`,
+                        borderWidth: active ? 3 : 2,
+                        borderStyle: "solid",
+                        borderColor: color,
+                        opacity: active ? 1 : d ? 0.45 : 0.85,
+                        boxShadow: active ? "0 0 0 2px rgba(0,0,0,0.4)" : undefined,
+                        cursor: correcting && active ? "move" : "pointer",
+                      } as React.CSSProperties}
                     >
-                      {clsOf(a)} {a.conf.toFixed(2)}
-                    </span>
-                    {active &&
-                      correcting &&
-                      handles.map((h) => (
-                        <span
-                          key={h.id}
-                          onPointerDown={(e) => {
-                            if (e.button === 1) {
-                              startPan(e)
-                              return
-                            }
-                            beginDrag(e, a.id, h.id)
-                          }}
-                          className={cn("absolute rounded-sm border border-white bg-brand-blue", h.cls)}
-                          style={{
-                            width: `${8 / scale}px`,
-                            height: `${8 / scale}px`,
-                            cursor: h.cursor,
-                          }}
-                        />
-                      ))}
+                      <span
+                        className="pointer-events-none absolute -top-5 left-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-semibold text-white"
+                        style={{ background: color, fontSize: `${10 / scale}px` }}
+                      >
+                        {clsOf(a)} {a.conf.toFixed(2)}
+                      </span>
+                      {active &&
+                        correcting &&
+                        handles.map((h) => (
+                          <span
+                            key={h.id}
+                            onPointerDown={(e) => {
+                              if (e.button === 1) {
+                                startPan(e)
+                                return
+                              }
+                              beginDrag(e, a.id, h.id)
+                            }}
+                            className={cn("absolute rounded-sm border border-white bg-brand-blue", h.cls)}
+                            style={{
+                              width: `${8 / scale}px`,
+                              height: `${8 / scale}px`,
+                              cursor: h.cursor,
+                            }}
+                          />
+                        ))}
+                    </div>
+                  )
+                })}
+                {frameAnnotationTotal === 0 && (
+                  <div className="absolute inset-0 flex items-center justify-center">
+                    <div className="rounded-full bg-black/60 px-3 py-1.5 text-xs text-white/80">
+                      Nenhuma anotação com bounding box para revisar.
+                    </div>
                   </div>
-                )
-              })}
-              {frameAnnotationTotal === 0 && (
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <div className="rounded-full bg-black/60 px-3 py-1.5 text-xs text-white/80">
-                    Nenhuma anotação com bounding box para revisar.
-                  </div>
-                </div>
-              )}
+                )}
+              </div>
             </div>
 
             {/* Correção de objeto */}

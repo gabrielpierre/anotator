@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import { useRouter } from "next/navigation"
-import { AlertTriangle, Pause, Square, MoreHorizontal, Settings2, ChevronRight } from "lucide-react"
+import { AlertTriangle, Pause, Square, MoreHorizontal, Settings2, ChevronRight, RotateCcw } from "lucide-react"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
 import { StatusBadge, ProgressBar, StatRow, Meter } from "@/components/app/primitives"
@@ -13,6 +13,7 @@ import {
   downloadBackendFile,
   fetchTrainingRun,
   pauseTrainingRun,
+  retryTrainingRun,
   stopTrainingRun,
   trainingArtifactAssetUrl,
   trainingArtifactDownloadPath,
@@ -88,7 +89,7 @@ export function TrainingDetail({ id }: { id: string }) {
   const [tab, setTab] = React.useState("overview")
   const [run, setRun] = React.useState<BackendTrainingRun | null>(null)
   const [actionMenuOpen, setActionMenuOpen] = React.useState(false)
-  const [actionBusy, setActionBusy] = React.useState<"pause" | "stop" | "delete" | null>(null)
+  const [actionBusy, setActionBusy] = React.useState<"pause" | "stop" | "retry" | "delete" | null>(null)
   const [actionError, setActionError] = React.useState<string | null>(null)
 
   React.useEffect(() => {
@@ -130,6 +131,7 @@ export function TrainingDetail({ id }: { id: string }) {
   const failureMessage = failureMessageFromRun(currentRun)
   const canPause = currentRun.status === "queued" || currentRun.status === "running"
   const canStop = canPause || currentRun.status === "paused"
+  const canRetry = currentRun.status === "failed" || currentRun.status === "canceled"
 
   async function handlePause() {
     if (!canPause || actionBusy) return
@@ -154,6 +156,19 @@ export function TrainingDetail({ id }: { id: string }) {
       setRun(await stopTrainingRun(currentRun.id))
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "Não foi possível parar o treinamento.")
+    } finally {
+      setActionBusy(null)
+    }
+  }
+
+  async function handleRetry() {
+    if (!canRetry || actionBusy) return
+    setActionBusy("retry")
+    setActionError(null)
+    try {
+      setRun(await retryTrainingRun(currentRun.id))
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "Não foi possível tentar novamente.")
     } finally {
       setActionBusy(null)
     }
@@ -214,6 +229,22 @@ export function TrainingDetail({ id }: { id: string }) {
             </Button>
             {actionMenuOpen && (
               <div className="absolute right-0 top-full z-20 mt-2 w-56 overflow-hidden rounded-xl border border-border bg-card p-1 shadow-lg">
+                {canRetry && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setActionMenuOpen(false)
+                      void handleRetry()
+                    }}
+                    disabled={actionBusy !== null}
+                    className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm font-medium text-foreground hover:bg-muted disabled:opacity-50"
+                  >
+                    <span className="inline-flex items-center gap-2">
+                      <RotateCcw className="size-4" />
+                      Tentar novamente
+                    </span>
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => {
@@ -362,7 +393,7 @@ function MachineResourcesCard({
   const resourcePolicy = objectRecord(run.config.resource_policy)
   const device = String(run.config.device ?? resourcePolicy?.device ?? "auto")
   const deviceLabel = String(resourcePolicy?.device_label ?? (device === "cpu" ? "CPU" : device))
-  const workers = numberParam(run.config, "workers", 0)
+  const workers = numberParam(run.config, "workers", 8)
   const batch = numberParam(run.config, "batch_size", 0)
 
   return (
@@ -391,7 +422,7 @@ function MachineResourcesCard({
         <Meter label="Progresso reportado" value={progress} color="bg-brand-lavender" />
 
         <div className="grid grid-cols-2 gap-2">
-          <ResourceMetric label="Workers" value={workers ? String(workers) : "--"} />
+          <ResourceMetric label="Workers" value={String(workers)} />
           <ResourceMetric label="Batch" value={batch ? String(batch) : "--"} />
         </div>
       </CardContent>
@@ -1073,7 +1104,7 @@ function ConfigTab({ run }: { run: BackendTrainingRun | null }) {
   )
 }
 
-type ConfigRow = { label: string; value: React.ReactNode; raw?: string }
+type ConfigRow = { key: string; label: string; value: React.ReactNode; raw?: string }
 type ConfigSection = { title: string; rows: ConfigRow[] }
 
 function configSectionsFromRun(run: BackendTrainingRun): ConfigSection[] {
@@ -1132,7 +1163,12 @@ function configRowsFromObject(value: unknown, prefix = ""): ConfigRow[] {
 
 function configRow(label: string, value: unknown): ConfigRow {
   const formatted = formatConfigValue(value)
-  return { label: humanizeConfigKey(label), value: formatted, raw: typeof formatted === "string" ? formatted : undefined }
+  return {
+    key: label,
+    label: humanizeConfigKey(label),
+    value: formatted,
+    raw: typeof formatted === "string" ? formatted : undefined,
+  }
 }
 
 function ParamSection({ title, rows }: { title: string; rows: ConfigRow[] }) {
@@ -1142,8 +1178,8 @@ function ParamSection({ title, rows }: { title: string; rows: ConfigRow[] }) {
         <h3 className="text-sm font-semibold text-foreground">{title}</h3>
       </div>
       <div className="divide-y divide-border">
-        {rows.map((row) => (
-          <ParamRow key={`${title}-${row.label}`} row={row} />
+        {rows.map((row, index) => (
+          <ParamRow key={`${title}-${row.key}-${index}`} row={row} />
         ))}
       </div>
     </section>

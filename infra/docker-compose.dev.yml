@@ -45,9 +45,15 @@ services:
       DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL:-admin@cvat.plus}
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
       DEFAULT_ADMIN_NAME: ${DEFAULT_ADMIN_NAME:-Administrador}
-      JOB_STALE_AFTER_SECONDS: ${JOB_STALE_AFTER_SECONDS:-900}
+      JOB_STALE_AFTER_SECONDS: ${JOB_STALE_AFTER_SECONDS:-300}
       TRAINING_CPU_MAX_WORKERS: ${TRAINING_CPU_MAX_WORKERS:-2}
       TRAINING_CPU_MAX_THREADS: ${TRAINING_CPU_MAX_THREADS:-4}
+      TRAINING_GPU_MAX_WORKERS: ${TRAINING_GPU_MAX_WORKERS:-4}
+      TRAINING_GPU_MAX_BATCH_SIZE: ${TRAINING_GPU_MAX_BATCH_SIZE:-8}
+      TRAINING_GPU_TARGET_MEMORY_FRACTION: ${TRAINING_GPU_TARGET_MEMORY_FRACTION:-0.7}
+      TRAINING_MIN_SHM_PER_WORKER_MB: ${TRAINING_MIN_SHM_PER_WORKER_MB:-256}
+      TRAINING_HEARTBEAT_SECONDS: ${TRAINING_HEARTBEAT_SECONDS:-20}
+      TRAINING_ISOLATE_PROCESS: ${TRAINING_ISOLATE_PROCESS:-true}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: minioadmin
@@ -64,6 +70,7 @@ services:
       - "${BACKEND_PORT:-8020}:8000"
     volumes:
       - ../backend:/app/backend
+    shm_size: ${TRAINING_SHM_SIZE:-2gb}
     healthcheck:
       test:
         [
@@ -90,7 +97,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     working_dir: /app/backend
-    command: sh -lc "alembic upgrade head && celery -A app.core.celery_app.celery_app worker --loglevel=INFO"
+    command: sh -lc "alembic upgrade head && celery -A app.core.celery_app.celery_app worker --loglevel=INFO -Q celery -n default@%h"
     environment:
       ENVIRONMENT: development
       DATABASE_URL: postgresql+psycopg://anotator:anotator@postgres:5432/anotator
@@ -103,9 +110,15 @@ services:
       DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL:-admin@cvat.plus}
       DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
       DEFAULT_ADMIN_NAME: ${DEFAULT_ADMIN_NAME:-Administrador}
-      JOB_STALE_AFTER_SECONDS: ${JOB_STALE_AFTER_SECONDS:-900}
+      JOB_STALE_AFTER_SECONDS: ${JOB_STALE_AFTER_SECONDS:-300}
       TRAINING_CPU_MAX_WORKERS: ${TRAINING_CPU_MAX_WORKERS:-2}
       TRAINING_CPU_MAX_THREADS: ${TRAINING_CPU_MAX_THREADS:-4}
+      TRAINING_GPU_MAX_WORKERS: ${TRAINING_GPU_MAX_WORKERS:-4}
+      TRAINING_GPU_MAX_BATCH_SIZE: ${TRAINING_GPU_MAX_BATCH_SIZE:-8}
+      TRAINING_GPU_TARGET_MEMORY_FRACTION: ${TRAINING_GPU_TARGET_MEMORY_FRACTION:-0.7}
+      TRAINING_MIN_SHM_PER_WORKER_MB: ${TRAINING_MIN_SHM_PER_WORKER_MB:-256}
+      TRAINING_HEARTBEAT_SECONDS: ${TRAINING_HEARTBEAT_SECONDS:-20}
+      TRAINING_ISOLATE_PROCESS: ${TRAINING_ISOLATE_PROCESS:-true}
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
       AWS_ACCESS_KEY_ID: minioadmin
@@ -120,6 +133,56 @@ services:
     volumes:
       - ../backend:/app/backend
       - worker_artifacts:/artifacts
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  worker-training:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    working_dir: /app/backend
+    command: sh -lc "alembic upgrade head && celery -A app.core.celery_app.celery_app worker --loglevel=INFO -Q training --pool=solo --concurrency=1 -n training@%h"
+    environment:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql+psycopg://anotator:anotator@postgres:5432/anotator
+      REDIS_URL: redis://redis:6379/0
+      CVAT_BASE_URL: http://host.docker.internal:8080
+      CVAT_ACCESS_TOKEN: ${CVAT_ACCESS_TOKEN:-}
+      CVAT_AUTH_SCHEME: ${CVAT_AUTH_SCHEME:-Token}
+      CVAT_HOST_HEADER: ${CVAT_HOST_HEADER:-localhost}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL:-admin@cvat.plus}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-admin123}
+      DEFAULT_ADMIN_NAME: ${DEFAULT_ADMIN_NAME:-Administrador}
+      JOB_STALE_AFTER_SECONDS: ${JOB_STALE_AFTER_SECONDS:-300}
+      TRAINING_CPU_MAX_WORKERS: ${TRAINING_CPU_MAX_WORKERS:-2}
+      TRAINING_CPU_MAX_THREADS: ${TRAINING_CPU_MAX_THREADS:-4}
+      TRAINING_GPU_MAX_WORKERS: ${TRAINING_GPU_MAX_WORKERS:-4}
+      TRAINING_GPU_MAX_BATCH_SIZE: ${TRAINING_GPU_MAX_BATCH_SIZE:-8}
+      TRAINING_GPU_TARGET_MEMORY_FRACTION: ${TRAINING_GPU_TARGET_MEMORY_FRACTION:-0.7}
+      TRAINING_MIN_SHM_PER_WORKER_MB: ${TRAINING_MIN_SHM_PER_WORKER_MB:-256}
+      TRAINING_HEARTBEAT_SECONDS: ${TRAINING_HEARTBEAT_SECONDS:-20}
+      TRAINING_ISOLATE_PROCESS: ${TRAINING_ISOLATE_PROCESS:-true}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: anotator-artifacts
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      AUTO_CREATE_TABLES: "false"
+      ANOTATOR_DOCKER_GPU_ENABLED: ${ANOTATOR_DOCKER_GPU_ENABLED:-false}
+      HOST_NVIDIA_GPUS: ${HOST_NVIDIA_GPUS:-}
+    volumes:
+      - ../backend:/app/backend
+      - worker_artifacts:/artifacts
+    shm_size: ${TRAINING_SHM_SIZE:-2gb}
     depends_on:
       backend:
         condition: service_healthy

@@ -193,3 +193,24 @@
     -webkit-font-smoothing: antialiased;
   }
 }
+
+@layer utilities {
+  @keyframes review-inspected-pulse {
+    0%,
+    100% {
+      box-shadow:
+        0 0 0 2px rgba(0, 0, 0, 0.45),
+        0 0 0 0 color-mix(in srgb, var(--review-active-color, #4c98fd) 0%, transparent);
+    }
+    50% {
+      box-shadow:
+        0 0 0 2px rgba(0, 0, 0, 0.45),
+        0 0 0 5px color-mix(in srgb, var(--review-active-color, #4c98fd) 35%, transparent),
+        0 0 18px color-mix(in srgb, var(--review-active-color, #4c98fd) 24%, transparent);
+    }
+  }
+
+  .review-inspected-pulse {
+    animation: review-inspected-pulse 1.45s ease-in-out infinite;
+  }
+}

@@ -561,6 +561,10 @@ export function stopTrainingRun(runId: string, signal?: AbortSignal) {
   return postJson<BackendTrainingRun>(`/training-runs/${encodeURIComponent(runId)}/stop`, {}, signal)
 }
 
+export function retryTrainingRun(runId: string, signal?: AbortSignal) {
+  return postJson<BackendTrainingRun>(`/training-runs/${encodeURIComponent(runId)}/retry`, {}, signal)
+}
+
 export function deleteTrainingRun(runId: string, signal?: AbortSignal) {
   return deleteJson<{
     id: string

@@ -15,6 +15,7 @@ import {
   ChevronRight,
   MoreHorizontal,
   Pause,
+  RotateCcw,
   Square,
   Trash2,
   ExternalLink,
@@ -29,6 +30,7 @@ import {
   fetchDatasetReleases,
   fetchTrainingRuns,
   pauseTrainingRun,
+  retryTrainingRun,
   stopTrainingRun,
 } from "@/lib/api/client"
 import { formatDateTimePt, toUiJobStatus, type UiJobStatus } from "@/lib/api/status"
@@ -36,12 +38,14 @@ import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendDatasetRelease, BackendJobStatus, BackendTrainingRun } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
+type TrainingAction = "pause" | "stop" | "retry" | "delete"
+
 export function TrainingList() {
   const [pickerOpen, setPickerOpen] = React.useState(false)
   const [backendRuns, setBackendRuns] = React.useState<BackendTrainingRun[] | null>(null)
   const [backendReleases, setBackendReleases] = React.useState<BackendDatasetRelease[] | null>(null)
   const [openActionsId, setOpenActionsId] = React.useState<string | null>(null)
-  const [busyAction, setBusyAction] = React.useState<{ id: string; action: "pause" | "stop" | "delete" } | null>(null)
+  const [busyAction, setBusyAction] = React.useState<{ id: string; action: TrainingAction } | null>(null)
   const [actionError, setActionError] = React.useState<string | null>(null)
   const { activeProject, projects } = useCurrentUser()
   const currentProjectId = activeProject?.id ?? projects[0]?.id ?? null
@@ -78,7 +82,7 @@ export function TrainingList() {
   const completed = items.filter((item) => item.status === "concluido").length
   const bestMap = items.reduce((best, item) => Math.max(best, item.bestMapValue ?? 0), 0)
 
-  async function runAction(id: string, action: "pause" | "stop" | "delete") {
+  async function runAction(id: string, action: TrainingAction) {
     const item = items.find((entry) => entry.id === id)
     if (!item || busyAction) return
     if (action === "stop" && !window.confirm("Parar este treinamento agora? O job ativo será cancelado.")) return
@@ -99,6 +103,9 @@ export function TrainingList() {
         setBackendRuns((runs) => runs?.map((run) => (run.id === id ? updated : run)) ?? null)
       } else if (action === "stop") {
         const updated = await stopTrainingRun(id)
+        setBackendRuns((runs) => runs?.map((run) => (run.id === id ? updated : run)) ?? null)
+      } else if (action === "retry") {
+        const updated = await retryTrainingRun(id)
         setBackendRuns((runs) => runs?.map((run) => (run.id === id ? updated : run)) ?? null)
       } else {
         await deleteTrainingRun(id)
@@ -254,16 +261,45 @@ function TrainingRowActions({
 }: {
   item: TrainingListItem
   open: boolean
-  busyAction: { id: string; action: "pause" | "stop" | "delete" } | null
+  busyAction: { id: string; action: TrainingAction } | null
   onToggle: (event: React.MouseEvent<HTMLButtonElement>) => void
-  onAction: (action: "pause" | "stop" | "delete") => void
+  onAction: (action: TrainingAction) => void
 }) {
   const canPause = item.rawStatus === "queued" || item.rawStatus === "running"
   const canStop = canPause || item.rawStatus === "paused"
+  const canRetry = item.rawStatus === "failed" || item.rawStatus === "canceled"
   const busy = busyAction?.id === item.id ? busyAction.action : null
 
   return (
-    <div className="relative flex items-center justify-end px-5 pb-4 sm:px-4 sm:py-4">
+    <div className="relative flex items-center justify-end gap-2 px-5 pb-4 sm:px-4 sm:py-4">
+      {canRetry && (
+        <button
+          type="button"
+          disabled={busyAction !== null}
+          onClick={(event) => {
+            event.stopPropagation()
+            onAction("retry")
+          }}
+          className="inline-flex h-9 items-center gap-2 rounded-full border border-border bg-background px-3 text-sm font-medium text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-45"
+        >
+          <RotateCcw className={cn("size-4 text-muted-foreground", busy === "retry" && "animate-spin")} />
+          {busy === "retry" ? "Enfileirando..." : "Tentar novamente"}
+        </button>
+      )}
+      {canRetry && (
+        <button
+          type="button"
+          disabled={busyAction !== null}
+          onClick={(event) => {
+            event.stopPropagation()
+            onAction("delete")
+          }}
+          className="inline-flex h-9 items-center gap-2 rounded-full border border-destructive/25 bg-background px-3 text-sm font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-45"
+        >
+          <Trash2 className="size-4" />
+          {busy === "delete" ? "Excluindo..." : "Excluir"}
+        </button>
+      )}
       <button
         type="button"
         onClick={onToggle}
@@ -307,7 +343,18 @@ function TrainingRowActions({
               {busy === "stop" ? "Parando..." : "Parar"}
             </button>
           )}
-          {canStop && <div className="my-1 h-px bg-border" />}
+          {canRetry && (
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => onAction("retry")}
+              className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              <RotateCcw className="size-4 text-muted-foreground" />
+              {busy === "retry" ? "Enfileirando..." : "Tentar novamente"}
+            </button>
+          )}
+          {(canStop || canRetry) && <div className="my-1 h-px bg-border" />}
           <button
             type="button"
             disabled={busyAction !== null}

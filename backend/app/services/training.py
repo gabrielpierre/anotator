@@ -1,7 +1,11 @@
 import csv
 import io
 import math
+import multiprocessing
 import os
+import queue
+import time
+import traceback
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -15,6 +19,7 @@ from app.models import AuditEvent, DatasetRelease, ModelVersion, Project, Traini
 from app.schemas import TrainingRunCreate
 from app.services.artifacts import S3ArtifactStore
 from app.services.compute import available_training_device_ids
+from app.services.json_safety import sanitize_json_dict, sanitize_json_payload
 
 ProgressCallback = Callable[[float, str | None, dict[str, Any] | None], None]
 TrainingRunner = Callable[[dict[str, Any], ProgressCallback | None], dict[str, Any]]
@@ -51,14 +56,15 @@ def run_training(
         "payload": payload,
         "settings": settings,
     }
-    result = (runner or ultralytics_training_runner)(train_context, progress_callback)
+    default_runner = isolated_ultralytics_training_runner if settings.training_isolate_process else ultralytics_training_runner
+    result = (runner or default_runner)(train_context, progress_callback)
 
     metrics = _normalize_metrics(result.get("metrics") or {})
-    artifacts = result.get("artifacts") if isinstance(result.get("artifacts"), list) else []
+    artifacts = sanitize_json_payload(result.get("artifacts")) if isinstance(result.get("artifacts"), list) else []
     run.mlflow_run_id = result.get("mlflow_run_id")
     run.status = "succeeded"
     run.progress = 100
-    run.metrics = {**(run.metrics or {}), **metrics, "stage": "completed", "status": "completed"}
+    run.metrics = sanitize_json_dict({**(run.metrics or {}), **metrics, "stage": "completed", "status": "completed"})
     run.artifacts = artifacts
     db.add(run)
 
@@ -120,6 +126,7 @@ def ultralytics_training_runner(
             train_args["patience"] = payload.patience
         train_args.update(payload.config.get("ultralytics", {}))
         params.update(_apply_training_resource_policy(train_args, payload, settings))
+        _configure_cuda_memory_budget(payload.device, settings)
 
         with mlflow.start_run(run_name=f"{payload.base_model}-{context['run_id']}") as mlflow_run:
             mlflow.log_params(params)
@@ -163,22 +170,348 @@ def ultralytics_training_runner(
             }
 
 
+def isolated_ultralytics_training_runner(
+    context: dict[str, Any],
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    if multiprocessing.current_process().daemon:
+        return ultralytics_training_runner(context, progress_callback)
+
+    try:
+        process_context = multiprocessing.get_context("fork")
+    except ValueError:
+        return ultralytics_training_runner(context, progress_callback)
+
+    events: multiprocessing.Queue = process_context.Queue()
+    process = process_context.Process(
+        target=_ultralytics_training_process,
+        args=(context, events),
+        daemon=False,
+        name=f"training-run-{str(context.get('run_id', 'unknown'))[:8]}",
+    )
+    process.start()
+
+    last_progress = 20.0
+    next_cancel_probe = time.monotonic() + 5
+    result: dict[str, Any] | None = None
+    child_error: str | None = None
+    try:
+        while process.is_alive() or not events.empty():
+            try:
+                event = events.get(timeout=1)
+            except queue.Empty:
+                if time.monotonic() >= next_cancel_probe:
+                    _probe_training_cancel(progress_callback, last_progress)
+                    next_cancel_probe = time.monotonic() + 5
+                continue
+
+            event_type = event.get("type") if isinstance(event, dict) else None
+            if event_type == "progress":
+                last_progress = float(event.get("progress") or last_progress)
+                _report(progress_callback, last_progress, event.get("detail"), event.get("metrics"))
+            elif event_type == "result":
+                event_result = event.get("result")
+                result = event_result if isinstance(event_result, dict) else {}
+            elif event_type == "error":
+                error = str(event.get("error") or "Training process failed.")
+                child_traceback = str(event.get("traceback") or "").strip()
+                child_error = f"{error}\n\n{child_traceback}" if child_traceback else error
+
+        process.join(timeout=2)
+        if child_error:
+            raise RuntimeError(child_error)
+        if result is not None:
+            return result
+        if process.exitcode not in (0, None):
+            raise RuntimeError(f"Training process exited with code {process.exitcode}.")
+        raise RuntimeError("Training process finished without returning a result.")
+    except BaseException:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+        raise
+    finally:
+        events.close()
+        events.join_thread()
+
+
+def _ultralytics_training_process(
+    context: dict[str, Any],
+    events: multiprocessing.Queue,
+) -> None:
+    def report(progress: float, detail: str | None = None, metrics: dict[str, Any] | None = None) -> None:
+        events.put({"type": "progress", "progress": progress, "detail": detail, "metrics": metrics})
+
+    try:
+        result = ultralytics_training_runner(context, report)
+        events.put({"type": "result", "result": result})
+    except BaseException as exc:
+        events.put({"type": "error", "error": str(exc), "traceback": traceback.format_exc()})
+    finally:
+        _release_cuda_memory()
+
+
+def _probe_training_cancel(callback: ProgressCallback | None, progress: float) -> None:
+    if callback is None:
+        return
+    try:
+        callback(progress, None, None)
+    except TypeError:
+        callback(progress, None)  # type: ignore[misc]
+
+
+def _release_cuda_memory() -> None:
+    try:
+        import gc
+
+        gc.collect()
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        return
+
+
+def _configure_cuda_memory_budget(device: str | None, settings: Settings) -> None:
+    normalized_device = normalize_training_device(device)
+    if _is_effective_cpu_device(normalized_device):
+        return
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        fraction = min(0.95, max(0.25, float(settings.training_gpu_target_memory_fraction or 0.7)))
+        torch.cuda.set_per_process_memory_fraction(fraction, device=_first_cuda_index(normalized_device))
+    except Exception:
+        return
+
+
+def effective_training_workers(
+    requested_workers: Any,
+    device: Any,
+    settings: Settings,
+    *,
+    in_daemon_process: bool | None = None,
+    shared_memory_mb: int | None = None,
+) -> tuple[int, dict[str, Any]]:
+    try:
+        workers = max(0, int(requested_workers or 0))
+    except (TypeError, ValueError):
+        workers = 0
+
+    daemon_process = multiprocessing.current_process().daemon if in_daemon_process is None else in_daemon_process
+    if daemon_process:
+        return 0, {
+            "dataloader_policy": "single_process",
+            "requested_workers": workers,
+            "effective_workers": 0,
+            "reason": "daemon_process_cannot_spawn_dataloader_processes",
+        }
+
+    normalized_device = normalize_training_device(device)
+    if _is_effective_cpu_device(normalized_device):
+        max_workers = max(0, settings.training_cpu_max_workers)
+        effective_workers = min(workers, max_workers)
+        return effective_workers, {
+            "dataloader_policy": "cpu_limited",
+            "requested_workers": workers,
+            "effective_workers": effective_workers,
+            "max_workers": max_workers,
+        }
+
+    max_workers = max(0, settings.training_gpu_max_workers)
+    shm_mb = _shared_memory_mb() if shared_memory_mb is None else shared_memory_mb
+    min_shm_per_worker_mb = max(0, settings.training_min_shm_per_worker_mb)
+    shm_limited_workers: int | None = None
+    if shm_mb is not None and min_shm_per_worker_mb > 0:
+        shm_limited_workers = max(0, int(shm_mb // min_shm_per_worker_mb))
+
+    limits = [workers, max_workers]
+    if shm_limited_workers is not None:
+        limits.append(shm_limited_workers)
+    effective_workers = min(limits)
+    reduced = effective_workers < workers
+    policy = {
+        "dataloader_policy": "gpu_limited" if reduced else "as_requested",
+        "requested_workers": workers,
+        "effective_workers": effective_workers,
+        "max_workers": max_workers,
+    }
+    if shm_mb is not None:
+        policy["shared_memory_mb"] = shm_mb
+    if shm_limited_workers is not None:
+        policy["shm_limited_workers"] = shm_limited_workers
+        policy["min_shm_per_worker_mb"] = min_shm_per_worker_mb
+    if reduced:
+        policy["reason"] = "gpu_worker_or_shared_memory_limit"
+    return effective_workers, policy
+
+
+def effective_training_batch_size(
+    requested_batch_size: Any,
+    base_model: Any,
+    image_size: Any,
+    device: Any,
+    settings: Settings,
+    *,
+    gpu_memory_bytes: int | None = None,
+) -> tuple[int, dict[str, Any]]:
+    try:
+        requested = max(1, int(requested_batch_size or 1))
+    except (TypeError, ValueError):
+        requested = 1
+
+    normalized_device = normalize_training_device(device)
+    if _is_effective_cpu_device(normalized_device):
+        return requested, {
+            "batch_policy": "as_requested",
+            "requested_batch_size": requested,
+            "effective_batch_size": requested,
+            "device": "cpu",
+        }
+
+    configured_limit = max(1, int(settings.training_gpu_max_batch_size or 1))
+    total_memory = gpu_memory_bytes if gpu_memory_bytes is not None else _cuda_device_total_memory_bytes(normalized_device)
+    memory_limited_batch: int | None = None
+    memory_gb: float | None = None
+    per_sample_gb = _estimated_yolo_sample_memory_gb(base_model, image_size)
+    target_fraction = min(0.95, max(0.25, float(settings.training_gpu_target_memory_fraction or 0.7)))
+    if total_memory:
+        memory_gb = total_memory / (1024**3)
+        usable_gb = memory_gb * target_fraction
+        memory_limited_batch = max(1, int(usable_gb // per_sample_gb))
+
+    limits = [requested, configured_limit]
+    if memory_limited_batch is not None:
+        limits.append(memory_limited_batch)
+    effective = max(1, min(limits))
+    policy = {
+        "batch_policy": "gpu_limited" if effective < requested else "as_requested",
+        "requested_batch_size": requested,
+        "effective_batch_size": effective,
+        "configured_max_batch_size": configured_limit,
+        "device": normalized_device or "auto",
+        "model_scale": _yolo_model_scale(base_model),
+        "image_size": _positive_int(image_size) or 640,
+        "estimated_memory_per_sample_gb": round(per_sample_gb, 2),
+        "target_memory_fraction": target_fraction,
+    }
+    if memory_gb is not None:
+        policy["gpu_total_memory_gb"] = round(memory_gb, 2)
+    if memory_limited_batch is not None:
+        policy["memory_limited_batch_size"] = memory_limited_batch
+    if effective < requested:
+        policy["reason"] = "gpu_memory_or_configured_batch_limit"
+    return effective, policy
+
+
+def _is_effective_cpu_device(normalized_device: str | None) -> bool:
+    if normalized_device == "cpu":
+        return True
+    if normalized_device is not None:
+        return False
+    try:
+        return available_training_device_ids() == {"cpu"}
+    except Exception:
+        return False
+
+
+def _cuda_device_total_memory_bytes(normalized_device: str | None) -> int | None:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        index = _first_cuda_index(normalized_device)
+        return int(torch.cuda.get_device_properties(index).total_memory)
+    except Exception:
+        return None
+
+
+def _first_cuda_index(normalized_device: str | None) -> int:
+    if normalized_device:
+        for part in str(normalized_device).split(","):
+            try:
+                return max(0, int(part.strip()))
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _estimated_yolo_sample_memory_gb(base_model: Any, image_size: Any) -> float:
+    scale = _yolo_model_scale(base_model)
+    base_by_scale = {
+        "n": 0.45,
+        "s": 0.75,
+        "m": 1.25,
+        "l": 1.85,
+        "x": 2.6,
+    }
+    size = _positive_int(image_size) or 640
+    image_factor = (size / 640) ** 2
+    return max(0.25, base_by_scale.get(scale, 1.25) * image_factor)
+
+
+def _yolo_model_scale(base_model: Any) -> str:
+    stem = Path(str(base_model or "")).stem.lower().replace("-", "").replace("_", "")
+    for scale in ("x", "l", "m", "s", "n"):
+        if stem.endswith(scale):
+            return scale
+        if f"yolo11{scale}" in stem or f"yolov8{scale}" in stem:
+            return scale
+    return "m"
+
+
+def _shared_memory_mb() -> int | None:
+    shm_path = Path("/dev/shm")
+    try:
+        stat = os.statvfs(shm_path)
+    except OSError:
+        return None
+    return int((stat.f_frsize * stat.f_blocks) / (1024 * 1024))
+
+
 def _apply_training_resource_policy(
     train_args: dict[str, Any],
     payload: TrainingRunCreate,
     settings: Settings,
+    *,
+    in_daemon_process: bool | None = None,
 ) -> dict[str, Any]:
     device = normalize_training_device(payload.device)
-    if device != "cpu":
-        return {}
+    effective_workers, dataloader_policy = effective_training_workers(
+        train_args.get("workers", payload.workers),
+        device,
+        settings,
+        in_daemon_process=in_daemon_process,
+    )
+    train_args["workers"] = effective_workers
 
-    max_workers = max(0, settings.training_cpu_max_workers)
-    try:
-        requested_workers = int(train_args.get("workers") or 0)
-    except (TypeError, ValueError):
-        requested_workers = 0
-    if requested_workers > max_workers:
-        train_args["workers"] = max_workers
+    effective_batch, batch_policy = effective_training_batch_size(
+        train_args.get("batch", payload.batch_size),
+        payload.base_model,
+        train_args.get("imgsz", payload.image_size),
+        device,
+        settings,
+    )
+    train_args["batch"] = effective_batch
+
+    flat_batch_policy = {
+        "requested_batch_size": batch_policy["requested_batch_size"],
+        "effective_batch_size": batch_policy["effective_batch_size"],
+        "batch_policy": batch_policy["batch_policy"],
+    }
+    if "gpu_total_memory_gb" in batch_policy:
+        flat_batch_policy["gpu_total_memory_gb"] = batch_policy["gpu_total_memory_gb"]
+
+    if device != "cpu":
+        return {**dataloader_policy, **flat_batch_policy}
 
     max_threads = max(1, settings.training_cpu_max_threads)
     os.environ.setdefault("OMP_NUM_THREADS", str(max_threads))
@@ -195,7 +528,8 @@ def _apply_training_resource_policy(
         pass
     return {
         "resource_policy": "cpu_limited",
-        "effective_workers": train_args.get("workers", 0),
+        **dataloader_policy,
+        **flat_batch_policy,
         "cpu_threads": max_threads,
     }
 
@@ -264,7 +598,9 @@ def register_model_version(
     model.mlflow_run_id = run.mlflow_run_id
     model.artifact_uri = result.get("artifact_uri") or _best_artifact_uri(result.get("artifacts") or [])
     model.metrics = _normalize_metrics(result.get("metrics") or run.metrics or {})
-    model.params = {**(result.get("params") or training_params(_payload_from_run(run), release)), **_release_project_payload(db, release)}
+    model.params = sanitize_json_dict(
+        {**(result.get("params") or training_params(_payload_from_run(run), release)), **_release_project_payload(db, release)}
+    )
     model.status = "registered"
     db.add(model)
     db.flush()
@@ -647,20 +983,14 @@ def _update_run(
     run.status = status
     run.progress = progress
     if metrics:
-        run.metrics = {**(run.metrics or {}), **metrics}
+        run.metrics = sanitize_json_dict({**(run.metrics or {}), **metrics})
     db.add(run)
     db.commit()
     db.refresh(run)
 
 
 def _normalize_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
-    normalized: dict[str, Any] = {}
-    for key, value in metrics.items():
-        if isinstance(value, (int, float)):
-            normalized[str(key)] = float(value)
-        else:
-            normalized[str(key)] = value
-    return normalized
+    return sanitize_json_dict(metrics)
 
 
 def _artifact_rows(path: Path, base_uri: str) -> list[dict[str, Any]]:
@@ -687,9 +1017,12 @@ def _best_artifact_uri(artifacts: list[dict[str, Any]]) -> str | None:
 
 def _put_float(metrics: dict[str, float], key: str, value: Any) -> None:
     try:
-        metrics[key] = float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return
+    if not math.isfinite(parsed):
+        return
+    metrics[key] = parsed
 
 
 def _report(
@@ -699,7 +1032,8 @@ def _report(
     metrics: dict[str, Any] | None = None,
 ) -> None:
     if callback is not None:
+        safe_metrics = sanitize_json_dict(metrics) if metrics is not None else None
         try:
-            callback(progress, detail, metrics)
+            callback(progress, detail, safe_metrics)
         except TypeError:
             callback(progress, detail)  # type: ignore[misc]

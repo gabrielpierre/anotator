@@ -25,12 +25,18 @@ from app.models import ArtifactRecord, AuditEvent, DatasetRelease, JobRecord, Mo
 from app.schemas import TrainingRunCreate, TrainingRunRead
 from app.services.artifacts import S3ArtifactStore, parse_s3_uri
 from app.services.jobs import attach_celery_task, cancel_job, create_job, fail_stale_active_jobs
-from app.services.training import ensure_training_device_available, normalize_training_device
+from app.services.training import (
+    effective_training_batch_size,
+    effective_training_workers,
+    ensure_training_device_available,
+    normalize_training_device,
+)
 from app.tasks import training_run_task
 
 router = APIRouter()
 FINAL_RUN_STATUSES = {"succeeded", "failed", "canceled"}
 ACTIVE_JOB_STATUSES = {"queued", "running", "paused"}
+RETRYABLE_RUN_STATUSES = {"failed", "canceled"}
 
 
 @router.get("", response_model=list[TrainingRunRead])
@@ -81,16 +87,26 @@ def create_training_run(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     settings = get_settings()
-    workers = payload.workers
-    if device == "cpu":
-        workers = min(workers, max(0, settings.training_cpu_max_workers))
+    workers, dataloader_policy = effective_training_workers(payload.workers, device, settings)
+    batch_size, batch_policy = effective_training_batch_size(
+        payload.batch_size,
+        payload.base_model,
+        payload.image_size,
+        device,
+        settings,
+    )
+    resource_policy = _training_resource_policy(payload.config, device, dataloader_policy, batch_policy)
     run_config = {
         **payload.config,
         "epochs": payload.epochs,
         "image_size": payload.image_size,
-        "batch_size": payload.batch_size,
+        "requested_batch_size": payload.batch_size,
+        "batch_size": batch_size,
         "device": device,
+        "requested_workers": payload.workers,
         "workers": workers,
+        "dataloader": dataloader_policy,
+        "resource_policy": resource_policy,
         "patience": payload.patience,
         "seed": payload.seed,
     }
@@ -190,6 +206,96 @@ def stop_training_run(
     )
     db.add(run)
     db.commit()
+    db.refresh(run)
+    return run
+
+
+@router.post("/{run_id}/retry", response_model=TrainingRunRead)
+def retry_training_run(
+    run_id: str,
+    db: Session = Depends(db_session),
+    actor: User = Depends(current_user),
+) -> TrainingRun:
+    fail_stale_active_jobs(db)
+    run = require_training_access(db, actor, run_id)
+    if run.status not in RETRYABLE_RUN_STATUSES:
+        raise HTTPException(status_code=409, detail="Only failed or canceled training runs can be retried")
+
+    release = require_release_access(db, actor, run.dataset_release_id)
+    if not release.immutable or release.status != "ready" or not release.artifact_uri:
+        raise HTTPException(
+            status_code=409,
+            detail="Training requires an immutable ready DatasetRelease with exported artifacts",
+        )
+
+    device = _device_from_training_config(run.config)
+    try:
+        ensure_training_device_available(device)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    settings = get_settings()
+    requested_workers = int((run.config or {}).get("requested_workers", (run.config or {}).get("workers", 8)))
+    workers, dataloader_policy = effective_training_workers(requested_workers, device, settings)
+    requested_batch = int((run.config or {}).get("requested_batch_size", (run.config or {}).get("batch_size", 16)))
+    image_size = int((run.config or {}).get("image_size", (run.config or {}).get("imgsz", 640)))
+    batch_size, batch_policy = effective_training_batch_size(
+        requested_batch,
+        run.base_model,
+        image_size,
+        device,
+        settings,
+    )
+
+    latest_job = _latest_training_job(db, run.id)
+    for job in _training_jobs(db, run.id):
+        if job.status in ACTIVE_JOB_STATUSES:
+            cancel_job(db, job.id, celery_app=celery_app, reason="Training retried by user")
+
+    run.config = {
+        **(run.config or {}),
+        "requested_workers": requested_workers,
+        "workers": workers,
+        "dataloader": dataloader_policy,
+        "requested_batch_size": requested_batch,
+        "batch_size": batch_size,
+        "resource_policy": _training_resource_policy(run.config, device, dataloader_policy, batch_policy),
+    }
+    run.status = "queued"
+    run.progress = 0
+    run.mlflow_run_id = None
+    run.metrics = _with_training_log({}, "Training retry queued by user.", level="INFO", progress=0)
+    run.artifacts = []
+    db.add(run)
+
+    release_project = project_for_release(db, release)
+    job = create_job(
+        db,
+        kind="training",
+        name=f"Retry: Training {run.base_model}",
+        detail=f"Dataset release {release.name}",
+        raw={
+            "operation": "training_run",
+            "training_run_id": run.id,
+            "retry_of_job_id": latest_job.id if latest_job is not None else None,
+            **project_payload(release_project),
+        },
+    )
+    db.add(
+        AuditEvent(
+            actor=actor.email,
+            action="training_run_retried",
+            target=run.id,
+            payload={
+                "dataset_release_id": run.dataset_release_id,
+                "retry_of_job_id": latest_job.id if latest_job is not None else None,
+                "job_id": job.id,
+            },
+        )
+    )
+    db.commit()
+    task = training_run_task.delay(job.id)
+    attach_celery_task(db, job.id, task.id)
     db.refresh(run)
     return run
 
@@ -358,6 +464,33 @@ def _training_jobs(db: Session, run_id: str) -> list[JobRecord]:
         select(JobRecord).where(JobRecord.kind == "training").order_by(JobRecord.created_at.desc())
     ).all()
     return [job for job in jobs if str((job.raw or {}).get("training_run_id")) == run_id]
+
+
+def _device_from_training_config(config: dict[str, Any] | None) -> str | None:
+    current = config if isinstance(config, dict) else {}
+    resource_policy = current.get("resource_policy")
+    if isinstance(resource_policy, dict) and "device" in resource_policy:
+        return normalize_training_device(resource_policy.get("device"))
+    return normalize_training_device(current.get("device"))
+
+
+def _training_resource_policy(
+    config: dict[str, Any] | None,
+    device: str | None,
+    dataloader_policy: dict[str, Any],
+    batch_policy: dict[str, Any],
+) -> dict[str, Any]:
+    current = config if isinstance(config, dict) else {}
+    existing = current.get("resource_policy")
+    policy = dict(existing) if isinstance(existing, dict) else {}
+    policy.update(
+        {
+            "device": device or "auto",
+            "dataloader": dataloader_policy,
+            "batch": batch_policy,
+        }
+    )
+    return policy
 
 
 def _revoke_training_job(job: JobRecord) -> None:

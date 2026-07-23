@@ -45,9 +45,15 @@ class Settings(BaseSettings):
     default_admin_email: str = Field(default="admin@cvat.plus", alias="DEFAULT_ADMIN_EMAIL")
     default_admin_password: str = Field(default="admin123", alias="DEFAULT_ADMIN_PASSWORD")
     default_admin_name: str = Field(default="Administrador", alias="DEFAULT_ADMIN_NAME")
-    job_stale_after_seconds: int = Field(default=900, alias="JOB_STALE_AFTER_SECONDS")
+    job_stale_after_seconds: int = Field(default=300, alias="JOB_STALE_AFTER_SECONDS")
     training_cpu_max_workers: int = Field(default=2, alias="TRAINING_CPU_MAX_WORKERS")
     training_cpu_max_threads: int = Field(default=4, alias="TRAINING_CPU_MAX_THREADS")
+    training_gpu_max_workers: int = Field(default=4, alias="TRAINING_GPU_MAX_WORKERS")
+    training_gpu_max_batch_size: int = Field(default=8, alias="TRAINING_GPU_MAX_BATCH_SIZE")
+    training_gpu_target_memory_fraction: float = Field(default=0.7, alias="TRAINING_GPU_TARGET_MEMORY_FRACTION")
+    training_min_shm_per_worker_mb: int = Field(default=256, alias="TRAINING_MIN_SHM_PER_WORKER_MB")
+    training_heartbeat_seconds: int = Field(default=20, alias="TRAINING_HEARTBEAT_SECONDS")
+    training_isolate_process: bool = Field(default=True, alias="TRAINING_ISOLATE_PROCESS")
 
     @property
     def cors_origins(self) -> list[str]:

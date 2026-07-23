@@ -36,7 +36,7 @@ No Linux/WSL, o caminho recomendado para uso diario e um unico comando na raiz d
 ./start.sh
 ```
 
-Esse comando sobe o CVAT em `.local/cvat` quando necessario e depois inicia frontend, backend, worker, Postgres, Redis, MinIO e MLflow. Se precisar rebuildar as imagens:
+Esse comando sobe o CVAT em `.local/cvat` quando necessario e depois inicia frontend, backend, worker geral, worker de treino, Postgres, Redis, MinIO e MLflow. Se precisar rebuildar as imagens:
 
 ```bash
 ./start.sh --build
@@ -73,7 +73,7 @@ $env:CVAT_ACCESS_TOKEN = "<token>"
 .\scripts\dev\up.ps1
 ```
 
-O Compose executa `alembic upgrade head` antes de iniciar backend e worker. Para rodar manualmente:
+O Compose executa `alembic upgrade head` antes de iniciar backend e workers. Para rodar manualmente:
 
 ```powershell
 cd backend
@@ -193,9 +193,11 @@ Em uso real, prefira copiar o volume `minio_data` ou configurar mirror externo d
 
 - Backend `401`: faca login novamente ou confira `INTERNAL_API_KEY`/`NEXT_PUBLIC_INTERNAL_API_KEY` em automacoes.
 - CVAT `authenticated=false`: gere novo token no CVAT e reinicie backend/worker.
-- Releases travados em `building`: verifique worker Celery e Redis em `/jobs` e logs do container `worker`.
+- Releases travados em `building`: verifique o worker geral, Redis em `/jobs` e logs do container `worker`.
 - MinIO sem artefatos: confirme `S3_ENDPOINT`, credenciais e bucket `anotator-artifacts`.
-- MLflow sem metricas: confirme `MLFLOW_TRACKING_URI` e logs do worker de treino.
+- MLflow/treino sem metricas: confirme `MLFLOW_TRACKING_URI` e logs do container `worker-training`.
+- Treino parado antes da primeira epoca, com progresso fixo e sem metricas: verifique `/dev/shm` do `worker-training`. PyTorch DataLoader precisa de memoria compartilhada; o Compose local usa `TRAINING_SHM_SIZE=2gb` e limita workers por `TRAINING_GPU_MAX_WORKERS`/`TRAINING_MIN_SHM_PER_WORKER_MB`.
+- Treino marcado como executando depois de processo morto: o backend usa heartbeat (`TRAINING_HEARTBEAT_SECONDS`) e considera jobs sem atualizacao por `JOB_STALE_AFTER_SECONDS` como obsoletos.
 - Frontend sem dados: execute sync CVAT e confirme que o backend tem registros para a rota exibida.
 
 ## Limites conhecidos

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models import AuditEvent, DatasetRelease, JobRecord, PipelineRun, TrainingRun, utcnow
+from app.services.json_safety import sanitize_json_dict
 
 FINAL_JOB_STATUSES = {"succeeded", "failed", "canceled"}
 ACTIVE_JOB_STATUSES = {"queued", "running", "paused"}
@@ -28,6 +29,7 @@ def create_job(
     task_external_id: str | None = None,
     raw: dict[str, Any] | None = None,
 ) -> JobRecord:
+    raw_payload = sanitize_json_dict(raw)
     job = JobRecord(
         kind=kind,
         status="queued",
@@ -35,7 +37,7 @@ def create_job(
         name=name,
         detail=detail,
         task_external_id=task_external_id,
-        raw=raw or {},
+        raw=raw_payload,
     )
     db.add(job)
     db.flush()
@@ -44,7 +46,7 @@ def create_job(
             actor="system",
             action="job_queued",
             target=job.id,
-            payload={"kind": kind, "name": name, "detail": detail, "raw": job.raw},
+            payload=sanitize_json_dict({"kind": kind, "name": name, "detail": detail, "raw": job.raw}),
         )
     )
     db.commit()
@@ -55,7 +57,7 @@ def create_job(
 def attach_celery_task(db: Session, job_id: str, celery_task_id: str) -> JobRecord:
     job = require_job(db, job_id)
     job.external_id = f"celery:{celery_task_id}"
-    job.raw = {**(job.raw or {}), "celery_task_id": celery_task_id}
+    job.raw = sanitize_json_dict({**(job.raw or {}), "celery_task_id": celery_task_id})
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -70,7 +72,7 @@ def mark_job_running(db: Session, job_id: str, detail: str | None = None) -> Job
     job.progress = max(job.progress, 1)
     job.detail = detail or job.detail
     job.started_at = job.started_at or utcnow()
-    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
+    job.resource_metrics = _with_resource_snapshot(sanitize_json_dict(job.resource_metrics or {}))
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -91,9 +93,34 @@ def update_job_progress(
     job.status = "running"
     job.progress = min(99, max(0, progress))
     job.detail = detail or job.detail
+    job.raw = sanitize_json_dict({**(job.raw or {}), "progress_at": utcnow().isoformat()})
     if metrics:
-        job.resource_metrics = {**(job.resource_metrics or {}), **metrics}
-    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
+        job.resource_metrics = sanitize_json_dict({**(job.resource_metrics or {}), **metrics})
+    job.resource_metrics = _with_resource_snapshot(sanitize_json_dict(job.resource_metrics or {}))
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return job
+
+
+def heartbeat_job(
+    db: Session,
+    job_id: str,
+    *,
+    raw_update: dict[str, Any] | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> JobRecord:
+    job = require_job(db, job_id)
+    if job.status in FINAL_JOB_STATUSES:
+        return job
+    now = utcnow()
+    job.resource_metrics = _with_resource_snapshot(sanitize_json_dict({**(job.resource_metrics or {}), **(metrics or {})}))
+    job.raw = sanitize_json_dict({
+        **(job.raw or {}),
+        **(raw_update or {}),
+        "heartbeat_at": now.isoformat(),
+    })
+    job.updated_at = now
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -115,15 +142,15 @@ def succeed_job(
     job.detail = detail or job.detail
     job.finished_at = utcnow()
     if raw_update:
-        job.raw = {**(job.raw or {}), **raw_update}
-    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
+        job.raw = sanitize_json_dict({**(job.raw or {}), **raw_update})
+    job.resource_metrics = _with_resource_snapshot(sanitize_json_dict(job.resource_metrics or {}))
     db.add(job)
     db.add(
         AuditEvent(
             actor="system",
             action="job_succeeded",
             target=job.id,
-            payload={"kind": job.kind, "raw": job.raw},
+            payload=sanitize_json_dict({"kind": job.kind, "raw": job.raw}),
         )
     )
     db.commit()
@@ -145,8 +172,8 @@ def fail_job(
     job.detail = reason
     job.finished_at = utcnow()
     if raw_update:
-        job.raw = {**(job.raw or {}), **raw_update}
-    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
+        job.raw = sanitize_json_dict({**(job.raw or {}), **raw_update})
+    job.resource_metrics = _with_resource_snapshot(sanitize_json_dict(job.resource_metrics or {}))
     db.add(job)
     db.add(
         AuditEvent(
@@ -154,7 +181,7 @@ def fail_job(
             action="job_failed",
             target=job.id,
             reason=reason,
-            payload={"kind": job.kind, "raw": job.raw},
+            payload=sanitize_json_dict({"kind": job.kind, "raw": job.raw}),
         )
     )
     db.commit()
@@ -180,7 +207,7 @@ def cancel_job(
     job.status = "canceled"
     job.detail = reason
     job.finished_at = utcnow()
-    job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
+    job.resource_metrics = _with_resource_snapshot(sanitize_json_dict(job.resource_metrics or {}))
     db.add(job)
     _cancel_linked_resource(db, job)
     db.add(
@@ -189,7 +216,7 @@ def cancel_job(
             action="job_canceled",
             target=job.id,
             reason=reason,
-            payload={"kind": job.kind, "raw": job.raw},
+            payload=sanitize_json_dict({"kind": job.kind, "raw": job.raw}),
         )
     )
     db.commit()
@@ -223,8 +250,8 @@ def fail_stale_active_jobs(db: Session) -> list[JobRecord]:
         job.status = "failed"
         job.detail = reason
         job.finished_at = utcnow()
-        job.raw = {**(job.raw or {}), "stale": True, "stale_after_seconds": stale_after_seconds}
-        job.resource_metrics = _with_resource_snapshot(job.resource_metrics or {})
+        job.raw = sanitize_json_dict({**(job.raw or {}), "stale": True, "stale_after_seconds": stale_after_seconds})
+        job.resource_metrics = _with_resource_snapshot(sanitize_json_dict(job.resource_metrics or {}))
         db.add(job)
         _fail_linked_resource(db, job, reason)
         db.add(
@@ -233,7 +260,7 @@ def fail_stale_active_jobs(db: Session) -> list[JobRecord]:
                 action="job_failed_stale",
                 target=job.id,
                 reason=reason,
-                payload={"kind": job.kind, "raw": job.raw},
+                payload=sanitize_json_dict({"kind": job.kind, "raw": job.raw}),
             )
         )
     db.commit()
@@ -269,7 +296,7 @@ def _cancel_linked_resource(db: Session, job: JobRecord) -> None:
         release = db.get(DatasetRelease, str(release_id))
         if release is not None and release.status not in {"ready", "failed", "canceled"}:
             release.status = "canceled"
-            release.snapshot = {**(release.snapshot or {}), "error": "Release job canceled"}
+            release.snapshot = sanitize_json_dict({**(release.snapshot or {}), "error": "Release job canceled"})
             db.add(release)
 
     training_run_id = raw.get("training_run_id")
@@ -292,7 +319,9 @@ def _cancel_linked_resource(db: Session, job: JobRecord) -> None:
                 release = db.get(DatasetRelease, str(derived_release_id))
                 if release is not None and release.status not in {"ready", "failed", "canceled"}:
                     release.status = "canceled"
-                    release.snapshot = {**(release.snapshot or {}), "error": "Pipeline job canceled"}
+                    release.snapshot = sanitize_json_dict(
+                        {**(release.snapshot or {}), "error": "Pipeline job canceled"}
+                    )
                     db.add(release)
 
 
@@ -303,7 +332,7 @@ def _fail_linked_resource(db: Session, job: JobRecord, reason: str) -> None:
         release = db.get(DatasetRelease, str(release_id))
         if release is not None and release.status not in {"ready", "failed", "canceled"}:
             release.status = "failed"
-            release.snapshot = {**(release.snapshot or {}), "error": reason}
+            release.snapshot = sanitize_json_dict({**(release.snapshot or {}), "error": reason})
             db.add(release)
 
     training_run_id = raw.get("training_run_id")
@@ -312,7 +341,7 @@ def _fail_linked_resource(db: Session, job: JobRecord, reason: str) -> None:
         if run is not None and run.status not in FINAL_JOB_STATUSES:
             run.status = "failed"
             run.progress = job.progress
-            run.metrics = {**(run.metrics or {}), "status": "failed", "error": reason}
+            run.metrics = sanitize_json_dict({**(run.metrics or {}), "status": "failed", "error": reason})
             db.add(run)
 
     pipeline_run_id = raw.get("pipeline_run_id")
@@ -321,14 +350,14 @@ def _fail_linked_resource(db: Session, job: JobRecord, reason: str) -> None:
         if run is not None and run.status not in FINAL_JOB_STATUSES:
             run.status = "failed"
             run.progress = job.progress
-            run.lineage = {**(run.lineage or {}), "error": reason}
+            run.lineage = sanitize_json_dict({**(run.lineage or {}), "error": reason})
             db.add(run)
             derived_release_id = (run.lineage or {}).get("derived_release_id")
             if derived_release_id:
                 release = db.get(DatasetRelease, str(derived_release_id))
                 if release is not None and release.status not in {"ready", "failed", "canceled"}:
                     release.status = "failed"
-                    release.snapshot = {**(release.snapshot or {}), "error": reason}
+                    release.snapshot = sanitize_json_dict({**(release.snapshot or {}), "error": reason})
                     db.add(release)
 
 
@@ -340,7 +369,7 @@ def _with_resource_snapshot(metrics: dict[str, Any]) -> dict[str, Any]:
         "memory": _memory_snapshot(),
         "gpu": {"available": False, "provider": None},
     }
-    return {**metrics, "snapshots": [*snapshots[-99:], snapshot], "latest": snapshot}
+    return sanitize_json_dict({**metrics, "snapshots": [*snapshots[-99:], snapshot], "latest": snapshot})
 
 
 def _memory_snapshot() -> dict[str, int]:
