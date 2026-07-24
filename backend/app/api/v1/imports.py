@@ -204,16 +204,10 @@ async def upload_import_task_files(
         project = validate_import_quota(db, payload, uploaded_bytes=total_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    previous_uploaded_bytes = _int_value((job.raw or {}).get("upload_storage_bytes")) or 0
-    record_import_storage_usage(
-        db,
-        project,
-        total_bytes,
-        previous_uploaded_bytes=previous_uploaded_bytes,
-    )
     job.raw = {**(job.raw or {}), "upload_artifacts": uploaded, "upload_storage_bytes": total_bytes}
     job.detail = f"Queued upload of {len(uploaded)} files."
     db.add(job)
+    record_import_storage_usage(db, project, total_bytes)
     db.add(
         AuditEvent(
             actor=actor.email,

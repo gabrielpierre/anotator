@@ -30,6 +30,8 @@ type ClassMapping = {
   count: number
 }
 
+type AnnotationImportTarget = "review" | "annotation"
+
 type DatasetProfile = {
   files: File[]
   images: File[]
@@ -163,6 +165,7 @@ export function ImportDatasetDialog({
   const [phase, setPhase] = React.useState<UploadPhase>("idle")
   const [progress, setProgress] = React.useState({ loaded: 0, total: 0, percent: 0 })
   const [mappingEditorOpen, setMappingEditorOpen] = React.useState(false)
+  const [annotationImportTarget, setAnnotationImportTarget] = React.useState<AnnotationImportTarget>("review")
   const analysisToken = React.useRef(0)
 
   const selectedProject = React.useMemo(
@@ -202,6 +205,7 @@ export function ImportDatasetDialog({
     setPhase("idle")
     setProgress({ loaded: 0, total: 0, percent: 0 })
     setMappingEditorOpen(false)
+    setAnnotationImportTarget("review")
     analysisToken.current += 1
   }, [activeProject?.id, initialProjectId, open, projects])
 
@@ -285,6 +289,7 @@ export function ImportDatasetDialog({
           color: mapping.color,
           count: mapping.count,
         })),
+        annotation_import_target: profile.annotationFiles > 0 ? annotationImportTarget : "annotation",
         sync_after_import: true,
       })
       setPhase("uploading")
@@ -441,6 +446,14 @@ export function ImportDatasetDialog({
               />
             )}
 
+            {profile && profile.annotationFiles > 0 && (
+              <AnnotationImportTargetControl
+                value={annotationImportTarget}
+                disabled={busy || Boolean(result)}
+                onChange={setAnnotationImportTarget}
+              />
+            )}
+
             {mappings.length > 0 && (
               <ClassMappingControl
                 open={mappingEditorOpen}
@@ -494,6 +507,63 @@ export function ImportDatasetDialog({
           </div>
         </div>
       </form>
+    </div>
+  )
+}
+
+function AnnotationImportTargetControl({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: AnnotationImportTarget
+  disabled: boolean
+  onChange: (value: AnnotationImportTarget) => void
+}) {
+  const options: Array<{ value: AnnotationImportTarget; label: string; detail: string }> = [
+    {
+      value: "review",
+      label: "Revisão",
+      detail: "Frames anotados entram na fila",
+    },
+    {
+      value: "annotation",
+      label: "Anotação",
+      detail: "Frames anotados abrem para ajuste",
+    },
+  ]
+
+  return (
+    <div className="rounded-xl border border-border bg-muted/20 p-3">
+      <p className="mb-2 text-sm font-medium text-foreground">Destino das anotações importadas</p>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {options.map((option) => {
+          const selected = option.value === value
+          return (
+            <button
+              key={option.value}
+              type="button"
+              disabled={disabled}
+              onClick={() => onChange(option.value)}
+              className={`rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                selected ? "border-brand-blue bg-surface-blue" : "border-border bg-card hover:bg-muted"
+              }`}
+            >
+              <span className="flex items-center gap-2 text-sm font-medium text-foreground">
+                <span
+                  className={`flex size-4 items-center justify-center rounded-full border ${
+                    selected ? "border-brand-blue bg-brand-blue" : "border-border"
+                  }`}
+                >
+                  {selected && <span className="size-1.5 rounded-full bg-white" />}
+                </span>
+                {option.label}
+              </span>
+              <span className="mt-1 block text-xs text-muted-foreground">{option.detail}</span>
+            </button>
+          )
+        })}
+      </div>
     </div>
   )
 }

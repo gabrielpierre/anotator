@@ -31,6 +31,46 @@ class SyncCounts:
     previews: int = 0
 
 
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, int)):
+        return [str(value)]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item is not None and item != ""]
+    return []
+
+
+def _import_job_task_ids(raw: Any) -> set[str]:
+    if not isinstance(raw, dict):
+        return set()
+
+    task_ids: set[str] = set()
+
+    def add_ids(payload: dict[str, Any], *, include_generic_id: bool = False) -> None:
+        keys = ("cvat_task_id", "task_external_id", "task_id")
+        if include_generic_id:
+            keys += ("id",)
+        for key in keys:
+            task_ids.update(_as_string_list(payload.get(key)))
+        for key in ("cvat_task_ids", "task_external_ids", "task_ids"):
+            task_ids.update(_as_string_list(payload.get(key)))
+
+    add_ids(raw)
+    for container_key in ("payload", "import_manifest"):
+        container = raw.get(container_key)
+        if isinstance(container, dict):
+            add_ids(container)
+            for batch in container.get("batches") or []:
+                if isinstance(batch, dict):
+                    add_ids(batch, include_generic_id=True)
+    for key in ("import_batches", "batches"):
+        for batch in raw.get(key) or []:
+            if isinstance(batch, dict):
+                add_ids(batch, include_generic_id=True)
+    return task_ids
+
+
 def map_cvat_job_state(raw: dict) -> str:
     state = str(raw.get("state") or raw.get("status") or "").lower()
     stage = str(raw.get("stage") or "").lower()
@@ -69,6 +109,7 @@ class CvatSyncService:
         self.db.add(job)
         self.db.commit()
         self.db.refresh(job)
+        sync_job_id = job.id
 
         counts = SyncCounts()
         try:
@@ -116,6 +157,8 @@ class CvatSyncService:
                 )
             )
         except JobCanceled as exc:
+            self.db.rollback()
+            job = self.db.get(JobRecord, sync_job_id) or job
             job.status = "canceled"
             job.detail = str(exc)
             job.finished_at = utcnow()
@@ -131,6 +174,8 @@ class CvatSyncService:
             self.db.commit()
             raise
         except Exception as exc:
+            self.db.rollback()
+            job = self.db.get(JobRecord, sync_job_id) or job
             job.status = "failed"
             job.detail = str(exc)
             job.finished_at = utcnow()
@@ -196,8 +241,7 @@ class CvatSyncService:
             row = self.db.scalar(select(Task).where(Task.external_id == external_id))
             if row is None:
                 row = Task(external_id=external_id, name=enriched.get("name") or f"Task {external_id}")
-            project_id = enriched.get("project_id") or enriched.get("project")
-            row.project_external_id = str(project_id) if project_id is not None else None
+            row.project_external_id = self._task_project_external_id(external_id, enriched, row)
             row.name = enriched.get("name") or row.name
             row.status = str(enriched.get("status") or "unknown")
             row.size = int(enriched.get("size") or enriched.get("data_chunk_size") or 0)
@@ -251,9 +295,62 @@ class CvatSyncService:
                         SyncError(scope="job_annotations", external_id=external_id, message=message)
                     )
             except Exception as exc:
+                if not self.db.is_active:
+                    self.db.rollback()
                 self._record_error("job_annotations", external_id, exc)
         self.db.commit()
         return counts
+
+    def _task_project_external_id(
+        self,
+        task_external_id: str,
+        task_payload: dict[str, Any],
+        task: Task | None,
+    ) -> str | None:
+        project_value = task_payload.get("project_id") or task_payload.get("project")
+        if isinstance(project_value, dict):
+            project_value = project_value.get("id") or project_value.get("external_id")
+        if project_value is not None and project_value != "":
+            project = self._resolve_project_candidate(project_value)
+            return project.external_id if project is not None else str(project_value)
+
+        # Directly imported CVAT tasks have no CVAT project. Keep the local
+        # project assigned at import time instead of clearing it during sync.
+        if task is not None and task.project_external_id:
+            return task.project_external_id
+
+        return self._project_external_id_from_import_job(task_external_id)
+
+    def _project_external_id_from_import_job(self, task_external_id: str) -> str | None:
+        import_jobs = self.db.scalars(
+            select(JobRecord)
+            .where(JobRecord.kind == "import")
+            .order_by(JobRecord.updated_at.desc())
+            .limit(500)
+        ).all()
+        for import_job in import_jobs:
+            raw = import_job.raw if isinstance(import_job.raw, dict) else {}
+            if task_external_id not in _import_job_task_ids(raw):
+                continue
+            payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
+            for candidate in (
+                raw.get("project_external_id"),
+                payload.get("project_external_id"),
+                payload.get("project_id"),
+                raw.get("project_id"),
+            ):
+                project = self._resolve_project_candidate(candidate)
+                if project is not None:
+                    return project.external_id
+        return None
+
+    def _resolve_project_candidate(self, candidate: Any) -> Project | None:
+        if candidate is None or candidate == "":
+            return None
+        value = str(candidate)
+        return self.db.get(Project, value) or self.db.scalar(
+            select(Project).where(Project.external_id == value)
+        )
 
     def _task_detail(self, external_id: str, raw: dict) -> dict:
         try:

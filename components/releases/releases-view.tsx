@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Check, ChevronRight, Database, Download, GitBranch, Package, Search, Trash2, X } from "lucide-react"
+import { Check, ChevronRight, Database, Download, GitBranch, Images, ListChecks, Package, Search, Trash2, X } from "lucide-react"
 
 import { PageHeader, StatusBadge } from "@/components/app/primitives"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/snowui/card"
@@ -20,6 +20,8 @@ import { formatDateTimePt, formatPtNumber } from "@/lib/api/status"
 import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendDatasetRelease, BackendTask } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
+
+type ReleaseImageScope = "all" | "annotated"
 
 export function ReleasesView() {
   const [backendReleases, setBackendReleases] = React.useState<BackendDatasetRelease[] | null>(null)
@@ -64,7 +66,7 @@ export function ReleasesView() {
     return () => window.clearInterval(interval)
   }, [buildingCount, reload])
 
-  const handleCreateRelease = async (payload: { name: string; taskExternalIds: string[] }) => {
+  const handleCreateRelease = async (payload: { name: string; taskExternalIds: string[]; imageScope: ReleaseImageScope }) => {
     if (!payload.taskExternalIds.length || creating) return
     setCreating(true)
     setError(null)
@@ -74,6 +76,7 @@ export function ReleasesView() {
         project_id: currentProject?.id ?? null,
         task_external_ids: payload.taskExternalIds,
         include_images: true,
+        image_scope: payload.imageScope,
         export_format: "CVAT for images 1.1",
       })
       setBackendReleases((current) => [release, ...(current ?? [])])
@@ -155,82 +158,128 @@ export function ReleasesView() {
       </div>
 
       <div className="grid grid-cols-1 gap-6">
-        <Card>
-          <CardHeader>
-            <CardTitle>Historico de releases</CardTitle>
+        <Card className="overflow-hidden p-0">
+          <CardHeader className="mb-0 border-b border-border px-6 py-5">
+            <div>
+              <CardTitle>Historico de releases</CardTitle>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {formatPtNumber(realReleases.length)} versoes imutaveis deste projeto
+              </p>
+            </div>
           </CardHeader>
-          <CardContent className="flex flex-col gap-3">
+          <CardContent className="p-0">
             {realReleases.length
-              ? realReleases.map((release) => {
-                  const counts = snapshotCounts(release.snapshot)
-                  const selected = release.id === selectedRelease?.id
-                  const deleting = deletingReleaseId === release.id
-                  const artifacts = snapshotArtifacts(release.snapshot)
-                  return (
-                    <div
-                      key={release.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => setSelectedReleaseId(release.id)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter" || event.key === " ") setSelectedReleaseId(release.id)
-                      }}
-                      className={cn(
-                        "flex cursor-pointer flex-wrap items-center justify-between gap-4 rounded-xl border p-4 text-left transition-colors focus:outline-none focus:ring-2 focus:ring-brand-blue/30",
-                        selected ? "border-brand-blue bg-surface-blue" : "border-border hover:bg-muted/40",
-                      )}
-                    >
-                      <div className="flex items-center gap-3">
-                        <span className="flex size-10 items-center justify-center rounded-lg bg-background text-brand-blue">
-                          <GitBranch className="size-5" />
-                        </span>
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="font-medium text-foreground">{release.name}</span>
-                            <StatusBadge status={releaseStatus(release.status)} />
-                          </div>
-                          <span className="text-xs text-muted-foreground">
-                            Criado em {formatDateTimePt(release.created_at)} -{" "}
-                            {formatPtNumber(counts.images ?? 0)} imagens -{" "}
-                            {formatPtNumber(counts.annotations ?? 0)} objetos
-                          </span>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-3">
-                        <span className="text-sm tabular-nums text-muted-foreground">
-                          {formatPtNumber(artifacts.length)} arquivo{artifacts.length === 1 ? "" : "s"}
-                        </span>
-                        <Button
-                          variant="destructive"
-                          size="sm"
-                          aria-label={`Excluir release ${release.name}`}
-                          disabled={Boolean(deletingReleaseId)}
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            void handleDeleteRelease(release)
-                          }}
-                        >
-                          <Trash2 className="size-3.5" />
-                          {deleting ? "Excluindo..." : "Excluir"}
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          aria-label="Baixar release"
-                          disabled={!release.artifact_uri}
-                          onClick={(event) => {
-                            event.stopPropagation()
-                            void downloadBackendFile(datasetReleaseDownloadPath(release.id), `${release.name}.zip`)
-                          }}
-                        >
-                          <Download className="size-4" />
-                        </Button>
-                        <ChevronRight className={cn("size-4", selected ? "text-brand-blue" : "text-muted-foreground")} />
-                      </div>
+              ? (
+                <div className="overflow-x-auto">
+                  <div className="min-w-[920px]">
+                    <div className="grid grid-cols-[minmax(260px,1fr)_128px_104px_104px_104px_160px_132px] items-center border-b border-border bg-muted/20 px-6 py-2.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      <span>Release</span>
+                      <span>Status</span>
+                      <span className="text-right">Imagens</span>
+                      <span className="text-right">Objetos</span>
+                      <span className="text-right">Arquivos</span>
+                      <span>Criado em</span>
+                      <span className="text-right">Acoes</span>
                     </div>
-                  )
-                })
-              : <p className="text-sm text-muted-foreground">Nenhum release sincronizado.</p>}
+                    <div className="divide-y divide-border">
+                      {realReleases.map((release) => {
+                        const counts = snapshotCounts(release.snapshot)
+                        const selected = release.id === selectedRelease?.id
+                        const deleting = deletingReleaseId === release.id
+                        const artifacts = snapshotArtifacts(release.snapshot)
+                        return (
+                          <div
+                            key={release.id}
+                            role="button"
+                            tabIndex={0}
+                            aria-selected={selected}
+                            onClick={() => setSelectedReleaseId(release.id)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") setSelectedReleaseId(release.id)
+                            }}
+                            className={cn(
+                              "relative grid min-h-16 cursor-pointer grid-cols-[minmax(260px,1fr)_128px_104px_104px_104px_160px_132px] items-center px-6 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-brand-blue/30",
+                              selected ? "bg-brand-blue/[0.055]" : "hover:bg-muted/30",
+                            )}
+                          >
+                            <span
+                              className={cn(
+                                "absolute bottom-3 left-0 top-3 w-1 rounded-r-full",
+                                selected ? "bg-brand-blue" : "bg-transparent",
+                              )}
+                            />
+                            <div className="flex min-w-0 items-center gap-3 py-3 pr-4">
+                              <GitBranch
+                                className={cn(
+                                  "size-4 shrink-0",
+                                  selected ? "text-brand-blue" : "text-muted-foreground",
+                                )}
+                              />
+                              <div className="min-w-0">
+                                <p className="truncate font-medium text-foreground">{release.name}</p>
+                                <p className="truncate text-xs text-muted-foreground">
+                                  {releaseImageScopeLabel(release.snapshot)}
+                                </p>
+                              </div>
+                            </div>
+                            <div className="py-3 pr-4">
+                              <StatusBadge status={releaseStatus(release.status)} />
+                            </div>
+                            <span className="py-3 pr-4 text-right text-sm tabular-nums text-foreground">
+                              {formatPtNumber(counts.images ?? 0)}
+                            </span>
+                            <span className="py-3 pr-4 text-right text-sm tabular-nums text-foreground">
+                              {formatPtNumber(counts.annotations ?? 0)}
+                            </span>
+                            <span className="py-3 pr-4 text-right text-sm tabular-nums text-muted-foreground">
+                              {formatPtNumber(artifacts.length)}
+                            </span>
+                            <span className="py-3 pr-4 text-sm text-muted-foreground">
+                              {formatDateTimePt(release.created_at)}
+                            </span>
+                            <div className="flex items-center justify-end gap-1 py-3">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                aria-label={`Excluir release ${release.name}`}
+                                disabled={Boolean(deletingReleaseId)}
+                                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  void handleDeleteRelease(release)
+                                }}
+                              >
+                                <Trash2 className="size-3.5" />
+                                {deleting ? "..." : "Excluir"}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                aria-label="Baixar release"
+                                disabled={!release.artifact_uri}
+                                className="text-muted-foreground hover:text-foreground"
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  void downloadBackendFile(datasetReleaseDownloadPath(release.id), `${release.name}.zip`)
+                                }}
+                              >
+                                <Download className="size-4" />
+                              </Button>
+                              <ChevronRight
+                                className={cn(
+                                  "size-4 shrink-0",
+                                  selected ? "text-brand-blue" : "text-muted-foreground",
+                                )}
+                              />
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )
+              : <p className="px-6 py-8 text-sm text-muted-foreground">Nenhum release sincronizado.</p>}
           </CardContent>
         </Card>
       </div>
@@ -249,18 +298,20 @@ function CreateReleaseModal({
   tasks: BackendTask[]
   creating: boolean
   onClose: () => void
-  onCreate: (payload: { name: string; taskExternalIds: string[] }) => void
+  onCreate: (payload: { name: string; taskExternalIds: string[]; imageScope: ReleaseImageScope }) => void
 }) {
   const defaultName = React.useMemo(() => `release_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "")}`, [open])
   const [name, setName] = React.useState(defaultName)
   const [query, setQuery] = React.useState("")
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set())
+  const [imageScope, setImageScope] = React.useState<ReleaseImageScope>("annotated")
 
   React.useEffect(() => {
     if (!open) return
     setName(defaultName)
     setQuery("")
     setSelectedIds(new Set(tasks.map((task) => task.external_id)))
+    setImageScope("annotated")
   }, [defaultName, open, tasks])
 
   React.useEffect(() => {
@@ -276,6 +327,11 @@ function CreateReleaseModal({
     const needle = `${task.name} ${task.external_id}`.toLowerCase()
     return needle.includes(query.trim().toLowerCase())
   })
+  const selectedTasks = tasks.filter((task) => selectedIds.has(task.external_id))
+  const selectedTotalImages = selectedTasks.reduce((sum, task) => sum + Math.max(0, task.size || 0), 0)
+  const selectedAnnotatedImages = selectedTasks.reduce((sum, task) => sum + taskAnnotatedImageCount(task), 0)
+  const releaseImageTotal = imageScope === "annotated" ? selectedAnnotatedImages : selectedTotalImages
+  const annotatedScopeEmpty = imageScope === "annotated" && selectedIds.size > 0 && selectedAnnotatedImages === 0
   function toggleTask(taskId: string) {
     setSelectedIds((current) => {
       const next = new Set(current)
@@ -329,6 +385,60 @@ function CreateReleaseModal({
             </label>
 
             <div className="flex flex-col gap-3 rounded-2xl border border-border p-4">
+              <div>
+                <h3 className="text-sm font-semibold text-foreground">Escopo das imagens</h3>
+                <p className="text-xs text-muted-foreground">
+                  {formatPtNumber(releaseImageTotal)} imagens entram na release
+                </p>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => setImageScope("annotated")}
+                  aria-pressed={imageScope === "annotated"}
+                  className={cn(
+                    "flex min-h-24 items-start gap-3 rounded-xl border p-3 text-left transition-colors",
+                    imageScope === "annotated" ? "border-brand-blue bg-surface-blue" : "border-border hover:bg-muted/50",
+                  )}
+                >
+                  <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-background text-brand-blue">
+                    <ListChecks className="size-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-2 text-sm font-medium text-foreground">
+                      Somente anotadas
+                      <span className="rounded-full bg-brand-blue/10 px-1.5 py-0.5 text-[10px] font-semibold text-brand-blue">
+                        Recomendado
+                      </span>
+                    </span>
+                    <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                      {formatPtNumber(selectedAnnotatedImages)} de {formatPtNumber(selectedTotalImages)} imagens selecionadas
+                    </span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setImageScope("all")}
+                  aria-pressed={imageScope === "all"}
+                  className={cn(
+                    "flex min-h-24 items-start gap-3 rounded-xl border p-3 text-left transition-colors",
+                    imageScope === "all" ? "border-brand-blue bg-surface-blue" : "border-border hover:bg-muted/50",
+                  )}
+                >
+                  <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-background text-brand-blue">
+                    <Images className="size-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-medium text-foreground">Todas as imagens</span>
+                    <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                      {formatPtNumber(selectedTotalImages)} imagens, incluindo frames sem objeto
+                    </span>
+                  </span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-3 rounded-2xl border border-border p-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h3 className="text-sm font-semibold text-foreground">Lotes disponíveis</h3>
@@ -379,7 +489,7 @@ function CreateReleaseModal({
                       <span className="min-w-0 flex-1">
                         <span className="block truncate text-sm font-medium text-foreground">{task.name}</span>
                         <span className="block truncate text-xs text-muted-foreground">
-                          {formatPtNumber(task.size)} imagens · {formatPtNumber(taskAnnotationCount(task))} objetos · CVAT #{task.external_id}
+                          {formatPtNumber(task.size)} imagens · {formatPtNumber(taskAnnotatedImageCount(task))} anotadas · {formatPtNumber(taskAnnotationCount(task))} objetos · CVAT #{task.external_id}
                         </span>
                       </span>
                     </button>
@@ -397,16 +507,25 @@ function CreateReleaseModal({
         </div>
 
         <div className="flex items-center justify-between gap-3 border-t border-border p-5">
-          <p className="text-sm text-muted-foreground">
-            {selectedIds.size ? `${formatPtNumber(selectedIds.size)} lotes selecionados` : "Selecione pelo menos um lote"}
-          </p>
+          <div className="min-w-0 text-sm text-muted-foreground">
+            <p>
+              {selectedIds.size
+                ? `${formatPtNumber(selectedIds.size)} lotes · ${formatPtNumber(releaseImageTotal)} imagens na release`
+                : "Selecione pelo menos um lote"}
+            </p>
+            {annotatedScopeEmpty && (
+              <p className="mt-0.5 text-xs text-destructive">
+                Nenhuma imagem anotada nos lotes selecionados.
+              </p>
+            )}
+          </div>
           <div className="flex gap-2">
             <Button variant="outline" onClick={onClose} disabled={creating}>
               Cancelar
             </Button>
             <Button
-              onClick={() => onCreate({ name: name.trim(), taskExternalIds: Array.from(selectedIds) })}
-              disabled={creating || !selectedIds.size || !name.trim()}
+              onClick={() => onCreate({ name: name.trim(), taskExternalIds: Array.from(selectedIds), imageScope })}
+              disabled={creating || !selectedIds.size || !name.trim() || annotatedScopeEmpty}
             >
               <Package className="size-4" />
               {creating ? "Criando..." : "Criar release"}
@@ -425,6 +544,12 @@ function snapshotCounts(snapshot: Record<string, unknown>) {
 
 function snapshotArtifacts(snapshot: Record<string, unknown>) {
   return Array.isArray(snapshot.artifacts) ? (snapshot.artifacts as Record<string, unknown>[]) : []
+}
+
+function releaseImageScopeLabel(snapshot: Record<string, unknown>) {
+  return snapshot.image_scope === "annotated"
+    ? "Somente imagens anotadas"
+    : "Todas as imagens dos lotes"
 }
 
 function taskAnnotationCount(task: BackendTask) {
@@ -446,6 +571,23 @@ function taskAnnotationCount(task: BackendTask) {
     if (number !== null) return number
   }
   return 0
+}
+
+function taskAnnotatedImageCount(task: BackendTask) {
+  const raw = task.raw && typeof task.raw === "object" ? task.raw : {}
+  const progress = raw.annotation_progress && typeof raw.annotation_progress === "object" ? raw.annotation_progress as Record<string, unknown> : {}
+  const datasetImport = raw.dataset_import && typeof raw.dataset_import === "object" ? raw.dataset_import as Record<string, unknown> : {}
+  const candidates = [
+    progress.annotated_images,
+    datasetImport.annotated_frames,
+    raw.annotated_images,
+    raw.annotated_frames,
+  ]
+  for (const value of candidates) {
+    const number = metricNumber(value)
+    if (number !== null) return Math.min(Math.max(0, number), Math.max(0, task.size || 0))
+  }
+  return taskAnnotationCount(task) > 0 ? Math.min(1, Math.max(0, task.size || 0)) : 0
 }
 
 function metricNumber(value: unknown): number | null {

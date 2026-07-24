@@ -289,6 +289,24 @@ export function AnnotateView() {
   const currentTaskId = currentTask?.external_id ?? currentTask?.id
   const currentFrameKey = `${currentTaskId ?? "no-task"}:${currentFrame}`
   const previewSrc = taskFrameAssetUrl(currentTaskId, currentFrame) ?? "/placeholder.svg"
+  const blockedAnnotationFrames = useMemo(() => {
+    const frames = new Set<number>()
+    for (const state of taskMeta?.frame_workflow_states ?? []) {
+      if (state.status === "review_pending" || state.status === "approved") {
+        frames.add(state.frame)
+      }
+    }
+    if (taskAnnotationImportTarget(currentTask) === "review") {
+      for (const frame of annotatedFrames) frames.add(frame)
+    }
+    return frames
+  }, [annotatedFrames, currentTask, taskMeta?.frame_workflow_states])
+  const hasAnnotatableFrame = useMemo(() => {
+    for (let frame = 0; frame < totalImages; frame += 1) {
+      if (!blockedAnnotationFrames.has(frame)) return true
+    }
+    return false
+  }, [blockedAnnotationFrames, totalImages])
   const knownAnnotatedFrames = useMemo(() => {
     const frames = new Set(annotatedFrames)
     if (!currentTaskId) return frames
@@ -301,38 +319,91 @@ export function AnnotateView() {
     }
     return frames
   }, [annotatedFrames, currentTaskId, shapesByFrame])
-  const findUnannotatedImage = useCallback(
-    (fromIndex: number, direction: -1 | 1) => {
-      for (let index = fromIndex + direction; index >= 1 && index <= totalImages; index += direction) {
-        if (!knownAnnotatedFrames.has(index - 1)) return index
+  const frameAvailableForAnnotation = useCallback(
+    (frame: number) => !blockedAnnotationFrames.has(frame),
+    [blockedAnnotationFrames],
+  )
+  const findAnnotationImage = useCallback(
+    (fromIndex: number, direction: -1 | 1, includeCurrent = false, onlyUnannotatedFilter = onlyUnannotated) => {
+      for (
+        let index = includeCurrent ? fromIndex : fromIndex + direction;
+        index >= 1 && index <= totalImages;
+        index += direction
+      ) {
+        const frame = index - 1
+        if (!frameAvailableForAnnotation(frame)) continue
+        if (onlyUnannotatedFilter && knownAnnotatedFrames.has(frame)) continue
+        return index
       }
       return null
     },
-    [knownAnnotatedFrames, totalImages],
+    [frameAvailableForAnnotation, knownAnnotatedFrames, onlyUnannotated, totalImages],
   )
+  const annotationQueueImages = useMemo(() => {
+    const images: number[] = []
+    for (let index = 1; index <= totalImages; index += 1) {
+      const frame = index - 1
+      if (!frameAvailableForAnnotation(frame)) continue
+      if (onlyUnannotated && knownAnnotatedFrames.has(frame)) continue
+      images.push(index)
+    }
+    return images
+  }, [frameAvailableForAnnotation, knownAnnotatedFrames, onlyUnannotated, totalImages])
+  const currentQueuePosition = annotationQueueImages.indexOf(imageIndex)
+  const currentQueueNumber =
+    annotationQueueImages.length === 0
+      ? 0
+      : currentQueuePosition >= 0
+        ? currentQueuePosition + 1
+        : Math.min(imageIndex, annotationQueueImages.length)
+  const visibleQueueImages = useMemo(() => {
+    const windowSize = Math.min(10, annotationQueueImages.length)
+    if (windowSize === 0) return []
+    const anchorIndex = currentQueuePosition >= 0 ? currentQueuePosition : 0
+    const windowStart = Math.max(0, Math.min(anchorIndex - 4, annotationQueueImages.length - windowSize))
+    return annotationQueueImages.slice(windowStart, windowStart + windowSize)
+  }, [annotationQueueImages, currentQueuePosition])
   const navigateImage = useCallback(
     (direction: -1 | 1, step = 1) => {
       setImageIndex((index) => {
-        if (!onlyUnannotated) return Math.min(totalImages, Math.max(1, index + direction * step))
         let nextIndex = index
         for (let count = 0; count < step; count += 1) {
-          const candidate = findUnannotatedImage(nextIndex, direction)
+          const candidate = findAnnotationImage(nextIndex, direction)
           if (!candidate) break
           nextIndex = candidate
         }
         return nextIndex
       })
     },
-    [findUnannotatedImage, onlyUnannotated, totalImages],
+    [findAnnotationImage],
   )
-  const canGoPrevious = onlyUnannotated ? findUnannotatedImage(imageIndex, -1) != null : imageIndex > 1
-  const canGoNext = onlyUnannotated ? findUnannotatedImage(imageIndex, 1) != null : imageIndex < totalImages
+  const canGoPrevious = findAnnotationImage(imageIndex, -1) != null
+  const canGoNext = findAnnotationImage(imageIndex, 1) != null
   const toggleOnlyUnannotated = (checked: boolean) => {
     setOnlyUnannotated(checked)
     if (!checked || !knownAnnotatedFrames.has(currentFrame)) return
-    const nextImage = findUnannotatedImage(imageIndex, 1) ?? findUnannotatedImage(imageIndex, -1)
+    const nextImage =
+      findAnnotationImage(imageIndex, 1, false, checked) ??
+      findAnnotationImage(imageIndex, -1, false, checked)
     if (nextImage) setImageIndex(nextImage)
   }
+
+  useEffect(() => {
+    if (totalImages <= 0) return
+    if (frameAvailableForAnnotation(currentFrame) && (!onlyUnannotated || !knownAnnotatedFrames.has(currentFrame))) return
+    const nextImage =
+      findAnnotationImage(imageIndex, 1, true) ??
+      findAnnotationImage(imageIndex, -1)
+    if (nextImage) setImageIndex(nextImage)
+  }, [
+    currentFrame,
+    findAnnotationImage,
+    frameAvailableForAnnotation,
+    imageIndex,
+    knownAnnotatedFrames,
+    onlyUnannotated,
+    totalImages,
+  ])
   const [naturalFrameDimensionsByKey, setNaturalFrameDimensionsByKey] = useState<Record<string, FrameDimensions>>({})
   const currentFrameDimensions = useMemo(
     () => frameDimensionsFromMeta(taskMeta, currentFrame) ?? naturalFrameDimensionsByKey[currentFrameKey] ?? null,
@@ -1563,6 +1634,32 @@ export function AnnotateView() {
     )
   }
 
+  if (taskMeta && !hasAnnotatableFrame) {
+    return (
+      <div className="flex h-[calc(100dvh-3.5rem)] items-center justify-center p-6">
+        <div className="flex max-w-md flex-col items-center gap-3 text-center">
+          <span className="flex size-12 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
+            <FolderKanban className="size-6" />
+          </span>
+          <div className="flex flex-col gap-1">
+            <p className="text-base font-medium text-foreground">Este lote está em revisão</p>
+            <p className="text-sm text-muted-foreground">
+              As imagens com anotações importadas foram enviadas para Revisar e não ficam disponíveis para anotação.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button onClick={() => router.push(projectScopedHref("/revisar", activeProjectId))}>
+              Ir para revisar
+            </Button>
+            <Button variant="outline" onClick={() => router.push(projectScopedHref("/dados", activeProjectId))}>
+              Ver dados
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <>
     <div className="flex h-[calc(100dvh-3.5rem)] flex-col lg:flex-row">
@@ -1606,7 +1703,7 @@ export function AnnotateView() {
               <ChevronLeft className="size-4" />
             </Button>
             <span className="tabular-nums text-muted-foreground">
-              {imageIndex.toLocaleString("pt-BR")} / {totalImages.toLocaleString("pt-BR")}
+              {currentQueueNumber.toLocaleString("pt-BR")} / {annotationQueueImages.length.toLocaleString("pt-BR")}
             </span>
             <Button
               variant="ghost"
@@ -1620,6 +1717,11 @@ export function AnnotateView() {
             <span className="ml-2 font-medium text-foreground">
               {currentTask ? currentTask.name : `Imagem ${String(imageIndex).padStart(6, "0")}.jpg`}
             </span>
+            {(annotationQueueImages.length !== totalImages || onlyUnannotated) && (
+              <span className="rounded-full bg-muted px-2 py-1 text-xs tabular-nums text-muted-foreground">
+                Imagem {imageIndex.toLocaleString("pt-BR")}
+              </span>
+            )}
             <label className="ml-3 inline-flex h-8 cursor-pointer items-center gap-2 rounded-full border border-border px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
               <input
                 type="checkbox"
@@ -2108,7 +2210,7 @@ export function AnnotateView() {
           )}
         </div>
 
-        {/* Filmstrip: preview das imagens vizinhas do lote */}
+        {/* Filmstrip: fila atual de anotacao */}
         <div className="flex items-center gap-2 border-t border-border bg-card px-3 py-2">
           <button
             type="button"
@@ -2119,36 +2221,32 @@ export function AnnotateView() {
             <ChevronsLeft className="size-4" />
           </button>
           <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
-            {(() => {
-              const windowSize = Math.min(10, totalImages)
-              const windowStart = Math.max(1, Math.min(imageIndex - 4, totalImages - windowSize + 1))
-              return Array.from({ length: windowSize }, (_, i) => windowStart + i).map((n) => {
-                const isCurrent = n === imageIndex
-                return (
-                  <button
-                    key={n}
-                    type="button"
-                    onClick={() => setImageIndex(n)}
-                    aria-label={`Ir para a imagem ${n}`}
-                    aria-current={isCurrent ? "true" : undefined}
-                    className={cn(
-                      "relative aspect-video h-12 shrink-0 overflow-hidden rounded-md border-2 transition-colors",
-                      isCurrent ? "border-brand-blue" : "border-transparent hover:border-border",
-                    )}
-                  >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={taskFrameAssetUrl(currentTaskId, n - 1) ?? "/placeholder.svg"}
-                      alt={`Imagem ${n}`}
-                      className="size-full object-cover"
-                    />
-                    <span className="absolute bottom-0 right-0 rounded-tl bg-black/60 px-1 text-[9px] tabular-nums text-white">
-                      {n}
-                    </span>
-                  </button>
-                )
-              })
-            })()}
+            {visibleQueueImages.map((n) => {
+              const isCurrent = n === imageIndex
+              return (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => setImageIndex(n)}
+                  aria-label={`Ir para a imagem ${n}`}
+                  aria-current={isCurrent ? "true" : undefined}
+                  className={cn(
+                    "relative aspect-video h-12 shrink-0 overflow-hidden rounded-md border-2 transition-colors",
+                    isCurrent ? "border-brand-blue" : "border-transparent hover:border-border",
+                  )}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={taskFrameAssetUrl(currentTaskId, n - 1) ?? "/placeholder.svg"}
+                    alt={`Imagem ${n}`}
+                    className="size-full object-cover"
+                  />
+                  <span className="absolute bottom-0 right-0 rounded-tl bg-black/60 px-1 text-[9px] tabular-nums text-white">
+                    {n}
+                  </span>
+                </button>
+              )
+            })}
           </div>
           <button
             type="button"
@@ -2796,7 +2894,7 @@ function shapesFromAnnotationRecords(records: BackendAnnotationRecord[], dimensi
 }
 
 function isEditableAnnotationRecord(record: BackendAnnotationRecord) {
-  return !["deleted_by_reviewer", "needs_annotation", "rejected", "incorrect"].includes(
+  return !["deleted_by_reviewer", "needs_annotation", "rejected", "incorrect", "replaced_by_manual"].includes(
     String(record.review_state ?? "").toLowerCase(),
   )
 }
@@ -3030,6 +3128,13 @@ function classItemsFromAnnotationRecords(records: BackendAnnotationRecord[], exi
     })
   }
   return mergeClassItems(items)
+}
+
+function taskAnnotationImportTarget(task: BackendTask | null): "annotation" | "review" | null {
+  const datasetImport = task?.raw?.dataset_import
+  if (!datasetImport || typeof datasetImport !== "object" || Array.isArray(datasetImport)) return null
+  const target = (datasetImport as Record<string, unknown>).annotation_import_target
+  return target === "annotation" || target === "review" ? target : null
 }
 
 function frameDimensionsFromMeta(meta: BackendTaskDataMeta | null, frame: number): FrameDimensions | null {

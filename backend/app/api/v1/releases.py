@@ -15,6 +15,7 @@ from app.schemas import ArtifactRead, DatasetReleaseCreate, DatasetReleaseRead, 
 from app.services.artifacts import S3ArtifactStore
 from app.services.datasets import prepare_yolo_dataset
 from app.services.jobs import ACTIVE_JOB_STATUSES, attach_celery_task, cancel_job, create_job
+from app.services.project_storage import refresh_project_storage
 from app.services.releases import prepare_dataset_release
 from app.tasks import build_dataset_release_task
 
@@ -172,6 +173,7 @@ def delete_release(
     actor: User = Depends(current_user),
 ) -> dict[str, Any]:
     release = require_release_access(db, actor, release_id)
+    project = db.get(Project, release.project_id) if release.project_id else None
     jobs = _release_jobs(db, release.id)
     canceled_jobs: list[str] = []
     for job in jobs:
@@ -179,7 +181,6 @@ def delete_release(
             cancel_job(db, job.id, celery_app=celery_app, reason="Dataset release deleted by user")
             canceled_jobs.append(job.id)
 
-    artifact_rows = _release_artifacts(release)
     artifact_uris = _release_artifact_uris(release)
     artifact_records = [
         record
@@ -205,8 +206,6 @@ def delete_release(
         db.delete(record)
         deleted_artifact_records += 1
 
-    _subtract_project_storage_usage(db, release, artifact_rows)
-
     db.add(
         AuditEvent(
             actor=actor.email,
@@ -228,6 +227,8 @@ def delete_release(
     for job in jobs:
         db.delete(job)
     db.delete(release)
+    db.flush()
+    refresh_project_storage(db, project)
     db.commit()
     return {
         "id": release_id,
@@ -284,40 +285,6 @@ def _nested_s3_uris(value: Any) -> set[str]:
         for child in value:
             uris.update(_nested_s3_uris(child))
     return uris
-
-
-def _subtract_project_storage_usage(db: Session, release: DatasetRelease, artifacts: list[dict]) -> None:
-    if not release.project_id:
-        return
-    project = db.get(Project, release.project_id)
-    if project is None or not isinstance(project.raw, dict):
-        return
-    storage = project.raw.get("storage")
-    if not isinstance(storage, dict):
-        return
-    removed_bytes = sum(_int_value(artifact.get("size_bytes")) or 0 for artifact in artifacts)
-    if removed_bytes <= 0:
-        return
-    used_bytes = max((_int_value(storage.get("used_bytes")) or 0) - removed_bytes, 0)
-    quota_bytes = _int_value(storage.get("quota_bytes")) or 0
-    percent = round((used_bytes / quota_bytes) * 100, 2) if quota_bytes else 0
-    project.raw = {
-        **project.raw,
-        "storage": {
-            **storage,
-            "used_bytes": used_bytes,
-            "used_gb": round(used_bytes / 1024**3, 3),
-            "used_percent": percent,
-        },
-    }
-    db.add(project)
-
-
-def _int_value(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _prepared_dataset_read(release_id: str, prepared: dict) -> PreparedDatasetRead:

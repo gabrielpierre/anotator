@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { useRouter, useSearchParams } from "next/navigation"
+import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import {
   Sliders,
   Upload,
@@ -68,6 +68,7 @@ const classColors = [
 
 export function ProjectOverview() {
   const router = useRouter()
+  const pathname = usePathname()
   const searchParams = useSearchParams()
   const [dashboard, setDashboard] = React.useState<BackendDashboard | null>(null)
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
@@ -81,6 +82,15 @@ export function ProjectOverview() {
   const { isAdmin, projects, activeProject, updateProject } = useCurrentUser()
   const currentProjectId = activeProject?.id ?? projects[0]?.id ?? null
   const currentProjectExternalId = activeProject?.externalId ?? projects[0]?.externalId ?? null
+
+  const closeCustomizeDialog = React.useCallback(() => {
+    setCustomizeOpen(false)
+    if (searchParams.get("personalizar") !== "1") return
+    const nextParams = new URLSearchParams(searchParams.toString())
+    nextParams.delete("personalizar")
+    const query = nextParams.toString()
+    router.replace(query ? `${pathname}?${query}` : pathname, { scroll: false })
+  }, [pathname, router, searchParams])
 
   React.useEffect(() => {
     const controller = new AbortController()
@@ -290,7 +300,7 @@ export function ProjectOverview() {
         open={customizeOpen}
         mode="edit"
         project={customizeTarget}
-        onClose={() => setCustomizeOpen(false)}
+        onClose={closeCustomizeDialog}
         onSaved={(project, _mode, annotatorIds) => {
           const record = projectRecordFromBackend(project, annotatorIds)
           void updateProject(project.id, {

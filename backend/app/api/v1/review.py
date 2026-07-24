@@ -34,7 +34,16 @@ from app.schemas import (
     TrackActionPayload,
     TrackRevisionRead,
 )
-from app.services.annotations import apply_review_decision, save_manual_annotations
+from app.services.annotations import (
+    FRAME_ANNOTATION_PENDING,
+    FRAME_APPROVED,
+    FRAME_NEEDS_ANNOTATION,
+    FRAME_REVIEW_PENDING,
+    apply_review_decision,
+    frame_active_annotation_count,
+    frame_workflow_state,
+    save_manual_annotations,
+)
 from app.services.cvat_client import CvatClient
 
 router = APIRouter()
@@ -43,42 +52,50 @@ router = APIRouter()
 @router.get("/queue", response_model=list[ReviewQueueItem])
 def review_queue(
     project_external_id: str | None = Query(default=None, max_length=64),
+    state: str = Query(default="pending", pattern="^(pending|approved)$"),
     db: Session = Depends(db_session),
     user: User = Depends(current_user),
 ) -> list[ReviewQueueItem]:
     task_external_ids = scope_visible_task_external_ids(db, user, project_external_id)
     if task_external_ids is not None and not task_external_ids:
         return []
+    review_states = ["pending"] if state == "pending" else ["accepted", "corrected"]
     query = select(AnnotationRecord).where(
-        AnnotationRecord.review_state == "pending",
+        AnnotationRecord.review_state.in_(review_states),
         AnnotationRecord.task_external_id.is_not(None),
         AnnotationRecord.frame.is_not(None),
     )
     if task_external_ids is not None:
         query = query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
     candidates = list(db.scalars(query.order_by(AnnotationRecord.updated_at.desc()).limit(2000)).all())
-    annotations = [annotation for annotation in candidates if _is_reviewable_annotation(annotation)][:500]
+    if state == "approved":
+        annotations = _limit_queue_frames(_approved_frame_annotations(db, candidates), 500)
+    else:
+        annotations = _limit_queue_frames(_frame_queue_annotations(db, candidates), 500)
     return [_queue_item_from_annotation(db, annotation) for annotation in annotations]
 
 
 @router.get("/queue/count")
 def review_queue_count(
     project_external_id: str | None = Query(default=None, max_length=64),
+    state: str = Query(default="pending", pattern="^(pending|approved)$"),
     db: Session = Depends(db_session),
     user: User = Depends(current_user),
 ) -> dict[str, int]:
     task_external_ids = scope_visible_task_external_ids(db, user, project_external_id)
     if task_external_ids is not None and not task_external_ids:
         return {"pending": 0}
+    review_states = ["pending"] if state == "pending" else ["accepted", "corrected"]
     query = select(AnnotationRecord).where(
-        AnnotationRecord.review_state == "pending",
+        AnnotationRecord.review_state.in_(review_states),
         AnnotationRecord.task_external_id.is_not(None),
         AnnotationRecord.frame.is_not(None),
     )
     if task_external_ids is not None:
         query = query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
     candidates = list(db.scalars(query).all())
-    return {"pending": sum(1 for annotation in candidates if _is_reviewable_annotation(annotation))}
+    annotations = _approved_frame_annotations(db, candidates) if state == "approved" else _frame_queue_annotations(db, candidates)
+    return {"pending": _queue_frame_count(annotations)}
 
 
 @router.post("/decisions", response_model=ReviewDecisionRead)
@@ -221,6 +238,9 @@ def _queue_item_from_annotation(db: Session, annotation: AnnotationRecord) -> Re
     preview_url = task.preview_url if task else None
     if annotation.task_external_id and annotation.frame is not None:
         preview_url = f"/api/v1/tasks/{annotation.task_external_id}/frame/{annotation.frame}"
+    state = frame_workflow_state(db, annotation.task_external_id, annotation.frame)
+    frame_status = state.status if state else FRAME_REVIEW_PENDING
+    frame_annotation_count = frame_active_annotation_count(db, annotation.task_external_id, annotation.frame)
     return ReviewQueueItem(
         external_annotation_id=annotation.external_id,
         cvat_job_id=annotation.cvat_job_id,
@@ -243,8 +263,99 @@ def _queue_item_from_annotation(db: Session, annotation: AnnotationRecord) -> Re
             "external_annotation_id": annotation.external_id,
             "raw": annotation.raw,
             "frame_dimensions": _frame_dimensions(db, annotation.task_external_id, annotation.frame),
+            "queue_scope": "frame",
+            "frame_review_state": frame_status,
+            "frame_annotation_count": frame_annotation_count,
         },
     )
+
+
+def _frame_queue_annotations(db: Session, candidates: list[AnnotationRecord]) -> list[AnnotationRecord]:
+    frame_terminal_statuses = {
+        FRAME_APPROVED,
+        FRAME_NEEDS_ANNOTATION,
+        FRAME_ANNOTATION_PENDING,
+    }
+    frames: set[tuple[str, int]] = set()
+    annotations: list[AnnotationRecord] = []
+    for annotation in candidates:
+        if not _is_reviewable_annotation(annotation):
+            continue
+        key = (annotation.task_external_id, annotation.frame)
+        if key not in frames:
+            state = frame_workflow_state(db, annotation.task_external_id, annotation.frame)
+            frame_status = state.status if state else FRAME_REVIEW_PENDING
+            if frame_status in frame_terminal_statuses:
+                continue
+            frames.add(key)
+        annotations.append(annotation)
+    return _dedupe_queue_annotations(annotations)
+
+
+def _approved_frame_annotations(db: Session, candidates: list[AnnotationRecord]) -> list[AnnotationRecord]:
+    annotations: list[AnnotationRecord] = []
+    for annotation in candidates:
+        if not _is_reviewable_annotation(annotation):
+            continue
+        state = frame_workflow_state(db, annotation.task_external_id, annotation.frame)
+        if state is None or state.status != FRAME_APPROVED:
+            continue
+        annotations.append(annotation)
+    return _dedupe_queue_annotations(annotations)
+
+
+def _dedupe_queue_annotations(candidates: list[AnnotationRecord]) -> list[AnnotationRecord]:
+    by_identity: dict[tuple, AnnotationRecord] = {}
+    order: list[tuple] = []
+    for annotation in candidates:
+        key = _annotation_identity_key(annotation)
+        existing = by_identity.get(key)
+        if existing is None:
+            by_identity[key] = annotation
+            order.append(key)
+            continue
+        if _annotation_queue_priority(annotation) > _annotation_queue_priority(existing):
+            by_identity[key] = annotation
+    return [by_identity[key] for key in order]
+
+
+def _limit_queue_frames(annotations: list[AnnotationRecord], limit: int) -> list[AnnotationRecord]:
+    frames: set[tuple[str | None, int | None]] = set()
+    limited: list[AnnotationRecord] = []
+    for annotation in annotations:
+        key = (annotation.task_external_id, annotation.frame)
+        if key not in frames:
+            if len(frames) >= limit:
+                break
+            frames.add(key)
+        limited.append(annotation)
+    return limited
+
+
+def _queue_frame_count(annotations: list[AnnotationRecord]) -> int:
+    return len({(annotation.task_external_id, annotation.frame) for annotation in annotations})
+
+
+def _annotation_identity_key(annotation: AnnotationRecord) -> tuple:
+    points = tuple(round(float(value), 3) for value in _annotation_points(annotation))
+    return (
+        annotation.task_external_id,
+        annotation.frame,
+        (annotation.label_name or "").casefold(),
+        (annotation.shape_type or "").casefold(),
+        points,
+    )
+
+
+def _annotation_queue_priority(annotation: AnnotationRecord) -> int:
+    priority = 0
+    if annotation.external_id.startswith("cvat_job:"):
+        priority += 20
+    if annotation.source == "dataset_import":
+        priority += 10
+    if annotation.source == "cvat-plus":
+        priority -= 1
+    return priority
 
 
 def _visible_task_external_ids(

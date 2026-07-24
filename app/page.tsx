@@ -7,6 +7,14 @@ import { ProjectOverview } from "@/components/overview/project-overview"
 import { useCurrentUser } from "@/lib/auth/user-context"
 
 export default function Page() {
+  return (
+    <React.Suspense fallback={<PageLoading />}>
+      <HomePageContent />
+    </React.Suspense>
+  )
+}
+
+function HomePageContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const { authReady, isAuthenticated, isAdmin, projects, setActiveProjectId } = useCurrentUser()
@@ -37,5 +45,14 @@ export default function Page() {
     <AppShell breadcrumb={[{ label: "Projetos", href: "/projetos" }, { label: "Projeto atual" }]}>
       <ProjectOverview />
     </AppShell>
+  )
+}
+
+function PageLoading() {
+  return (
+    <div className="flex min-h-svh items-center justify-center bg-background">
+      <span className="sr-only">Carregando projeto</span>
+      <span className="size-8 animate-spin rounded-full border-2 border-border border-t-brand-blue" aria-hidden="true" />
+    </div>
   )
 }

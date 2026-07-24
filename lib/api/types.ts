@@ -193,6 +193,16 @@ export type BackendTaskDataMeta = {
   frame_filter: string | null
   frames: unknown[]
   deleted_frames: unknown[]
+  frame_workflow_states: Array<{
+    frame: number
+    status: string
+    annotation_count: number
+    assigned_user_id: string | null
+    submitted_by: string | null
+    reviewed_by: string | null
+    reason: string | null
+    raw: Record<string, unknown>
+  }>
   raw: Record<string, unknown>
   created_at: string
   updated_at: string
@@ -460,6 +470,7 @@ export type BackendDatasetReleaseCreate = {
   job_external_ids?: string[]
   export_format?: string | null
   include_images?: boolean
+  image_scope?: "all" | "annotated"
   splits?: Record<string, unknown>
   snapshot?: Record<string, unknown>
 }
@@ -617,6 +628,7 @@ export type BackendImportTaskCreate = {
   assignee_user_id?: string | null
   labels?: Record<string, unknown>[]
   class_mappings?: Record<string, unknown>[]
+  annotation_import_target?: "annotation" | "review"
   source_path?: string | null
   estimated_bytes?: number | null
   sync_after_import?: boolean

@@ -2,7 +2,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import (
@@ -10,6 +10,7 @@ from app.models import (
     AnnotationRevision,
     AuditEvent,
     CvatLabel,
+    FrameWorkflowState,
     JobRecord,
     ReviewDecision,
     Task,
@@ -24,6 +25,19 @@ from app.services.cvat_client import CvatClient
 class AnnotationSyncResult:
     annotations_synced: int = 0
     errors: list[str] | None = None
+
+
+FRAME_ANNOTATION_PENDING = "annotation_pending"
+FRAME_REVIEW_PENDING = "review_pending"
+FRAME_APPROVED = "approved"
+FRAME_NEEDS_ANNOTATION = "needs_annotation"
+FRAME_ACTIVE_ANNOTATION_EXCLUDED_STATES = {
+    "deleted_by_reviewer",
+    "needs_annotation",
+    "rejected",
+    "incorrect",
+    "replaced_by_manual",
+}
 
 
 def normalize_cvat_job_id(value: str | None) -> str | None:
@@ -77,11 +91,26 @@ def apply_review_decision(
     cvat_synced = False
     cvat_error: str | None = None
     frame_annotations_sent_to_annotation = 0
+    frame_annotations_accepted = 0
 
     if annotation is not None:
         if decision_value == "accepted":
             after["review_status"] = "accepted"
             after["release_ready"] = True
+            after["accepted_by"] = payload.actor
+            frame_annotations_accepted = _mark_frame_annotations_accepted(
+                db,
+                annotation,
+                actor=payload.actor,
+            )
+            upsert_frame_workflow_state(
+                db,
+                annotation.task_external_id,
+                annotation.frame,
+                FRAME_APPROVED,
+                actor=payload.actor,
+                raw={"decision": decision_value, "accepted_annotations": frame_annotations_accepted},
+            )
         elif decision_value == "needs_annotation":
             after["review_status"] = "needs_annotation"
             after["needs_annotation"] = True
@@ -95,6 +124,19 @@ def apply_review_decision(
                 annotation,
                 actor=payload.actor,
                 reason=payload.reason,
+            )
+            upsert_frame_workflow_state(
+                db,
+                annotation.task_external_id,
+                annotation.frame,
+                FRAME_NEEDS_ANNOTATION,
+                actor=payload.actor,
+                reason=payload.reason,
+                annotation_count=0,
+                raw={
+                    "decision": decision_value,
+                    "sent_to_annotation_annotations": frame_annotations_sent_to_annotation,
+                },
             )
         elif decision_value == "corrected":
             label_error = _apply_corrected_label(db, annotation, payload, after)
@@ -111,6 +153,8 @@ def apply_review_decision(
         annotation.review_state = decision_value
         annotation.raw = after
         db.add(annotation)
+        if decision_value in {"corrected", "deleted_by_reviewer"}:
+            _sync_frame_workflow_after_review(db, annotation, payload.actor)
 
         if payload.patch_cvat and action and cvat_error is None:
             try:
@@ -134,6 +178,7 @@ def apply_review_decision(
             "action": action,
             "review_state": decision_value,
             "frame_annotations_sent_to_annotation": frame_annotations_sent_to_annotation,
+            "frame_annotations_accepted": frame_annotations_accepted,
         },
         cvat_synced=cvat_synced,
         cvat_error=cvat_error,
@@ -163,12 +208,188 @@ def apply_review_decision(
                 "action": action,
                 "review_state": decision_value,
                 "frame_annotations_sent_to_annotation": frame_annotations_sent_to_annotation,
+                "frame_annotations_accepted": frame_annotations_accepted,
             },
         )
     )
     db.commit()
     db.refresh(decision)
     return decision
+
+
+def frame_workflow_state(
+    db: Session,
+    task_external_id: str | None,
+    frame: int | None,
+) -> FrameWorkflowState | None:
+    if task_external_id is None or frame is None:
+        return None
+    return db.scalar(
+        select(FrameWorkflowState).where(
+            FrameWorkflowState.task_external_id == task_external_id,
+            FrameWorkflowState.frame == frame,
+        )
+    )
+
+
+def _pending_frame_workflow_state(
+    db: Session,
+    task_external_id: str,
+    frame: int,
+) -> FrameWorkflowState | None:
+    for pending in db.new:
+        if (
+            isinstance(pending, FrameWorkflowState)
+            and pending.task_external_id == task_external_id
+            and pending.frame == frame
+        ):
+            return pending
+    return None
+
+
+def upsert_frame_workflow_state(
+    db: Session,
+    task_external_id: str | None,
+    frame: int | None,
+    status: str,
+    *,
+    actor: str | None = None,
+    reason: str | None = None,
+    annotation_count: int | None = None,
+    raw: dict[str, Any] | None = None,
+) -> FrameWorkflowState | None:
+    if task_external_id is None or frame is None:
+        return None
+    with db.no_autoflush:
+        state = _pending_frame_workflow_state(db, task_external_id, frame) or frame_workflow_state(
+            db, task_external_id, frame
+        )
+    if state is None:
+        state = FrameWorkflowState(task_external_id=task_external_id, frame=frame)
+    state.status = status
+    state.annotation_count = (
+        annotation_count if annotation_count is not None else frame_active_annotation_count(db, task_external_id, frame)
+    )
+    if status == FRAME_REVIEW_PENDING and actor:
+        state.submitted_by = actor
+    if status in {FRAME_APPROVED, FRAME_NEEDS_ANNOTATION} and actor:
+        state.reviewed_by = actor
+    if reason:
+        state.reason = reason
+    state.raw = {
+        **(state.raw or {}),
+        **(raw or {}),
+        "last_status": status,
+        "last_actor": actor,
+    }
+    db.add(state)
+    return state
+
+
+def frame_active_annotation_count(
+    db: Session,
+    task_external_id: str | None,
+    frame: int | None,
+) -> int:
+    if task_external_id is None or frame is None:
+        return 0
+    return int(
+        db.scalar(
+            select(func.count(AnnotationRecord.id)).where(
+                AnnotationRecord.task_external_id == task_external_id,
+                AnnotationRecord.frame == frame,
+                AnnotationRecord.annotation_type != "tag",
+                AnnotationRecord.review_state.not_in(FRAME_ACTIVE_ANNOTATION_EXCLUDED_STATES),
+            )
+        )
+        or 0
+    )
+
+
+def _mark_frame_annotations_accepted(
+    db: Session,
+    annotation: AnnotationRecord,
+    *,
+    actor: str,
+) -> int:
+    if annotation.task_external_id is None or annotation.frame is None:
+        return 1
+    rows = list(
+        db.scalars(
+            select(AnnotationRecord).where(
+                AnnotationRecord.task_external_id == annotation.task_external_id,
+                AnnotationRecord.frame == annotation.frame,
+                AnnotationRecord.review_state == "pending",
+            )
+        ).all()
+    )
+    for row in rows:
+        if not _is_reviewable_shape_record(row):
+            continue
+        raw = dict(row.raw or {})
+        raw.update(
+            {
+                "review_status": "accepted",
+                "release_ready": True,
+                "accepted_by": actor,
+            }
+        )
+        row.review_state = "accepted"
+        row.raw = raw
+        db.add(row)
+    return sum(1 for row in rows if _is_reviewable_shape_record(row))
+
+
+def _sync_frame_workflow_after_review(db: Session, annotation: AnnotationRecord, actor: str) -> None:
+    if annotation.task_external_id is None or annotation.frame is None:
+        return
+    pending_reviewables = [
+        row
+        for row in db.scalars(
+            select(AnnotationRecord).where(
+                AnnotationRecord.task_external_id == annotation.task_external_id,
+                AnnotationRecord.frame == annotation.frame,
+                AnnotationRecord.external_id != annotation.external_id,
+                AnnotationRecord.review_state == "pending",
+            )
+        ).all()
+        if _is_reviewable_shape_record(row)
+    ]
+    if pending_reviewables:
+        upsert_frame_workflow_state(
+            db,
+            annotation.task_external_id,
+            annotation.frame,
+            FRAME_REVIEW_PENDING,
+            actor=actor,
+            raw={"pending_review_annotations": len(pending_reviewables)},
+        )
+        return
+    active_count = frame_active_annotation_count(db, annotation.task_external_id, annotation.frame)
+    upsert_frame_workflow_state(
+        db,
+        annotation.task_external_id,
+        annotation.frame,
+        FRAME_APPROVED if active_count else FRAME_NEEDS_ANNOTATION,
+        actor=actor,
+        annotation_count=active_count,
+        raw={"pending_review_annotations": 0},
+    )
+
+
+def _is_reviewable_shape_record(annotation: AnnotationRecord) -> bool:
+    if annotation.annotation_type == "tag":
+        return False
+    if annotation.frame is None or not annotation.task_external_id:
+        return False
+    if (annotation.shape_type or "").lower() not in {"rectangle", "polygon"}:
+        return False
+    points = annotation.points if isinstance(annotation.points, list) else []
+    if not points and isinstance(annotation.raw, dict):
+        points_norm = annotation.raw.get("points_norm")
+        if isinstance(points_norm, list):
+            points = points_norm
+    return len(points) >= 4 and all(isinstance(value, int | float) for value in points)
 
 
 def _mark_frame_annotations_for_rework(
@@ -223,19 +444,37 @@ def save_manual_annotations(
     local_job_id = cvat_job_id or f"local:{payload.task_external_id}"
     version = _cvat_annotation_version(client, cvat_job_id) if payload.sync_cvat and cvat_job_id else None
 
-    previous = list(
-        db.scalars(
-            select(AnnotationRecord).where(
-                AnnotationRecord.external_id.like(f"manual:{payload.task_external_id}:{payload.frame}:%")
-            )
-        ).all()
+    previous_query = select(AnnotationRecord).where(
+        AnnotationRecord.external_id.like(f"manual:{payload.task_external_id}:{payload.frame}:%")
     )
+    if payload.replace_existing:
+        previous_query = select(AnnotationRecord).where(
+            AnnotationRecord.task_external_id == payload.task_external_id,
+            AnnotationRecord.frame == payload.frame,
+            AnnotationRecord.annotation_type != "tag",
+            AnnotationRecord.review_state.not_in(FRAME_ACTIVE_ANNOTATION_EXCLUDED_STATES),
+        )
+    previous = list(db.scalars(previous_query).all())
     if not payload.shapes:
         if not payload.replace_existing:
             return previous
 
     for row in previous:
-        db.delete(row)
+        if row.external_id.startswith("manual:"):
+            db.delete(row)
+            continue
+        raw = dict(row.raw or {})
+        raw.update(
+            {
+                "review_status": "replaced_by_manual",
+                "replaced_by_manual": True,
+                "release_ready": False,
+                "replaced_by": payload.actor,
+            }
+        )
+        row.review_state = "replaced_by_manual"
+        row.raw = raw
+        db.add(row)
     db.flush()
 
     records: list[AnnotationRecord] = []
@@ -327,6 +566,21 @@ def save_manual_annotations(
         }
         db.add(record)
 
+    upsert_frame_workflow_state(
+        db,
+        payload.task_external_id,
+        payload.frame,
+        FRAME_REVIEW_PENDING if records else FRAME_ANNOTATION_PENDING,
+        actor=payload.actor,
+        annotation_count=len(records),
+        raw={
+            "source": "manual_save",
+            "replace_existing": payload.replace_existing,
+            "cvat_synced": cvat_synced,
+            "cvat_error": cvat_error,
+        },
+    )
+
     db.add(
         AuditEvent(
             actor=payload.actor,
@@ -381,6 +635,15 @@ def _upsert_annotation_record(
     row.points = _annotation_points(raw, annotation_type)
     row.raw = {**raw, "_cvat_version": version}
     db.add(row)
+    if _is_reviewable_shape_record(row):
+        upsert_frame_workflow_state(
+            db,
+            row.task_external_id,
+            row.frame,
+            FRAME_REVIEW_PENDING,
+            actor="sync CVAT",
+            raw={"source": "sync_cvat", "cvat_job_id": cvat_job_id},
+        )
     return 1
 
 

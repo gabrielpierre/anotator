@@ -16,7 +16,7 @@ from app.services.artifacts import ArtifactStore, proxy_download_url
 
 DEFAULT_SPLITS = {"train": 0.8, "val": 0.1, "test": 0.1}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-EXCLUDED_REVIEW_STATES = {"deleted_by_reviewer", "rejected", "incorrect", "needs_annotation"}
+EXCLUDED_REVIEW_STATES = {"deleted_by_reviewer", "rejected", "incorrect", "needs_annotation", "replaced_by_manual"}
 
 
 def prepare_yolo_dataset(

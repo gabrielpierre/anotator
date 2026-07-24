@@ -34,6 +34,7 @@ import type { BackendReviewQueueItem, BackendTask } from "@/lib/api/types"
 import { cn } from "@/lib/utils"
 
 type Decision = "aceito" | "anotacao" | "corrigido" | "excluido"
+type ReviewMode = "pending" | "approved"
 
 type Box = { x: number; y: number; w: number; h: number }
 type EditSnapshot = { id: number; box?: Box }
@@ -215,6 +216,25 @@ function sameReviewFrame(annotation: ReviewAnnotation, current: ReviewAnnotation
   return annotation.cvatJobId === current.cvatJobId && annotation.frame === current.frame
 }
 
+function groupReviewFrames(annotations: ReviewAnnotation[]) {
+  const groups: Array<{ key: string; representative: ReviewAnnotation; annotations: ReviewAnnotation[] }> = []
+  const byKey = new Map<string, { key: string; representative: ReviewAnnotation; annotations: ReviewAnnotation[] }>()
+  for (const annotation of annotations) {
+    const key = reviewFrameKey(annotation)
+    let group = byKey.get(key)
+    if (!group) {
+      group = { key, representative: annotation, annotations: [] }
+      byKey.set(key, group)
+      groups.push(group)
+    }
+    group.annotations.push(annotation)
+    if (annotation.id < group.representative.id) {
+      group.representative = annotation
+    }
+  }
+  return groups
+}
+
 function reviewFrameKey(annotation: ReviewAnnotation) {
   if (annotation.previewUrl) return `preview:${annotation.previewUrl}`
   return `task:${annotation.cvatJobId ?? annotation.taskName ?? "unknown"}:frame:${annotation.frame ?? "unknown"}`
@@ -273,6 +293,8 @@ const emptyAnnotation: ReviewAnnotation = {
 export function ReviewWorkspace() {
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [reviewQueue, setReviewQueue] = React.useState<BackendReviewQueueItem[] | null>(null)
+  const [approvedQueue, setApprovedQueue] = React.useState<BackendReviewQueueItem[] | null>(null)
+  const [reviewMode, setReviewMode] = React.useState<ReviewMode>("pending")
   const { currentUser, activeProject, projects } = useCurrentUser()
   const currentProjectId = activeProject?.id ?? projects[0]?.id ?? null
   const currentProjectExternalId = activeProject?.externalId ?? projects[0]?.externalId ?? null
@@ -280,13 +302,24 @@ export function ReviewWorkspace() {
     const cvatClasses = labelsFromTasks(tasks)
     return cvatClasses.length > 0 ? cvatClasses : []
   }, [tasks])
-  const reviewItems = React.useMemo(
+  const pendingReviewItems = React.useMemo(
     () =>
       reviewQueue && reviewQueue.length > 0
         ? reviewQueue.map((item, index) => queueItemToAnnotation(item, index, classCatalog))
         : [],
     [classCatalog, reviewQueue],
   )
+  const approvedReviewItems = React.useMemo(
+    () =>
+      approvedQueue && approvedQueue.length > 0
+        ? approvedQueue.map((item, index) => queueItemToAnnotation(item, index, classCatalog))
+        : [],
+    [approvedQueue, classCatalog],
+  )
+  const reviewItems = reviewMode === "approved" ? approvedReviewItems : pendingReviewItems
+  const pendingFrameTotal = React.useMemo(() => groupReviewFrames(pendingReviewItems).length, [pendingReviewItems])
+  const approvedFrameTotal = React.useMemo(() => groupReviewFrames(approvedReviewItems).length, [approvedReviewItems])
+  const isApprovedMode = reviewMode === "approved"
   const [selectedId, setSelectedId] = React.useState<number>(0)
   const [decisions, setDecisions] = React.useState<Record<number, Decision>>({})
   const [syncState, setSyncState] = React.useState<Record<number, { synced: boolean; error?: string | null }>>({})
@@ -327,18 +360,59 @@ export function ReviewWorkspace() {
       colorForName(name),
     [classCatalog],
   )
+  const refreshReviewQueues = React.useCallback(
+    async (signal?: AbortSignal) => {
+      if (!currentProjectExternalId) {
+        setReviewQueue([])
+        setApprovedQueue([])
+        return
+      }
+      const [pending, approved] = await Promise.all([
+        fetchReviewQueue({ projectExternalId: currentProjectExternalId, state: "pending" }, signal),
+        fetchReviewQueue({ projectExternalId: currentProjectExternalId, state: "approved" }, signal),
+      ])
+      setReviewQueue(pending)
+      setApprovedQueue(approved)
+    },
+    [currentProjectExternalId],
+  )
 
   React.useEffect(() => {
     const controller = new AbortController()
     if (!currentProjectExternalId) {
       setTasks([])
       setReviewQueue([])
+      setApprovedQueue([])
       return () => controller.abort()
     }
     fetchTasks({ projectExternalId: currentProjectExternalId }, controller.signal).then(setTasks).catch(() => setTasks(null))
-    fetchReviewQueue({ projectExternalId: currentProjectExternalId }, controller.signal).then(setReviewQueue).catch(() => setReviewQueue(null))
+    refreshReviewQueues(controller.signal).catch(() => {
+      if (!controller.signal.aborted) {
+        setReviewQueue(null)
+        setApprovedQueue(null)
+      }
+    })
     return () => controller.abort()
-  }, [currentProjectExternalId])
+  }, [currentProjectExternalId, refreshReviewQueues])
+
+  React.useEffect(() => {
+    if (reviewMode !== "pending") return
+    if (reviewQueue === null || approvedQueue === null) return
+    if (reviewQueue.length === 0 && approvedQueue.length > 0) {
+      setReviewMode("approved")
+    }
+  }, [approvedQueue, reviewMode, reviewQueue])
+
+  React.useEffect(() => {
+    setSelectedId(0)
+    setDecisions({})
+    setSyncState({})
+    setLog([])
+    setCorrecting(false)
+    setClassEditorOpen(false)
+    setEditSnapshot(null)
+    setClassQuery("")
+  }, [reviewMode])
 
   React.useEffect(() => {
     if (classCatalog.length > 0) {
@@ -347,7 +421,10 @@ export function ReviewWorkspace() {
   }, [classCatalog])
 
   React.useEffect(() => {
-    if (!reviewQueue?.length) return
+    if (!reviewItems.length) {
+      setBoxState({})
+      return
+    }
     const nextBoxes = generatedBoxesFor(reviewItems)
     const ids = new Set(reviewItems.map((item) => item.id))
     setBoxState((prev) => {
@@ -357,7 +434,7 @@ export function ReviewWorkspace() {
     if (!reviewItems.some((item) => item.id === selectedId)) {
       setSelectedId(reviewItems[0]?.id ?? selectedId)
     }
-  }, [reviewItems, reviewQueue?.length, selectedId])
+  }, [reviewItems, selectedId])
 
   React.useEffect(() => {
     const node = canvasRef.current
@@ -388,6 +465,7 @@ export function ReviewWorkspace() {
 
   const startCorrection = React.useCallback(
     (id?: number, options: { openClassEditor?: boolean } = {}) => {
+      if (isApprovedMode) return
       const targetId = id ?? selectedId
       const target = reviewItems.find((item) => item.id === targetId) ?? reviewItems[0]
       if (!target || target.id === emptyAnnotation.id) return
@@ -400,7 +478,7 @@ export function ReviewWorkspace() {
         requestAnimationFrame(() => correctInputRef.current?.focus())
       }
     },
-    [boxState, clsOf, reviewItems, selectedId],
+    [boxState, clsOf, isApprovedMode, reviewItems, selectedId],
   )
 
   const openClassEditor = React.useCallback(
@@ -469,20 +547,35 @@ export function ReviewWorkspace() {
       sizeFilter,
     ],
   )
-  const total = visibleAnnotations.length
+  const visibleFrameGroups = React.useMemo(() => groupReviewFrames(visibleAnnotations), [visibleAnnotations])
+  const total = visibleFrameGroups.length
   const hasVisibleAnnotations = total > 0
-  const current = hasVisibleAnnotations
-    ? visibleAnnotations.find((a) => a.id === selectedId) ?? visibleAnnotations[0] ?? emptyAnnotation
+  const currentFrameGroup = hasVisibleAnnotations
+    ? visibleFrameGroups.find((group) => group.annotations.some((annotation) => annotation.id === selectedId)) ??
+      visibleFrameGroups[0]
+    : null
+  const currentFrameAnnotations = currentFrameGroup?.annotations ?? []
+  const current = currentFrameGroup
+    ? currentFrameAnnotations.find((annotation) => annotation.id === selectedId) ?? currentFrameGroup.representative
     : emptyAnnotation
-  const currentFrameAnnotations = hasVisibleAnnotations
-    ? visibleAnnotations.filter((annotation) => sameReviewFrame(annotation, current))
-    : []
   const frameAnnotationTotal = currentFrameAnnotations.length
-  const reviewedCount = Object.keys(decisions).length
-  const queueTotal = visibleAnnotations.length
-  const currentQueueIndex = visibleAnnotations.findIndex((item) => item.id === current.id)
+  const reviewedFrameKeys = React.useMemo(() => {
+    const keys = new Set<string>()
+    for (const group of groupReviewFrames(reviewItems)) {
+      if (group.annotations.length > 0 && group.annotations.every((annotation) => decisions[annotation.id])) {
+        keys.add(group.key)
+      }
+    }
+    return keys
+  }, [decisions, reviewItems])
+  const allQueueFrameTotal = React.useMemo(() => groupReviewFrames(reviewItems).length, [reviewItems])
+  const reviewedCount = reviewedFrameKeys.size
+  const queueTotal = visibleFrameGroups.length
+  const currentQueueIndex = currentFrameGroup
+    ? visibleFrameGroups.findIndex((group) => group.key === currentFrameGroup.key)
+    : -1
   const queuePos = queueTotal === 0 ? 0 : Math.max(1, currentQueueIndex + 1)
-  const queuePct = reviewItems.length === 0 ? 0 : Math.round((reviewedCount / reviewItems.length) * 100)
+  const queuePct = isApprovedMode ? 100 : allQueueFrameTotal === 0 ? 0 : Math.round((reviewedCount / allQueueFrameTotal) * 100)
   const currentPreviewSrc = current.previewUrl ?? "/placeholder.svg"
   const imageFrameStyle = React.useMemo<React.CSSProperties>(() => {
     const dimensions = current.frameDimensions
@@ -506,40 +599,17 @@ export function ReviewWorkspace() {
     }
   }, [canvasSize.height, canvasSize.width, current.frameDimensions])
 
-  const selectNext = React.useCallback(() => {
-    const i = visibleAnnotations.findIndex((a) => a.id === selectedId)
-    const next = visibleAnnotations[Math.min(i + 1, visibleAnnotations.length - 1)]
-    if (next) setSelectedId(next.id)
-  }, [selectedId, visibleAnnotations])
-
-  const selectPrevious = React.useCallback(() => {
-    const i = visibleAnnotations.findIndex((a) => a.id === selectedId)
-    const previous = visibleAnnotations[Math.max(i - 1, 0)]
-    if (previous) setSelectedId(previous.id)
-  }, [selectedId, visibleAnnotations])
-
   const selectFrame = React.useCallback(
     (direction: -1 | 1) => {
-      const currentIndex = visibleAnnotations.findIndex((a) => a.id === selectedId)
+      if (!currentFrameGroup) return
+      const currentIndex = visibleFrameGroups.findIndex((group) => group.key === currentFrameGroup.key)
       if (currentIndex < 0) return
-      const currentKey = reviewFrameKey(visibleAnnotations[currentIndex])
-      if (direction < 0) {
-        for (let index = currentIndex - 1; index >= 0; index -= 1) {
-          if (reviewFrameKey(visibleAnnotations[index]) !== currentKey) {
-            setSelectedId(visibleAnnotations[index].id)
-            return
-          }
-        }
-        return
-      }
-      for (let index = currentIndex + 1; index < visibleAnnotations.length; index += 1) {
-        if (reviewFrameKey(visibleAnnotations[index]) !== currentKey) {
-          setSelectedId(visibleAnnotations[index].id)
-          return
-        }
-      }
+      const next = visibleFrameGroups[
+        Math.max(0, Math.min(visibleFrameGroups.length - 1, currentIndex + direction))
+      ]
+      if (next) setSelectedId(next.representative.id)
     },
-    [selectedId, visibleAnnotations],
+    [currentFrameGroup, visibleFrameGroups],
   )
 
   const startPan = React.useCallback((e: {
@@ -642,11 +712,20 @@ export function ReviewWorkspace() {
 
   const decide = React.useCallback(
     async (decision: Decision, correctedLabel?: string) => {
-      const selected = current
+      if (isApprovedMode) return
+      const isFrameDecision = decision === "aceito" || decision === "anotacao"
+      const selected = isFrameDecision ? currentFrameAnnotations[0] ?? current : current
       if (selected.id === emptyAnnotation.id) return
       const backendDecision = decisionToBackend(decision)
-      setDecisions((d) => ({ ...d, [selected.id]: decision }))
-      setSyncState((state) => ({ ...state, [selected.id]: { synced: false, error: null } }))
+      const affectedAnnotations = isFrameDecision ? currentFrameAnnotations : [selected]
+      setDecisions((state) => ({
+        ...state,
+        ...Object.fromEntries(affectedAnnotations.map((annotation) => [annotation.id, decision])),
+      }))
+      setSyncState((state) => ({
+        ...state,
+        ...Object.fromEntries(affectedAnnotations.map((annotation) => [annotation.id, { synced: false, error: null }])),
+      }))
       setLog((l) => [{ id: selected.id, decision }, ...l].slice(0, 20))
       if (selected.externalAnnotationId) {
         try {
@@ -668,9 +747,15 @@ export function ReviewWorkspace() {
           })
           setSyncState((state) => ({
             ...state,
-            [selected.id]: { synced: response.cvat_synced, error: response.cvat_error },
+            ...Object.fromEntries(
+              affectedAnnotations.map((annotation) => [
+                annotation.id,
+                { synced: response.cvat_synced, error: response.cvat_error },
+              ]),
+            ),
           }))
           window.dispatchEvent(new Event("review-queue-updated"))
+          void refreshReviewQueues()
           if (decision === "excluido") {
             setBoxState((prev) => {
               const next = { ...prev }
@@ -688,9 +773,20 @@ export function ReviewWorkspace() {
           }))
         }
       }
-      if (autoAdvance) selectNext()
+      if (autoAdvance && isFrameDecision) selectFrame(1)
     },
-    [autoAdvance, boxState, clsOf, current, currentUser.email, currentUser.id, selectNext],
+    [
+      autoAdvance,
+      boxState,
+      clsOf,
+      current,
+      currentFrameAnnotations,
+      currentUser.email,
+      currentUser.id,
+      isApprovedMode,
+      refreshReviewQueues,
+      selectFrame,
+    ],
   )
 
   // Escolha de classe e acoes do modo de correcao.
@@ -747,11 +843,12 @@ export function ReviewWorkspace() {
       if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
         e.preventDefault()
-        undo()
+        if (!isApprovedMode) undo()
         return
       }
       if (e.key === "Delete" || e.key === "Backspace") {
         e.preventDefault()
+        if (isApprovedMode) return
         if (correcting) {
           deleteSelectedAnnotation()
         } else {
@@ -761,18 +858,21 @@ export function ReviewWorkspace() {
       }
       if (e.key === "ArrowRight") {
         e.preventDefault()
+        if (isApprovedMode) return
         void decide("aceito")
       } else if (e.key === "ArrowLeft") {
         e.preventDefault()
+        if (isApprovedMode) return
         void decide("anotacao")
       } else if (e.key === "ArrowUp") {
         e.preventDefault()
+        if (isApprovedMode) return
         startCorrection()
       }
     }
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [correcting, decide, deleteSelectedAnnotation, selectedId, startCorrection, undo])
+  }, [correcting, decide, deleteSelectedAnnotation, isApprovedMode, selectedId, startCorrection, undo])
 
   React.useEffect(() => {
     const el = canvasRef.current
@@ -807,9 +907,11 @@ export function ReviewWorkspace() {
   }, [visibleAnnotations, selectedId])
 
   const alts = alternatives(current.cls, current.conf, classCatalog)
-  const isLoadingReview = Boolean(currentProjectExternalId) && (tasks === null || reviewQueue === null)
+  const isLoadingReview = Boolean(currentProjectExternalId) && (tasks === null || reviewQueue === null || approvedQueue === null)
   const hasTasks = (tasks?.length ?? 0) > 0
   const hasReviewItems = reviewItems.length > 0
+  const hasPendingReviewItems = pendingReviewItems.length > 0
+  const hasApprovedReviewItems = approvedReviewItems.length > 0
   const filtersActive =
     onlyUnreviewed ||
     onlyThisClass ||
@@ -863,12 +965,39 @@ export function ReviewWorkspace() {
       )
     }
 
+    if (!hasReviewItems && reviewMode === "pending" && hasApprovedReviewItems) {
+      return (
+        <ReviewEmptyState
+          icon={Check}
+          title="Revisão concluída"
+          description="Não há imagens pendentes. As imagens aprovadas continuam disponíveis para consulta na visão Aprovadas."
+          primary={{ label: "Ver aprovadas", onClick: () => setReviewMode("approved") }}
+          secondary={{ label: "Ir para dados", href: dataHref }}
+        />
+      )
+    }
+
+    if (!hasReviewItems && reviewMode === "approved" && hasPendingReviewItems) {
+      return (
+        <ReviewEmptyState
+          icon={PenLine}
+          title="Nenhuma imagem aprovada ainda"
+          description="Ainda existem imagens pendentes de revisão. Revise e aceite imagens para elas aparecerem aqui."
+          primary={{ label: "Ver pendentes", onClick: () => setReviewMode("pending") }}
+        />
+      )
+    }
+
     if (!hasReviewItems) {
       return (
         <ReviewEmptyState
           icon={PenLine}
-          title="Anote imagens antes de revisar"
-          description="Abra a tela Anotar e salve ao menos uma anotacao. Depois disso, os objetos aparecem aqui para revisao."
+          title={reviewMode === "approved" ? "Nenhuma imagem aprovada" : "Nenhuma imagem para revisar"}
+          description={
+            reviewMode === "approved"
+              ? "Quando uma imagem for aceita na revisão, ela aparece aqui para consulta."
+              : "Abra a tela Anotar e salve ao menos uma anotacao. Depois disso, as imagens aparecem aqui para revisão."
+          }
           primary={{ label: "Ir para anotar", href: annotateHref }}
           secondary={{ label: "Subir lote", href: dataHref }}
         />
@@ -894,7 +1023,7 @@ export function ReviewWorkspace() {
         <aside className="hidden w-60 shrink-0 flex-col overflow-y-auto border-r border-border bg-sidebar lg:flex">
           <div className="flex items-center justify-between px-4 pb-2 pt-4">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              Classes revisadas ({checkedClasses.size}/{classCatalog.length})
+              {isApprovedMode ? "Classes aprovadas" : "Classes em revisão"} ({checkedClasses.size}/{classCatalog.length})
             </p>
             <button
               onClick={() =>
@@ -953,11 +1082,13 @@ export function ReviewWorkspace() {
             )}
           </div>
           <div className="flex flex-col gap-1.5 px-3 pb-4">
-            <FilterToggle
-              label="Somente não revisadas"
-              active={onlyUnreviewed}
-              onClick={() => setOnlyUnreviewed((v) => !v)}
-            />
+            {!isApprovedMode && (
+              <FilterToggle
+                label="Somente não revisadas"
+                active={onlyUnreviewed}
+                onClick={() => setOnlyUnreviewed((v) => !v)}
+              />
+            )}
             <FilterToggle
               label={onlyThisClass && selectedCls ? `Somente: ${selectedCls}` : "Somente desta classe"}
               active={onlyThisClass}
@@ -1065,6 +1196,40 @@ export function ReviewWorkspace() {
         <section className="flex min-w-0 flex-1 flex-col">
           {/* playback bar */}
           <div className="flex items-center gap-1.5 border-b border-border px-4 py-2">
+            <div className="mr-2 inline-flex h-9 shrink-0 items-center rounded-lg bg-muted p-1">
+              <button
+                type="button"
+                onClick={() => setReviewMode("pending")}
+                aria-pressed={reviewMode === "pending"}
+                className={cn(
+                  "inline-flex h-7 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors",
+                  reviewMode === "pending"
+                    ? "bg-card text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                Pendentes
+                <span className="rounded-full bg-background px-1.5 text-[11px] tabular-nums text-muted-foreground">
+                  {pendingFrameTotal.toLocaleString("pt-BR")}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setReviewMode("approved")}
+                aria-pressed={reviewMode === "approved"}
+                className={cn(
+                  "inline-flex h-7 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors",
+                  reviewMode === "approved"
+                    ? "bg-card text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                Aprovadas
+                <span className="rounded-full bg-background px-1.5 text-[11px] tabular-nums text-muted-foreground">
+                  {approvedFrameTotal.toLocaleString("pt-BR")}
+                </span>
+              </button>
+            </div>
             <button
               type="button"
               onClick={() => selectFrame(-1)}
@@ -1076,28 +1241,28 @@ export function ReviewWorkspace() {
             </button>
             <button
               type="button"
-              onClick={selectPrevious}
+              onClick={() => selectFrame(-1)}
               className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
-              aria-label="Objeto anterior"
-              title="Objeto anterior"
+              aria-label="Imagem anterior"
+              title="Imagem anterior"
             >
               <ChevronLeft className="size-4" />
             </button>
             <button
               type="button"
-              onClick={selectNext}
+              onClick={() => selectFrame(1)}
               className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
-              aria-label="Próximo objeto"
-              title="Próximo objeto"
+              aria-label="Próxima imagem"
+              title="Próxima imagem"
             >
               <Play className="size-4" />
             </button>
             <button
               type="button"
-              onClick={selectNext}
+              onClick={() => selectFrame(1)}
               className="inline-flex size-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
-              aria-label="Próximo objeto"
-              title="Próximo objeto"
+              aria-label="Próxima imagem"
+              title="Próxima imagem"
             >
               <ChevronRight className="size-4" />
             </button>
@@ -1113,15 +1278,17 @@ export function ReviewWorkspace() {
             <span className="ml-1 text-sm font-medium tabular-nums">
               {queuePos.toLocaleString("pt-BR")} / {queueTotal.toLocaleString("pt-BR")}
             </span>
-            <label className="ml-3 flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
-              <input
-                type="checkbox"
-                checked={autoAdvance}
-                onChange={(e) => setAutoAdvance(e.target.checked)}
-                className="size-4 rounded border-border accent-brand-blue"
-              />
-              Auto avançar
-            </label>
+            {!isApprovedMode && (
+              <label className="ml-3 flex cursor-pointer items-center gap-2 text-sm text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={autoAdvance}
+                  onChange={(e) => setAutoAdvance(e.target.checked)}
+                  className="size-4 rounded border-border accent-brand-blue"
+                />
+                Auto avançar
+              </label>
+            )}
             <div className="ml-auto flex items-center gap-1">
               <button
                 onClick={() => setScale((s) => Math.max(0.5, s - 0.1))}
@@ -1485,16 +1652,18 @@ export function ReviewWorkspace() {
                               <button aria-label="Expandir" className="hover:text-foreground">
                                 <Maximize2 className="size-4" />
                               </button>
-                              <button
-                                aria-label="Excluir anotação"
-                                onClick={(e) => {
-                                  e.stopPropagation()
-                                  startCorrection(a.id)
-                                }}
-                                className="hover:text-destructive"
-                              >
-                                <Trash2 className="size-4" />
-                              </button>
+                              {!isApprovedMode && (
+                                <button
+                                  aria-label="Excluir anotação"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    startCorrection(a.id)
+                                  }}
+                                  className="hover:text-destructive"
+                                >
+                                  <Trash2 className="size-4" />
+                                </button>
+                              )}
                             </span>
                           </td>
                         </tr>
@@ -1514,20 +1683,24 @@ export function ReviewWorkspace() {
         {/* ---------- RIGHT: decision panel ---------- */}
         <aside className="hidden w-80 shrink-0 flex-col overflow-y-auto border-l border-border bg-card xl:flex">
           <div className="flex items-center justify-between px-4 pb-2 pt-4">
-            <p className="text-sm font-semibold">Anotação selecionada</p>
+            <p className="text-sm font-semibold">{isApprovedMode ? "Imagem aprovada" : "Imagem em revisão"}</p>
             <button className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
-              ID: {current.id} <Copy className="size-3.5" />
+              Frame: {current.frame ?? "--"} <Copy className="size-3.5" />
             </button>
           </div>
 
           <div className="flex items-start justify-between gap-3 px-4">
             <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Objeto selecionado</p>
               <p className="text-2xl font-semibold" style={{ color: clsColor(clsOf(current)) }}>
                 {clsOf(current)}
               </p>
               <p className="text-sm">
                 <span className="font-medium tabular-nums">{current.conf.toFixed(2)}</span>{" "}
                 <span className="text-muted-foreground">Confiança</span>
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {frameAnnotationTotal.toLocaleString("pt-BR")} objetos nesta imagem
               </p>
             </div>
             <div className="size-16 shrink-0 overflow-hidden rounded-lg border border-border">
@@ -1547,67 +1720,80 @@ export function ReviewWorkspace() {
             )}
           </dl>
 
-          {/* top alternativas */}
-          <div className="mt-5 px-4">
-            <p className="mb-2 text-sm font-medium">Top alternativas</p>
-            <ol className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm">
-              {alts.map((alt, i) => (
-                <li key={alt.cls} className="flex items-center justify-between gap-2">
-                  <span className="flex min-w-0 items-center gap-1.5">
-                    <span className="text-muted-foreground">{i + 1}.</span>
-                    <span className="size-2 shrink-0 rounded-full" style={{ background: clsColor(alt.cls) }} />
-                    <span className="truncate" style={i === 0 ? { color: current.color } : undefined}>
-                      {alt.cls}
-                    </span>
-                  </span>
-                  <span className="tabular-nums text-muted-foreground">{alt.v.toFixed(2)}</span>
-                </li>
-              ))}
-            </ol>
-          </div>
-
-          {/* quick actions */}
-          <div className="mt-5 px-4">
-            <p className="mb-2 text-sm font-medium">Ações rápidas</p>
-            <div className="flex flex-col gap-2">
-              <DecisionButton onClick={() => void decide("aceito")} className="bg-brand-green text-white hover:brightness-110">
-                <ArrowRight className="size-4" /> <span className="flex-1 text-center">Aceitar</span>{" "}
-                <ArrowRight className="size-4" />
-              </DecisionButton>
-              <DecisionButton
-                onClick={() => startCorrection()}
-                className="bg-warning text-white hover:brightness-110"
-              >
-                <ArrowUp className="size-4" /> <span className="flex-1 text-center">Corrigir objeto</span>{" "}
-                <ArrowUp className="size-4" />
-              </DecisionButton>
-              <DecisionButton
-                onClick={() => void decide("anotacao")}
-                className="bg-destructive text-destructive-foreground hover:brightness-110"
-              >
-                <ArrowLeft className="size-4" /> <span className="flex-1 text-center">Enviar para anotação</span>{" "}
-                <ArrowLeft className="size-4" />
-              </DecisionButton>
+          {isApprovedMode ? (
+            <div className="mt-5 px-4">
+              <div className="rounded-lg border border-brand-green/25 bg-brand-green/10 px-3 py-3 text-sm">
+                <p className="font-medium text-foreground">Disponível para consulta</p>
+                <p className="mt-1 text-muted-foreground">
+                  Esta imagem já saiu da fila de revisão. Ela permanece aqui para inspeção do resultado aprovado.
+                </p>
+              </div>
             </div>
-          </div>
+          ) : (
+            <>
+              {/* top alternativas */}
+              <div className="mt-5 px-4">
+                <p className="mb-2 text-sm font-medium">Top alternativas</p>
+                <ol className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm">
+                  {alts.map((alt, i) => (
+                    <li key={alt.cls} className="flex items-center justify-between gap-2">
+                      <span className="flex min-w-0 items-center gap-1.5">
+                        <span className="text-muted-foreground">{i + 1}.</span>
+                        <span className="size-2 shrink-0 rounded-full" style={{ background: clsColor(alt.cls) }} />
+                        <span className="truncate" style={i === 0 ? { color: current.color } : undefined}>
+                          {alt.cls}
+                        </span>
+                      </span>
+                      <span className="tabular-nums text-muted-foreground">{alt.v.toFixed(2)}</span>
+                    </li>
+                  ))}
+                </ol>
+              </div>
 
-          {/* motivo */}
-          <div className="mt-5 px-4">
-            <label className="mb-1.5 block text-xs text-muted-foreground">Motivo (opcional)</label>
-            <button className="flex w-full items-center justify-between rounded-lg border border-border bg-background px-3 py-2 text-sm text-muted-foreground hover:bg-muted">
-              Selecione um motivo... <ChevronDown className="size-4" />
-            </button>
-          </div>
+              {/* quick actions */}
+              <div className="mt-5 px-4">
+                <p className="mb-2 text-sm font-medium">Decisão da imagem</p>
+                <div className="flex flex-col gap-2">
+                  <DecisionButton onClick={() => void decide("aceito")} className="bg-brand-green text-white hover:brightness-110">
+                    <ArrowRight className="size-4" /> <span className="flex-1 text-center">Aceitar imagem</span>{" "}
+                    <ArrowRight className="size-4" />
+                  </DecisionButton>
+                  <DecisionButton
+                    onClick={() => startCorrection()}
+                    className="bg-warning text-white hover:brightness-110"
+                  >
+                    <ArrowUp className="size-4" /> <span className="flex-1 text-center">Editar objeto selecionado</span>{" "}
+                    <ArrowUp className="size-4" />
+                  </DecisionButton>
+                  <DecisionButton
+                    onClick={() => void decide("anotacao")}
+                    className="bg-destructive text-destructive-foreground hover:brightness-110"
+                  >
+                    <ArrowLeft className="size-4" /> <span className="flex-1 text-center">Enviar imagem para anotação</span>{" "}
+                    <ArrowLeft className="size-4" />
+                  </DecisionButton>
+                </div>
+              </div>
 
-          {/* comentário */}
-          <div className="mt-3 px-4">
-            <label className="mb-1.5 block text-xs text-muted-foreground">Comentário (opcional)</label>
-            <textarea
-              rows={2}
-              placeholder="Adicione um comentário..."
-              className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus:border-brand-blue"
-            />
-          </div>
+              {/* motivo */}
+              <div className="mt-5 px-4">
+                <label className="mb-1.5 block text-xs text-muted-foreground">Motivo (opcional)</label>
+                <button className="flex w-full items-center justify-between rounded-lg border border-border bg-background px-3 py-2 text-sm text-muted-foreground hover:bg-muted">
+                  Selecione um motivo... <ChevronDown className="size-4" />
+                </button>
+              </div>
+
+              {/* comentário */}
+              <div className="mt-3 px-4">
+                <label className="mb-1.5 block text-xs text-muted-foreground">Comentário (opcional)</label>
+                <textarea
+                  rows={2}
+                  placeholder="Adicione um comentário..."
+                  className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus:border-brand-blue"
+                />
+              </div>
+            </>
+          )}
 
           <div className="pb-4" />
         </aside>
@@ -1618,16 +1804,19 @@ export function ReviewWorkspace() {
         <span className="flex items-center gap-2 text-muted-foreground">
           Atalhos ativos
           <span className="flex items-center gap-1 text-brand-green">
-            <span className="size-1.5 rounded-full bg-brand-green" /> Modo decis��o
+            <span className="size-1.5 rounded-full bg-brand-green" />{" "}
+            {isApprovedMode ? "Modo consulta de aprovadas" : "Modo decisão por imagem"}
           </span>
         </span>
         <span className="hidden items-center gap-2 text-muted-foreground md:flex">
-          Progresso da fila
+          {isApprovedMode ? "Imagens aprovadas" : "Progresso da fila"}
           <span className="h-1.5 w-32 overflow-hidden rounded-full bg-muted">
             <span className="block h-full rounded-full bg-brand-green" style={{ width: `${queuePct}%` }} />
           </span>
           <span className="tabular-nums text-foreground">
-            {queuePos.toLocaleString("pt-BR")} / {queueTotal.toLocaleString("pt-BR")} ({queuePct}%)
+            {isApprovedMode
+              ? `${queueTotal.toLocaleString("pt-BR")} imagens`
+              : `${queuePos.toLocaleString("pt-BR")} / ${queueTotal.toLocaleString("pt-BR")} imagens (${queuePct}%)`}
           </span>
         </span>
         <span className="hidden text-muted-foreground lg:block">

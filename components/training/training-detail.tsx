@@ -11,11 +11,11 @@ import { MetricLineChart } from "@/components/app/charts"
 import {
   deleteTrainingRun,
   downloadBackendFile,
+  fetchTrainingArtifactBlob,
   fetchTrainingRun,
   pauseTrainingRun,
   retryTrainingRun,
   stopTrainingRun,
-  trainingArtifactAssetUrl,
   trainingArtifactDownloadPath,
   trainingRunEventsUrl,
 } from "@/lib/api/client"
@@ -677,7 +677,12 @@ function OverviewTab({ run }: { run: BackendTrainingRun }) {
     <div className="flex flex-col gap-6">
       <Card>
         <CardHeader>
-          <CardTitle>Métricas reportadas</CardTitle>
+          <div>
+            <CardTitle>Métricas de validação</CardTitle>
+            <p className="mt-1 text-xs text-muted-foreground">
+              mAP, precisão, recall e perdas val/* são calculados no conjunto de validação.
+            </p>
+          </div>
           <span className="text-xs text-muted-foreground">{formatDateTimePt(run.updated_at)}</span>
         </CardHeader>
         <CardContent className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_300px]">
@@ -811,8 +816,8 @@ function ValidationArtifactsCard({ run }: { run: BackendTrainingRun }) {
                     )}
                   >
                     <div className="aspect-video overflow-hidden bg-muted/20">
-                      <img
-                        src={trainingArtifactAssetUrl(artifact.runId, artifact.path)}
+                      <TrainingArtifactImage
+                        artifact={artifact}
                         alt={artifact.label}
                         className="h-full w-full object-cover transition-transform group-hover:scale-[1.02]"
                       />
@@ -855,8 +860,8 @@ function ValidationMediaViewer({
           variant === "matrix" ? "aspect-[4/3] max-h-[380px] bg-white p-3" : "aspect-video bg-muted/20",
         )}
       >
-        <img
-          src={trainingArtifactAssetUrl(artifact.runId, artifact.path)}
+        <TrainingArtifactImage
+          artifact={artifact}
           alt={artifact.label}
           className={cn("h-full w-full", variant === "matrix" ? "object-contain" : "object-cover")}
         />
@@ -867,6 +872,55 @@ function ValidationMediaViewer({
       </figcaption>
     </figure>
   )
+}
+
+function TrainingArtifactImage({
+  artifact,
+  alt,
+  className,
+}: {
+  artifact: TrainingImageArtifact
+  alt: string
+  className?: string
+}) {
+  const [src, setSrc] = React.useState<string | null>(null)
+  const [failed, setFailed] = React.useState(false)
+
+  React.useEffect(() => {
+    const controller = new AbortController()
+    let objectUrl: string | null = null
+
+    setSrc(null)
+    setFailed(false)
+    fetchTrainingArtifactBlob(artifact.runId, artifact.path, controller.signal)
+      .then((blob) => {
+        if (controller.signal.aborted) return
+        objectUrl = URL.createObjectURL(blob)
+        setSrc(objectUrl)
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setFailed(true)
+      })
+
+    return () => {
+      controller.abort()
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [artifact.runId, artifact.path])
+
+  if (failed) {
+    return (
+      <div className="flex h-full w-full items-center justify-center bg-muted/30 px-3 text-center text-xs text-muted-foreground">
+        Não foi possível carregar a imagem.
+      </div>
+    )
+  }
+
+  if (!src) {
+    return <div className="h-full w-full animate-pulse bg-muted/30" />
+  }
+
+  return <img src={src} alt={alt} className={className} />
 }
 
 function pluralCount(count: number, singular: string, plural: string) {

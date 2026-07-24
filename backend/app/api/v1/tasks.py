@@ -10,6 +10,7 @@ from app.models import (
     AuditEvent,
     CvatLabel,
     JobRecord,
+    FrameWorkflowState,
     Project,
     ProjectMember,
     Task,
@@ -24,6 +25,7 @@ from app.schemas import (
     TaskRead,
 )
 from app.services.cvat_client import CvatClient, CvatClientError
+from app.services.artifacts import S3ArtifactStore
 from app.services.frame_previews import retrieve_annotation_frame_preview
 from app.services.tasks import (
     ActiveTaskJobsError,
@@ -147,6 +149,7 @@ def delete_task(
             actor_email=actor.email,
             client=CvatClient(get_settings()) if delete_cvat else None,
             delete_cvat=delete_cvat,
+            artifact_store=S3ArtifactStore(get_settings()),
         )
     except ActiveTaskJobsError as exc:
         raise HTTPException(
@@ -165,13 +168,42 @@ def get_task_data_meta(
     task_id: str,
     db: Session = Depends(db_session),
     user: User = Depends(current_user),
-) -> TaskDataMeta:
+) -> dict:
     task = require_task_access(db, user, task_id)
     external_id = task.external_id
     meta = db.scalar(select(TaskDataMeta).where(TaskDataMeta.task_external_id == external_id))
     if meta is None:
         raise HTTPException(status_code=404, detail="Task data meta not found")
-    return meta
+    workflow_states = db.scalars(
+        select(FrameWorkflowState).where(FrameWorkflowState.task_external_id == external_id)
+    ).all()
+    return {
+        "id": meta.id,
+        "task_external_id": meta.task_external_id,
+        "frame_count": meta.frame_count,
+        "chunk_size": meta.chunk_size,
+        "start_frame": meta.start_frame,
+        "stop_frame": meta.stop_frame,
+        "frame_filter": meta.frame_filter,
+        "frames": meta.frames,
+        "deleted_frames": meta.deleted_frames,
+        "frame_workflow_states": [
+            {
+                "frame": state.frame,
+                "status": state.status,
+                "annotation_count": state.annotation_count,
+                "assigned_user_id": state.assigned_user_id,
+                "submitted_by": state.submitted_by,
+                "reviewed_by": state.reviewed_by,
+                "reason": state.reason,
+                "raw": state.raw,
+            }
+            for state in workflow_states
+        ],
+        "raw": meta.raw,
+        "created_at": meta.created_at,
+        "updated_at": meta.updated_at,
+    }
 
 
 @router.get("/{task_id}/preview")
@@ -259,7 +291,7 @@ def _attach_annotation_progress(db: Session, tasks: list[Task]) -> None:
     if not external_ids:
         return
     active_annotation = ~AnnotationRecord.review_state.in_(
-        ["deleted_by_reviewer", "needs_annotation", "rejected", "incorrect"]
+        ["deleted_by_reviewer", "needs_annotation", "rejected", "incorrect", "replaced_by_manual"]
     )
     annotation_counts = {
         str(task_external_id): int(count or 0)

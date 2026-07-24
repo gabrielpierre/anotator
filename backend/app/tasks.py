@@ -51,6 +51,7 @@ def sync_cvat_task(job_id: str | None = None) -> dict[str, Any]:
     except JobCanceled:
         return {"status": "canceled"}
     except Exception as exc:
+        db.rollback()
         if job_id:
             fail_job(db, job_id, reason=str(exc))
         raise
@@ -80,6 +81,7 @@ def import_task_job_task(job_id: str) -> dict[str, Any]:
     except JobCanceled:
         return {"status": "canceled", "job_id": job_id}
     except Exception as exc:
+        db.rollback()
         fail_job(db, job_id, reason=str(exc))
         raise
     finally:

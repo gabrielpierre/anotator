@@ -17,6 +17,8 @@ AnnotationType = Literal["shape", "track", "tag"]
 InferenceModelFamily = Literal["detection", "segmentation", "classification", "tracking"]
 InferenceApplyMode = Literal["append", "replace"]
 UserRole = Literal["admin", "anotador"]
+AnnotationImportTarget = Literal["annotation", "review"]
+DatasetReleaseImageScope = Literal["all", "annotated"]
 
 
 class OrmModel(BaseModel):
@@ -242,6 +244,7 @@ class TaskDataMetaRead(OrmModel):
     frame_filter: str | None = None
     frames: list[Any] = Field(default_factory=list)
     deleted_frames: list[Any] = Field(default_factory=list)
+    frame_workflow_states: list[dict[str, Any]] = Field(default_factory=list)
     raw: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
@@ -504,6 +507,7 @@ class DatasetReleaseCreate(BaseModel):
     job_external_ids: list[str] = Field(default_factory=list)
     export_format: str | None = None
     include_images: bool = True
+    image_scope: DatasetReleaseImageScope = "all"
     splits: dict[str, Any] = Field(
         default_factory=lambda: {"train": 0.8, "val": 0.1, "test": 0.1}
     )
@@ -733,6 +737,7 @@ class ImportTaskCreate(BaseModel):
     assignee_user_id: str | None = None
     labels: list[dict[str, Any]] = Field(default_factory=list)
     class_mappings: list[dict[str, Any]] = Field(default_factory=list)
+    annotation_import_target: AnnotationImportTarget = "review"
     source_path: str | None = Field(default=None, max_length=2048)
     estimated_bytes: int | None = Field(default=None, ge=0)
     sync_after_import: bool = True

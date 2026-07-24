@@ -182,6 +182,19 @@ async function deleteJson<T>(path: string, signal?: AbortSignal): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function getBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(`${apiBaseUrl()}${path}`, {
+    method: "GET",
+    headers: apiHeaders(),
+    cache: "no-store",
+    signal,
+  })
+  if (!response.ok) {
+    throw await backendError(response)
+  }
+  return response.blob()
+}
+
 async function backendError(response: Response) {
   const fallback = `Backend request failed: ${response.status} ${response.statusText}`
   try {
@@ -440,25 +453,27 @@ export function updateInferenceSuggestionStatus(
 }
 
 export function fetchReviewQueue(
-  paramsOrSignal?: { projectExternalId?: string | null } | AbortSignal,
+  paramsOrSignal?: { projectExternalId?: string | null; state?: "pending" | "approved" } | AbortSignal,
   maybeSignal?: AbortSignal,
 ) {
   const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
   const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
   const query = new URLSearchParams()
   if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
+  if (params.state) query.set("state", params.state)
   const suffix = query.toString() ? `?${query.toString()}` : ""
   return getJson<BackendReviewQueueItem[]>(`/review/queue${suffix}`, signal)
 }
 
 export function fetchReviewQueueCount(
-  paramsOrSignal?: { projectExternalId?: string | null } | AbortSignal,
+  paramsOrSignal?: { projectExternalId?: string | null; state?: "pending" | "approved" } | AbortSignal,
   maybeSignal?: AbortSignal,
 ) {
   const params = isAbortSignal(paramsOrSignal) ? {} : (paramsOrSignal ?? {})
   const signal = isAbortSignal(paramsOrSignal) ? paramsOrSignal : maybeSignal
   const query = new URLSearchParams()
   if (params.projectExternalId) query.set("project_external_id", params.projectExternalId)
+  if (params.state) query.set("state", params.state)
   const suffix = query.toString() ? `?${query.toString()}` : ""
   return getJson<BackendReviewQueueCount>(`/review/queue/count${suffix}`, signal)
 }
@@ -690,13 +705,18 @@ export function trainingArtifactDownloadPath(runId: string, artifactPath: string
     .filter(Boolean)
     .map((part) => encodeURIComponent(part))
     .join("/")
-  return `/training/${encodeURIComponent(runId)}/artifacts/${encodedPath}/download`
+  return `/training-runs/${encodeURIComponent(runId)}/artifacts/${encodedPath}/download`
 }
 
 export function trainingArtifactAssetUrl(runId: string, artifactPath: string) {
   const url = new URL(`${apiBaseUrl()}${trainingArtifactDownloadPath(runId, artifactPath)}`)
   url.searchParams.set("inline", "true")
   return withApiKeyQuery(url.toString())
+}
+
+export function fetchTrainingArtifactBlob(runId: string, artifactPath: string, signal?: AbortSignal) {
+  const path = `${trainingArtifactDownloadPath(runId, artifactPath)}?inline=true`
+  return getBlob(path, signal)
 }
 
 export function createImportTask(payload: BackendImportTaskCreate, signal?: AbortSignal) {

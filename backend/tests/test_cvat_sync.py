@@ -80,6 +80,27 @@ class FakeCvatClient:
         }
 
 
+class DirectImportCvatClient:
+    """A task criada sem projeto CVAT ainda pertence a um projeto local."""
+
+    def list_projects(self) -> list[dict]:
+        return []
+
+    def list_tasks(self) -> list[dict]:
+        return [{"id": 42, "name": "Lote importado", "status": "annotation", "size": 1}]
+
+    def retrieve_task(self, task_id: str) -> dict:
+        assert task_id == "42"
+        return {"id": 42, "name": "Lote importado", "status": "annotation", "size": 1}
+
+    def retrieve_task_data_meta(self, task_id: str) -> dict:
+        assert task_id == "42"
+        return {"size": 1, "frames": [{"name": "imagem.jpg", "width": 100, "height": 100}]}
+
+    def list_jobs(self) -> list[dict]:
+        return []
+
+
 def test_cvat_sync_is_idempotent_for_core_read_models() -> None:
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
@@ -120,3 +141,55 @@ def test_cvat_sync_is_idempotent_for_core_read_models() -> None:
         assert annotation is not None
         assert annotation.external_id == "cvat_job:99:shape:501"
         assert annotation.label_name == "truck"
+
+
+def test_cvat_sync_preserves_local_project_for_standalone_imported_task() -> None:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    with session_factory() as db:
+        project = Project(external_id="local-project", name="Projeto local")
+        task = Task(
+            external_id="42",
+            project_external_id="local-project",
+            name="Lote importado",
+        )
+        db.add_all([project, task])
+        db.commit()
+
+        CvatSyncService(db, DirectImportCvatClient()).sync_all()  # type: ignore[arg-type]
+
+        synced_task = db.scalar(select(Task).where(Task.external_id == "42"))
+        assert synced_task is not None
+        assert synced_task.project_external_id == "local-project"
+
+
+def test_cvat_sync_recovers_standalone_task_project_from_import_job() -> None:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+    with session_factory() as db:
+        project = Project(external_id="local-project", name="Projeto local")
+        db.add(project)
+        db.flush()
+        db.add(
+            JobRecord(
+                kind="import",
+                status="failed",
+                progress=80,
+                name="Import CVAT task Lote importado",
+                raw={
+                    "payload": {"project_id": project.id},
+                    "import_batches": [{"cvat_task_id": "42"}],
+                },
+            )
+        )
+        db.commit()
+
+        CvatSyncService(db, DirectImportCvatClient()).sync_all()  # type: ignore[arg-type]
+
+        synced_task = db.scalar(select(Task).where(Task.external_id == "42"))
+        assert synced_task is not None
+        assert synced_task.project_external_id == "local-project"

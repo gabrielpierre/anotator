@@ -140,6 +140,24 @@ class AnnotationRecord(Base, TimestampMixin):
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class FrameWorkflowState(Base, TimestampMixin):
+    __tablename__ = "frame_workflow_states"
+    __table_args__ = (
+        UniqueConstraint("task_external_id", "frame", name="uq_frame_workflow_states_task_frame"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    task_external_id: Mapped[str] = mapped_column(String(64), index=True)
+    frame: Mapped[int] = mapped_column(Integer, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="annotation_pending", index=True)
+    annotation_count: Mapped[int] = mapped_column(Integer, default=0)
+    assigned_user_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    submitted_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class InferenceSuggestion(Base, TimestampMixin):
     __tablename__ = "inference_suggestions"
     __table_args__ = (UniqueConstraint("external_id", name="uq_inference_suggestions_external_id"),)

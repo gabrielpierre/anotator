@@ -7,20 +7,27 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     AnnotationRecord,
+    AnnotationRevision,
     AuditEvent,
     CvatLabel,
     DatasetRelease,
     DerivedAsset,
+    FrameWorkflowState,
     InferenceSuggestion,
     JobRecord,
     PipelineRun,
+    Project,
+    ReviewDecision,
     Task,
     TaskDataMeta,
     TaskPreview,
+    TrackRevision,
     TrainingRun,
 )
 from app.schemas import TaskDeleteBlockingJob, TaskDeleteImpactRead, TaskDeleteResultRead
+from app.services.artifacts import ArtifactStore
 from app.services.jobs import ACTIVE_JOB_STATUSES
+from app.services.project_storage import refresh_project_storage
 
 TASK_OWNED_JOB_KINDS = {"cvat_job", "import", "inference"}
 
@@ -99,6 +106,7 @@ def delete_task_with_dependencies(
     actor_email: str,
     client: Any | None = None,
     delete_cvat: bool = True,
+    artifact_store: ArtifactStore | None = None,
 ) -> TaskDeleteResultRead:
     impact = build_task_delete_impact(db, task)
     if impact.blocking:
@@ -109,11 +117,15 @@ def delete_task_with_dependencies(
             raise RuntimeError("CVAT client is required when delete_cvat=true")
         client.delete_task(task.external_id)
 
+    project = db.scalar(select(Project).where(Project.external_id == task.project_external_id))
+    upload_cleanup = cleanup_task_import_uploads(db, task.external_id, artifact_store)
     deleted = delete_local_task_records(db, task.external_id)
     task_id = task.id
     task_external_id = task.external_id
     task_name = task.name
     db.delete(task)
+    db.flush()
+    refresh_project_storage(db, project)
 
     preserved = {
         "dataset_releases": impact.dataset_releases,
@@ -121,6 +133,8 @@ def delete_task_with_dependencies(
         "pipeline_runs": impact.pipeline_runs,
     }
     warnings = list(impact.warnings)
+    if upload_cleanup["errors"]:
+        warnings.append("Alguns uploads temporarios nao puderam ser removidos e serao reconciliados depois.")
     if not delete_cvat:
         warnings.append("O lote foi removido apenas localmente e pode voltar no proximo sync do CVAT.")
 
@@ -145,6 +159,7 @@ def delete_task_with_dependencies(
                 "delete_cvat": delete_cvat,
                 "impact": impact.model_dump(mode="json"),
                 "deleted": deleted,
+                "upload_cleanup": upload_cleanup,
                 "preserved": preserved,
             },
         )
@@ -153,13 +168,57 @@ def delete_task_with_dependencies(
     return result
 
 
+def cleanup_task_import_uploads(
+    db: Session,
+    task_external_id: str,
+    artifact_store: ArtifactStore | None,
+) -> dict[str, Any]:
+    """Remove arquivos de transporte de imports ligados a uma task removida."""
+    result: dict[str, Any] = {"prefixes": 0, "deleted_objects": 0, "errors": []}
+    if artifact_store is None:
+        return result
+
+    prefixes: set[str] = set()
+    jobs = db.scalars(select(JobRecord).where(JobRecord.kind == "import")).all()
+    for job in jobs:
+        if not _job_directly_references_task(job, task_external_id):
+            continue
+        uploads = (job.raw or {}).get("upload_artifacts")
+        if not isinstance(uploads, list):
+            continue
+        for upload in uploads:
+            if not isinstance(upload, dict):
+                continue
+            uri = upload.get("uri")
+            if not isinstance(uri, str) or not uri.startswith("s3://"):
+                continue
+            before, marker, _after = uri.partition("/uploads/")
+            if marker:
+                prefixes.add(f"{before}{marker}")
+
+    result["prefixes"] = len(prefixes)
+    for prefix in sorted(prefixes):
+        try:
+            result["deleted_objects"] += artifact_store.delete_prefix(prefix)
+        except Exception as exc:
+            result["errors"].append(f"{prefix}: {exc}")
+    return result
+
+
 def delete_local_task_records(db: Session, task_external_id: str) -> dict[str, int]:
+    annotations = list(
+        db.scalars(
+            select(AnnotationRecord).where(AnnotationRecord.task_external_id == task_external_id)
+        ).all()
+    )
+    annotation_external_ids = {annotation.external_id for annotation in annotations}
+    cvat_job_ids = {annotation.cvat_job_id for annotation in annotations if annotation.cvat_job_id}
     cvat_jobs = _count(
         JobRecord,
         (JobRecord.kind == "cvat_job") & (JobRecord.task_external_id == task_external_id),
         db=db,
     )
-    return {
+    deleted = {
         "annotations": _delete_count(
             db,
             delete(AnnotationRecord).where(AnnotationRecord.task_external_id == task_external_id),
@@ -183,6 +242,35 @@ def delete_local_task_records(db: Session, task_external_id: str) -> dict[str, i
         "cvat_jobs": cvat_jobs,
         "jobs": _delete_task_owned_jobs(db, task_external_id),
     }
+    deleted["frame_workflow_states"] = _delete_count(
+        db,
+        delete(FrameWorkflowState).where(FrameWorkflowState.task_external_id == task_external_id),
+    )
+    if annotation_external_ids:
+        deleted["annotation_revisions"] = _delete_count(
+            db,
+            delete(AnnotationRevision).where(
+                AnnotationRevision.annotation_external_id.in_(annotation_external_ids)
+            ),
+        )
+        deleted["review_decisions"] = _delete_count(
+            db,
+            delete(ReviewDecision).where(
+                ReviewDecision.external_annotation_id.in_(annotation_external_ids)
+            ),
+        )
+    else:
+        deleted["annotation_revisions"] = 0
+        deleted["review_decisions"] = 0
+    deleted["track_revisions"] = (
+        _delete_count(
+            db,
+            delete(TrackRevision).where(TrackRevision.cvat_job_id.in_(cvat_job_ids)),
+        )
+        if cvat_job_ids
+        else 0
+    )
+    return deleted
 
 
 def _active_jobs_for_task(db: Session, task_external_id: str) -> list[JobRecord]:

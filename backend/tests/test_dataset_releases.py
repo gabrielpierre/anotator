@@ -1,3 +1,6 @@
+import io
+import zipfile
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, select
@@ -23,8 +26,9 @@ from app.services.releases import create_dataset_release
 
 
 class FakeReleaseCvatClient:
-    def __init__(self) -> None:
+    def __init__(self, export_content: bytes = b"zip-bytes") -> None:
         self.export_calls: list[dict] = []
+        self.export_content = export_content
 
     def create_task_dataset_export(
         self,
@@ -50,7 +54,7 @@ class FakeReleaseCvatClient:
 
     def get_url_bytes(self, url_or_path: str) -> CvatBinaryResponse:
         assert url_or_path == "/api/exports/release.zip"
-        return CvatBinaryResponse(b"zip-bytes", "application/zip")
+        return CvatBinaryResponse(self.export_content, "application/zip")
 
     def list_quality_reports(self, *, task_id: str | None = None) -> list[dict]:
         return [{"id": 1, "task_id": task_id, "summary": {"accuracy": 0.98}}]
@@ -141,6 +145,8 @@ def test_dataset_release_exports_cvat_artifacts_and_records_qa_snapshot() -> Non
             "labels": 1,
             "annotations": 1,
             "images": 3,
+            "source_images": 3,
+            "annotated_images": 1,
         }
         assert release.snapshot["artifacts"][0]["size_bytes"] == len(b"zip-bytes")
         assert release.snapshot["qa"]["ground_truth_jobs"][0]["configured"] is True
@@ -155,6 +161,78 @@ def test_dataset_release_exports_cvat_artifacts_and_records_qa_snapshot() -> Non
         ]
         assert artifact_store.objects[0]["content"] == b"zip-bytes"
         assert db.scalar(select(AuditEvent).where(AuditEvent.action == "dataset_release_ready")) is not None
+
+
+def test_dataset_release_can_include_only_annotated_images() -> None:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    client = FakeReleaseCvatClient(_cvat_images_zip())
+    artifact_store = FakeArtifactStore()
+
+    with session_factory() as db:
+        db.add(
+            Task(
+                external_id="21",
+                name="camera-01",
+                status="completed",
+                size=3,
+                labels=[{"id": 11, "name": "truck"}],
+            )
+        )
+        db.add(
+            AnnotationRecord(
+                external_id="cvat_job:99:shape:501",
+                cvat_job_id="99",
+                task_external_id="21",
+                annotation_type="shape",
+                cvat_annotation_id="501",
+                frame=1,
+                label_id=11,
+                label_name="truck",
+                shape_type="rectangle",
+                source="manual",
+                points=[10, 20, 110, 120],
+                raw={"id": 501},
+            )
+        )
+        db.commit()
+
+        release = create_dataset_release(
+            db,
+            payload=DatasetReleaseCreate(
+                name="release_annotated",
+                task_external_ids=["21"],
+                image_scope="annotated",
+            ),
+            settings=Settings(),
+            client=client,  # type: ignore[arg-type]
+            artifact_store=artifact_store,
+        )
+
+        assert release.snapshot["image_scope"] == "annotated"
+        assert release.snapshot["counts"]["images"] == 1
+        assert release.snapshot["counts"]["source_images"] == 3
+        assert release.snapshot["counts"]["annotated_images"] == 1
+        assert release.snapshot["tasks"][0]["release_images"] == 1
+        assert release.snapshot["artifacts"][0]["filtered"] == {
+            "source_images": 3,
+            "included_images": 1,
+            "removed_images": 2,
+            "annotated_frames": [1],
+        }
+
+        with zipfile.ZipFile(io.BytesIO(artifact_store.objects[0]["content"])) as archive:
+            names = sorted(archive.namelist())
+            xml = archive.read("annotations.xml").decode("utf-8")
+
+        assert "images/frame_000000.jpg" not in names
+        assert "images/frame_000001.jpg" in names
+        assert "images/frame_000002.jpg" not in names
+        assert 'name="images/frame_000000.jpg"' not in xml
+        assert 'name="images/frame_000001.jpg"' in xml
+        assert 'name="images/frame_000002.jpg"' not in xml
+        assert "<size>1</size>" in xml
 
 
 def test_training_requires_ready_immutable_release_with_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -264,3 +342,33 @@ def test_failed_training_run_can_be_retried(monkeypatch: pytest.MonkeyPatch) -> 
         assert jobs[0].raw["training_run_id"] == run.id
         assert jobs[0].raw["celery_task_id"] == "celery-training-retry"
         assert db.scalar(select(AuditEvent).where(AuditEvent.action == "training_run_retried")) is not None
+
+
+def _cvat_images_zip() -> bytes:
+    xml = """<?xml version="1.0" encoding="utf-8"?>
+<annotations>
+  <version>1.1</version>
+  <meta>
+    <task>
+      <id>21</id>
+      <name>camera-01</name>
+      <size>3</size>
+      <labels>
+        <label><name>truck</name></label>
+      </labels>
+    </task>
+  </meta>
+  <image id="0" name="images/frame_000000.jpg" width="100" height="100" />
+  <image id="1" name="images/frame_000001.jpg" width="100" height="100">
+    <box label="truck" xtl="10" ytl="20" xbr="80" ybr="90" />
+  </image>
+  <image id="2" name="images/frame_000002.jpg" width="100" height="100" />
+</annotations>
+"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("annotations.xml", xml)
+        archive.writestr("images/frame_000000.jpg", b"image-0")
+        archive.writestr("images/frame_000001.jpg", b"image-1")
+        archive.writestr("images/frame_000002.jpg", b"image-2")
+    return buffer.getvalue()

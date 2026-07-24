@@ -14,6 +14,7 @@ from app.models import (
     AuditEvent,
     CvatLabel,
     DatasetRelease,
+    FrameWorkflowState,
     JobRecord,
     Project,
     ProjectMember,
@@ -32,7 +33,10 @@ from app.schemas import (
     ProjectUpdate,
 )
 from app.services.cvat_client import CvatClient, CvatClientError
-from app.services.tasks import delete_local_task_records
+from app.services.artifacts import S3ArtifactStore
+from app.services.project_cleanup import purge_project_derived_data
+from app.services.project_storage import refresh_project_storage
+from app.services.tasks import cleanup_task_import_uploads, delete_local_task_records
 
 router = APIRouter()
 
@@ -160,11 +164,20 @@ def delete_project(
     if project is None or project.status == "deleted":
         raise HTTPException(status_code=404, detail="Project not found")
 
-    task_cleanup = _delete_project_tasks(db, project)
+    artifact_store = S3ArtifactStore(get_settings())
+    task_cleanup = _delete_project_tasks(db, project, artifact_store=artifact_store)
+    db.flush()
+    derived_cleanup = purge_project_derived_data(
+        db,
+        project,
+        task_external_ids=task_cleanup["task_external_ids"],
+        artifact_store=artifact_store,
+    )
     raw = dict(project.raw or {})
     raw["deleted_at"] = datetime_iso()
     raw["deleted_by"] = actor.email
     raw["deleted_tasks"] = task_cleanup
+    raw["deleted_derived_data"] = derived_cleanup
     project.status = "deleted"
     project.raw = raw
     for member in db.scalars(
@@ -182,6 +195,7 @@ def delete_project(
                 "external_id": project.external_id,
                 "name": project.name,
                 "task_cleanup": task_cleanup,
+                "derived_cleanup": derived_cleanup,
             },
         )
     )
@@ -190,15 +204,28 @@ def delete_project(
     return project
 
 
-def _delete_project_tasks(db: Session, project: Project) -> dict[str, Any]:
+def _delete_project_tasks(
+    db: Session,
+    project: Project,
+    *,
+    artifact_store: S3ArtifactStore,
+) -> dict[str, Any]:
     tasks = _project_tasks_for_cleanup(db, project)
     if not tasks:
-        return {"tasks": 0, "cvat_deleted": 0, "cvat_errors": [], "local_deleted": {}}
+        return {
+            "tasks": 0,
+            "task_external_ids": [],
+            "cvat_deleted": 0,
+            "cvat_errors": [],
+            "local_deleted": {},
+            "upload_cleanup": {"prefixes": 0, "deleted_objects": 0, "errors": []},
+        }
 
     client = CvatClient(get_settings())
     cvat_deleted = 0
     cvat_errors: list[dict[str, str]] = []
     local_deleted: dict[str, int] = {}
+    upload_cleanup: dict[str, Any] = {"prefixes": 0, "deleted_objects": 0, "errors": []}
 
     for task in tasks:
         if task.external_id:
@@ -209,6 +236,10 @@ def _delete_project_tasks(db: Session, project: Project) -> dict[str, Any]:
                 message = str(exc)
                 if "404" not in message:
                     cvat_errors.append({"task_external_id": task.external_id, "error": message})
+            cleanup = cleanup_task_import_uploads(db, task.external_id, artifact_store)
+            upload_cleanup["prefixes"] += cleanup["prefixes"]
+            upload_cleanup["deleted_objects"] += cleanup["deleted_objects"]
+            upload_cleanup["errors"].extend(cleanup["errors"])
             deleted = delete_local_task_records(db, task.external_id)
             for key, count in deleted.items():
                 local_deleted[key] = local_deleted.get(key, 0) + count
@@ -216,9 +247,11 @@ def _delete_project_tasks(db: Session, project: Project) -> dict[str, Any]:
 
     return {
         "tasks": len(tasks),
+        "task_external_ids": [task.external_id for task in tasks if task.external_id],
         "cvat_deleted": cvat_deleted,
         "cvat_errors": cvat_errors,
         "local_deleted": local_deleted,
+        "upload_cleanup": upload_cleanup,
     }
 
 
@@ -299,18 +332,8 @@ def project_dashboard(
         ClassDistribution(name=name, count=count, share=round((count / total_labels) * 100, 2))
         for name, count in sorted(labels.items())
     ]
-    pending_review_query = select(func.count(AnnotationRecord.id)).where(
-        AnnotationRecord.review_state == "pending"
-    )
     task_external_ids = [task.external_id for task in tasks]
-    if task_external_ids:
-        pending_review_query = pending_review_query.where(
-            AnnotationRecord.task_external_id.in_(task_external_ids)
-        )
-    elif project:
-        pending_review_query = pending_review_query.where(
-            AnnotationRecord.task_external_id == "__none__"
-        )
+    pending_review = _pending_review_annotation_count(db, task_external_ids, scoped_to_empty_project=bool(project and not task_external_ids))
 
     releases = list(db.scalars(select(DatasetRelease)).all())
     project_releases = [
@@ -334,14 +357,14 @@ def project_dashboard(
         if project is not None and job_matches_project(db, job, project)
     ]
     if project is not None:
-        project = _project_with_calculated_import_storage(project, project_jobs)
+        refresh_project_storage(db, project)
 
     stats = DashboardStats(
         projects=db.scalar(select(func.count(Project.id)).where(Project.status == "active")) or 0,
         tasks=len(tasks),
         images=sum(task.size for task in tasks),
         jobs_running=sum(1 for job in project_jobs if job.status == "running"),
-        pending_review=db.scalar(pending_review_query) or 0,
+        pending_review=pending_review,
         dataset_releases=len(project_releases),
         training_runs=len(training_runs),
     )
@@ -485,6 +508,85 @@ def _sync_project_annotators(db: Session, project: Project, user_ids: list[str])
     db.add(project)
 
 
+def _pending_review_annotation_count(
+    db: Session,
+    task_external_ids: list[str],
+    *,
+    scoped_to_empty_project: bool,
+) -> int:
+    if scoped_to_empty_project:
+        return 0
+    query = select(AnnotationRecord).where(
+        AnnotationRecord.review_state == "pending",
+        AnnotationRecord.task_external_id.is_not(None),
+        AnnotationRecord.frame.is_not(None),
+    )
+    if task_external_ids:
+        query = query.where(AnnotationRecord.task_external_id.in_(task_external_ids))
+    candidates = [annotation for annotation in db.scalars(query).all() if _is_pending_review_annotation(annotation)]
+    statuses = _frame_statuses(db, candidates)
+    filtered = [
+        annotation
+        for annotation in candidates
+        if statuses.get((annotation.task_external_id, annotation.frame), "review_pending")
+        not in {"approved", "needs_annotation", "annotation_pending"}
+    ]
+    return len(_dedupe_pending_review_annotations(filtered))
+
+
+def _frame_statuses(db: Session, annotations: list[AnnotationRecord]) -> dict[tuple[str | None, int | None], str]:
+    task_ids = sorted({annotation.task_external_id for annotation in annotations if annotation.task_external_id})
+    if not task_ids:
+        return {}
+    states = db.scalars(select(FrameWorkflowState).where(FrameWorkflowState.task_external_id.in_(task_ids))).all()
+    return {(state.task_external_id, state.frame): state.status for state in states}
+
+
+def _dedupe_pending_review_annotations(annotations: list[AnnotationRecord]) -> list[AnnotationRecord]:
+    by_key: dict[tuple, AnnotationRecord] = {}
+    order: list[tuple] = []
+    for annotation in annotations:
+        key = _pending_review_annotation_key(annotation)
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = annotation
+            order.append(key)
+            continue
+        if annotation.external_id.startswith("cvat_job:") and not existing.external_id.startswith("cvat_job:"):
+            by_key[key] = annotation
+    return [by_key[key] for key in order]
+
+
+def _pending_review_annotation_key(annotation: AnnotationRecord) -> tuple:
+    return (
+        annotation.task_external_id,
+        annotation.frame,
+        (annotation.label_name or "").casefold(),
+        (annotation.shape_type or "").casefold(),
+        tuple(round(float(value), 3) for value in _pending_review_annotation_points(annotation)),
+    )
+
+
+def _is_pending_review_annotation(annotation: AnnotationRecord) -> bool:
+    if annotation.annotation_type == "tag":
+        return False
+    if annotation.frame is None or not annotation.task_external_id:
+        return False
+    if (annotation.shape_type or "").lower() not in {"rectangle", "polygon"}:
+        return False
+    points = _pending_review_annotation_points(annotation)
+    return len(points) >= 4 and all(isinstance(value, int | float) for value in points)
+
+
+def _pending_review_annotation_points(annotation: AnnotationRecord) -> list:
+    points = annotation.points if isinstance(annotation.points, list) else []
+    if points:
+        return points
+    raw = annotation.raw if isinstance(annotation.raw, dict) else {}
+    points_norm = raw.get("points_norm")
+    return points_norm if isinstance(points_norm, list) else []
+
+
 def datetime_iso() -> str:
     from datetime import UTC, datetime
 
@@ -494,43 +596,6 @@ def datetime_iso() -> str:
 def _release_belongs_to_project(db: Session, release: DatasetRelease, project: Project) -> bool:
     owner = project_for_release(db, release)
     return owner is not None and owner.id == project.id
-
-
-def _project_with_calculated_import_storage(project: Project, jobs: list[JobRecord]) -> Project:
-    raw = dict(project.raw or {})
-    storage = raw.get("storage")
-    if not isinstance(storage, dict):
-        return project
-    imported_bytes = sum(_job_uploaded_bytes(job) for job in jobs if job.kind == "import")
-    if imported_bytes <= 0:
-        return project
-    stored_used_bytes = _int_value(storage.get("used_bytes")) or 0
-    if stored_used_bytes >= imported_bytes:
-        return project
-    quota_bytes = _int_value(storage.get("quota_bytes")) or 0
-    raw["storage"] = {
-        **storage,
-        "used_bytes": imported_bytes,
-        "used_gb": round(imported_bytes / 1024**3, 3),
-        "percent": round((imported_bytes / quota_bytes) * 100, 2) if quota_bytes else 0,
-    }
-    project.raw = raw
-    return project
-
-
-def _job_uploaded_bytes(job: JobRecord) -> int:
-    raw = job.raw or {}
-    stored = _int_value(raw.get("upload_storage_bytes"))
-    if stored is not None:
-        return stored
-    artifacts = raw.get("upload_artifacts")
-    if not isinstance(artifacts, list):
-        return 0
-    total = 0
-    for artifact in artifacts:
-        if isinstance(artifact, dict):
-            total += _int_value(artifact.get("size_bytes")) or 0
-    return total
 
 
 def _job_cvat_task_ids(raw: dict[str, Any], payload: dict[str, Any]) -> list[str]:
@@ -549,18 +614,3 @@ def _job_cvat_task_ids(raw: dict[str, Any], payload: dict[str, Any]) -> list[str
             seen.add(task_id)
             deduped.append(task_id)
     return deduped
-
-
-def _int_value(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, str):
-        try:
-            return int(value)
-        except ValueError:
-            return None
-    return None

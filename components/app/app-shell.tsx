@@ -13,6 +13,20 @@ export function AppShell({
   breadcrumb: Crumb[]
   children: React.ReactNode
 }) {
+  return (
+    <React.Suspense fallback={<AppShellLoading />}>
+      <AppShellInner breadcrumb={breadcrumb}>{children}</AppShellInner>
+    </React.Suspense>
+  )
+}
+
+function AppShellInner({
+  breadcrumb,
+  children,
+}: {
+  breadcrumb: Crumb[]
+  children: React.ReactNode
+}) {
   const [navOpen, setNavOpen] = React.useState(false)
   const searchParams = useSearchParams()
   const { isAuthenticated, authReady, activeProject, projects, setActiveProjectId } = useCurrentUser()
@@ -37,12 +51,7 @@ export function AppShell({
   }, [activeProject?.id, projects, searchParams, setActiveProjectId])
 
   if (!authReady || !isAuthenticated) {
-    return (
-      <div className="flex min-h-svh items-center justify-center bg-background">
-        <span className="sr-only">Redirecionando para o login</span>
-        <span className="size-8 animate-spin rounded-full border-2 border-border border-t-brand-blue" aria-hidden="true" />
-      </div>
-    )
+    return <AppShellLoading />
   }
 
   return (
@@ -52,6 +61,15 @@ export function AppShell({
         <AppTopbar breadcrumb={resolvedBreadcrumb} onMenuClick={() => setNavOpen(true)} />
         <main className="min-w-0 flex-1">{children}</main>
       </div>
+    </div>
+  )
+}
+
+function AppShellLoading() {
+  return (
+    <div className="flex min-h-svh items-center justify-center bg-background">
+      <span className="sr-only">Redirecionando para o login</span>
+      <span className="size-8 animate-spin rounded-full border-2 border-border border-t-brand-blue" aria-hidden="true" />
     </div>
   )
 }

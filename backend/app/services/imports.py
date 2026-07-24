@@ -23,8 +23,14 @@ from app.models import (
     User,
 )
 from app.schemas import ImportTaskCreate
-from app.services.annotations import sync_job_annotations
+from app.services.annotations import (
+    FRAME_ANNOTATION_PENDING,
+    FRAME_REVIEW_PENDING,
+    sync_job_annotations,
+    upsert_frame_workflow_state,
+)
 from app.services.artifacts import ArtifactStore
+from app.services.project_storage import refresh_project_storage
 from app.services.cvat_client import CvatClient
 from app.services.jobs import mark_job_running, succeed_job, update_job_progress
 from app.services.sync import CvatSyncService
@@ -131,6 +137,7 @@ def validate_import_quota(
     project = _resolve_project(db, payload.project_id)
     if project is None:
         return None
+    refresh_project_storage(db, project)
     storage = project.raw.get("storage") if isinstance(project.raw, dict) else None
     if not isinstance(storage, dict) or storage.get("enforce_quota") is False:
         return project
@@ -155,26 +162,10 @@ def record_import_storage_usage(
     *,
     previous_uploaded_bytes: int = 0,
 ) -> None:
-    if project is None or uploaded_bytes <= 0:
-        return
-    raw = dict(project.raw or {})
-    storage = raw.get("storage")
-    if not isinstance(storage, dict):
-        return
-    added_bytes = max(uploaded_bytes - max(previous_uploaded_bytes, 0), 0)
-    if added_bytes <= 0:
-        return
-    used_bytes = (_int_value(storage.get("used_bytes")) or 0) + added_bytes
-    quota_bytes = _int_value(storage.get("quota_bytes")) or 0
-    raw["storage"] = {
-        **storage,
-        "used_bytes": used_bytes,
-        "used_gb": round(used_bytes / 1024**3, 3),
-        "percent": round((used_bytes / quota_bytes) * 100, 2) if quota_bytes else 0,
-    }
-    project.raw = raw
-    db.add(project)
-    db.flush()
+    # Uploads are temporary. Usage must be derived from tasks, releases and
+    # pending uploads still present in the database, never incremented blindly.
+    del uploaded_bytes, previous_uploaded_bytes
+    refresh_project_storage(db, project)
 
 
 def run_import_task_job(
@@ -261,6 +252,16 @@ def run_import_task_job(
             "cvat_task": task_payload,
         }
         import_batches.append(batch_payload)
+        # Imported tasks can be standalone in CVAT (without a CVAT project).
+        # Persist the local project ownership before any sync runs.
+        _finalize_imported_task(
+            db,
+            task_id_str,
+            payload.assignee_user_id,
+            task_payload,
+            project,
+            batch_manifest,
+        )
         _persist_import_task_progress(
             db,
             job,
@@ -364,7 +365,11 @@ def run_import_task_job(
         "upload_result": import_batches[0].get("upload_result") if import_batches else None,
         "upload_request": import_batches[0].get("upload_request") if import_batches else None,
         "sync_result": sync_result,
+        "upload_artifacts": [],
+        "upload_storage_bytes": 0,
     }
+    cleanup = _cleanup_import_uploads(job, artifact_store)
+    raw_update["upload_cleanup"] = cleanup
     db.add(
         AuditEvent(
             actor="system",
@@ -377,7 +382,11 @@ def run_import_task_job(
         detail = f"Importada task CVAT {task_ids[0]}."
     else:
         detail = f"Importadas {len(media_files)} imagens em {len(task_ids)} tasks CVAT."
-    return succeed_job(db, job_id, detail=detail, raw_update=raw_update)
+    completed = succeed_job(db, job_id, detail=detail, raw_update=raw_update)
+    refresh_project_storage(db, project)
+    db.commit()
+    db.refresh(completed)
+    return completed
 
 
 def _files_from_job(job: JobRecord, artifact_store: ArtifactStore) -> list[tuple[str, bytes, str]]:
@@ -454,6 +463,35 @@ def _cvat_import_max_upload_bytes(settings: Settings) -> int:
 
 def _files_size(files: list[tuple[str, bytes, str]]) -> int:
     return sum(len(content) for _filename, content, _content_type in files)
+
+
+def _manifest_size(manifest: list[dict[str, Any]]) -> int:
+    return sum(max(_int_value(item.get("size_bytes")) or 0, 0) for item in manifest)
+
+
+def _cleanup_import_uploads(job: JobRecord, artifact_store: ArtifactStore) -> dict[str, Any]:
+    """Delete transient MinIO objects after CVAT has accepted an import."""
+    uploads = (job.raw or {}).get("upload_artifacts")
+    prefixes: set[str] = set()
+    if isinstance(uploads, list):
+        for upload in uploads:
+            if not isinstance(upload, dict):
+                continue
+            uri = upload.get("uri")
+            if not isinstance(uri, str) or not uri.startswith("s3://"):
+                continue
+            before, marker, _after = uri.partition("/uploads/")
+            if marker:
+                prefixes.add(f"{before}{marker}")
+
+    deleted_objects = 0
+    errors: list[str] = []
+    for prefix in sorted(prefixes):
+        try:
+            deleted_objects += artifact_store.delete_prefix(prefix)
+        except Exception as exc:  # A completed import must not fail because cleanup is retried later.
+            errors.append(f"{prefix}: {exc}")
+    return {"prefixes": len(prefixes), "deleted_objects": deleted_objects, "errors": errors}
 
 
 def _batch_task_name(base_name: str, index: int, total: int) -> str:
@@ -615,6 +653,7 @@ def _finalize_imported_task(
         **(task.raw or {}),
         "local_import_manifest": {
             "files": import_manifest,
+            "storage_bytes": _manifest_size(import_manifest),
             "source": "cvat-plus",
         },
     }
@@ -815,6 +854,8 @@ def _materialize_dataset_annotations(
         row.raw = raw
         db.add(row)
 
+    _upsert_dataset_import_frame_states(db, task, local_records, payload)
+
     return {
         "format": format_name,
         "imported": len(local_records),
@@ -823,6 +864,47 @@ def _materialize_dataset_annotations(
         "cvat_job_id": cvat_job_id,
         "cvat_error": cvat_error,
     }
+
+
+def _upsert_dataset_import_frame_states(
+    db: Session,
+    task: Task,
+    local_records: list[dict[str, Any]],
+    payload: ImportTaskCreate,
+) -> None:
+    frame_counts: dict[int, int] = {}
+    for record in local_records:
+        frame = _int_value(record.get("frame"))
+        if frame is None:
+            continue
+        frame_counts[frame] = frame_counts.get(frame, 0) + 1
+
+    target = payload.annotation_import_target
+    status = FRAME_ANNOTATION_PENDING if target == "annotation" else FRAME_REVIEW_PENDING
+    for frame, count in frame_counts.items():
+        upsert_frame_workflow_state(
+            db,
+            task.external_id,
+            frame,
+            status,
+            actor="dataset import",
+            annotation_count=count,
+            raw={
+                "source": "dataset_import",
+                "annotation_import_target": target,
+            },
+        )
+
+    task.raw = {
+        **(task.raw or {}),
+        "dataset_import": {
+            **((task.raw or {}).get("dataset_import") if isinstance((task.raw or {}).get("dataset_import"), dict) else {}),
+            "annotation_import_target": target,
+            "annotated_frames": len(frame_counts),
+            "annotations": sum(frame_counts.values()),
+        },
+    }
+    db.add(task)
 
 
 def _yolo_annotation_files(files: list[tuple[str, bytes, str]]) -> list[tuple[str, str]]:
