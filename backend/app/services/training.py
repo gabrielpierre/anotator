@@ -46,7 +46,7 @@ def run_training(
     _update_run(db, run, status="running", progress=5, metrics={"stage": "preparing"})
     _report(progress_callback, 5, "Preparing training dataset.")
     if runner is None:
-        release = ensure_prepared_training_dataset(db, release, settings)
+        release = ensure_prepared_training_dataset(db, release, settings, split_config=payload.config.get("split"))
 
     train_context = {
         "run_id": run.id,
@@ -926,23 +926,30 @@ def ensure_prepared_training_dataset(
     db: Session,
     release: DatasetRelease,
     settings: Settings,
+    split_config: dict[str, Any] | None = None,
 ) -> DatasetRelease:
     snapshot = release.snapshot if isinstance(release.snapshot, dict) else {}
     prepared = snapshot.get("prepared_dataset") if isinstance(snapshot.get("prepared_dataset"), dict) else {}
-    if _prepared_dataset_usable_for_training(prepared):
+    if _prepared_dataset_usable_for_training(prepared, split_config):
         return release
 
     from app.services.datasets import prepare_yolo_dataset
 
-    prepare_yolo_dataset(db, release_id=release.id, artifact_store=S3ArtifactStore(settings))
+    prepare_yolo_dataset(db, release_id=release.id, artifact_store=S3ArtifactStore(settings), split_config=split_config)
     refreshed = db.get(DatasetRelease, release.id)
     return refreshed or release
 
 
-def _prepared_dataset_usable_for_training(prepared: dict[str, Any]) -> bool:
+def _prepared_dataset_usable_for_training(prepared: dict[str, Any], split_config: dict[str, Any] | None = None) -> bool:
     if prepared.get("status") != "ready" or not prepared.get("artifact_uri"):
         return False
     manifest = prepared.get("manifest") if isinstance(prepared.get("manifest"), dict) else {}
+    if split_config is not None:
+        split_policy = manifest.get("split_policy") if isinstance(manifest.get("split_policy"), dict) else {}
+        from app.services.datasets import split_policy_digest
+
+        if split_policy.get("digest") != split_policy_digest(split_config):
+            return False
     splits = manifest.get("splits") if isinstance(manifest.get("splits"), dict) else {}
     data_yaml = prepared.get("data_yaml") if isinstance(prepared.get("data_yaml"), dict) else {}
     train_count = _positive_int(splits.get("train"))

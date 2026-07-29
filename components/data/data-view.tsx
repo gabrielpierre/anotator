@@ -39,7 +39,7 @@ import {
   fetchTasks,
   fetchUsers,
 } from "@/lib/api/client"
-import { formatDateTimePt, formatPtNumber, labelsFromTasks, toUiJobStatus } from "@/lib/api/status"
+import { chartClassColor, formatDateTimePt, formatPercentPt, formatPtNumber, labelsFromTasks, percentFromCount, toUiJobStatus } from "@/lib/api/status"
 import { useCurrentUser, type ProjectRecord } from "@/lib/auth/user-context"
 import type {
   BackendDashboard,
@@ -185,22 +185,27 @@ export function DataView() {
     () => (users ?? []).filter((user) => user.role === "anotador" && user.status === "active"),
     [users],
   )
-  const classDistribution =
+  const rawClassDistribution: ClassDistributionItem[] =
     dashboard?.class_distribution && dashboard.class_distribution.length > 0
-      ? dashboard.class_distribution.map((item, index) => ({
+      ? dashboard.class_distribution.map((item) => ({
           name: item.name,
           count: item.count,
-          share: item.share,
-          color: classColors[index % classColors.length],
         }))
       : taskClasses.length > 0
         ? taskClasses.map((item) => ({
             name: item.name,
             count: item.count ?? 1,
-            share: Math.round((100 / taskClasses.length) * 100) / 100,
             color: item.color,
           }))
       : []
+  const classDistributionTotal = rawClassDistribution.reduce((total, item) => total + item.count, 0)
+  const classDistribution = rawClassDistribution
+    .map((item) => ({
+      ...item,
+      share: percentFromCount(item.count, classDistributionTotal),
+    }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "pt-BR"))
+    .map((item, index) => ({ ...item, color: chartClassColor(index) }))
 
   const imageCount = dashboard?.stats.images ?? batches.reduce((total, batch) => total + batch.images, 0)
   const annotatedCount = batches.reduce((total, batch) => total + batch.annotatedImages, 0)
@@ -547,9 +552,11 @@ export function DataView() {
                       <span className="size-2.5 rounded-full" style={{ backgroundColor: c.color }} />
                       {c.name}
                     </span>
-                    <span className="tabular-nums text-muted-foreground">{c.count.toLocaleString("pt-BR")}</span>
+                    <span className="tabular-nums text-muted-foreground">
+                      {c.count.toLocaleString("pt-BR")} · {formatPercentPt(c.share)}%
+                    </span>
                   </div>
-                  <ProgressBar value={c.share * 3} color="bg-brand-blue" />
+                  <ProgressBar value={c.share} color="bg-brand-blue" />
                 </div>
               ))}
               {classDistribution.length === 0 && (
@@ -843,14 +850,11 @@ function taskStatusLabel(status: string, progressPercent?: number) {
   return status || "CVAT"
 }
 
-const classColors = [
-  "var(--brand-blue)",
-  "var(--brand-green)",
-  "var(--brand-lavender)",
-  "var(--warning)",
-  "var(--brand-indigo)",
-  "var(--brand-sky)",
-]
+type ClassDistributionItem = {
+  name: string
+  count: number
+  color?: string
+}
 
 function storageFromDashboard(dashboard: BackendDashboard | null, fallbackProject: ProjectRecord | null) {
   const storage = dashboard?.project?.raw?.storage

@@ -54,7 +54,7 @@ export function AppSidebar({
       <aside
         onClick={collapsed ? () => setCollapsed(false) : undefined}
         className={cn(
-          "fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-sidebar-border bg-sidebar transition-[transform,width] duration-300 ease-in-out lg:static lg:z-auto lg:translate-x-0",
+          "fixed inset-y-0 left-0 z-50 flex h-svh w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar transition-[transform,width] duration-300 ease-in-out lg:sticky lg:top-0 lg:z-auto lg:translate-x-0",
           open ? "translate-x-0" : "-translate-x-full",
           collapsed ? "lg:w-16 lg:cursor-pointer" : "lg:w-64",
         )}
@@ -111,7 +111,7 @@ export function AppSidebar({
           )}
         </div>
 
-        <nav className={cn("flex flex-1 flex-col gap-5 overflow-y-auto p-3", collapsed && "lg:items-center")}>
+        <nav className={cn("flex min-h-0 flex-1 flex-col gap-5 p-3", collapsed && "lg:items-center")}>
           <section className="flex min-h-0 flex-1 flex-col gap-2">
             <div
               className={cn(
@@ -123,7 +123,7 @@ export function AppSidebar({
               <span className="tabular-nums">{projects.length}</span>
             </div>
 
-            <div className="flex min-h-0 flex-col gap-1 overflow-y-auto">
+            <div className="flex min-h-0 flex-col gap-1 overflow-y-auto pr-1">
               {projects.map((project) => {
                 const active = activeProject?.id === project.id
                 return (

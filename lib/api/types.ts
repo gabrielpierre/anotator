@@ -463,6 +463,10 @@ export type BackendPreparedDataset = {
   manifest: Record<string, unknown> | null
 }
 
+export type BackendPreparedDatasetRequest = {
+  splits?: Record<string, unknown> | null
+}
+
 export type BackendDatasetReleaseCreate = {
   name: string
   project_id?: string | null

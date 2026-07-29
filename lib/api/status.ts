@@ -23,6 +23,24 @@ export function formatPtNumber(value: number) {
   return value.toLocaleString("pt-BR")
 }
 
+export function formatPercentPt(value: number) {
+  return value.toLocaleString("pt-BR", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })
+}
+
+export function percentFromCount(count: number, total: number) {
+  return total > 0 ? (count / total) * 100 : 0
+}
+
+export function chartClassColor(index: number) {
+  const hue = Math.round((index * 137.508) % 360)
+  const saturation = 68 + (index % 3) * 8
+  const lightness = 45 + (index % 4) * 5
+  return `hsl(${hue} ${saturation}% ${lightness}%)`
+}
+
 export function formatDateTimePt(value: string | null | undefined) {
   if (!value) return "--"
   const date = new Date(value)

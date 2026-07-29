@@ -31,6 +31,7 @@ import type {
   BackendPipelineRun,
   BackendPipelineRunCreate,
   BackendPreparedDataset,
+  BackendPreparedDatasetRequest,
   BackendProject,
   BackendProjectCreate,
   BackendProjectMember,
@@ -536,8 +537,24 @@ export function fetchDatasetReleaseArtifacts(releaseId: string, signal?: AbortSi
   return getJson<BackendArtifact[]>(`/dataset-releases/${encodeURIComponent(releaseId)}/artifacts`, signal)
 }
 
-export function prepareDatasetReleaseYolo(releaseId: string, signal?: AbortSignal) {
-  return postJson<BackendPreparedDataset>(`/dataset-releases/${encodeURIComponent(releaseId)}/prepare-yolo`, {}, signal)
+export function prepareDatasetReleaseYolo(
+  releaseId: string,
+  payload: BackendPreparedDatasetRequest = {},
+  signal?: AbortSignal,
+) {
+  return postJson<BackendPreparedDataset>(`/dataset-releases/${encodeURIComponent(releaseId)}/prepare-yolo`, payload, signal)
+}
+
+export function previewDatasetReleaseYolo(
+  releaseId: string,
+  payload: BackendPreparedDatasetRequest = {},
+  signal?: AbortSignal,
+) {
+  return postJson<BackendPreparedDataset>(
+    `/dataset-releases/${encodeURIComponent(releaseId)}/prepare-yolo/preview`,
+    payload,
+    signal,
+  )
 }
 
 export function fetchPreparedDataset(releaseId: string, signal?: AbortSignal) {

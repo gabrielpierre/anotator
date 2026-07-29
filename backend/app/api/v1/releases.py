@@ -1,19 +1,38 @@
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, db_session, require_project_access
-from app.api.project_scope import project_for_release, project_payload, require_release_access, require_task_access
+from app.api.project_scope import (
+    project_for_release,
+    project_payload,
+    require_release_access,
+    require_task_access,
+)
 from app.api.v1.artifacts import artifact_read_from_uri
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
-from app.models import ArtifactRecord, AuditEvent, DatasetRelease, JobRecord, Project, ProjectMember, User
-from app.schemas import ArtifactRead, DatasetReleaseCreate, DatasetReleaseRead, PreparedDatasetRead
+from app.models import (
+    ArtifactRecord,
+    AuditEvent,
+    DatasetRelease,
+    JobRecord,
+    Project,
+    ProjectMember,
+    User,
+)
+from app.schemas import (
+    ArtifactRead,
+    DatasetReleaseCreate,
+    DatasetReleaseRead,
+    PreparedDatasetRead,
+    PreparedDatasetRequest,
+)
 from app.services.artifacts import S3ArtifactStore
-from app.services.datasets import prepare_yolo_dataset
+from app.services.datasets import prepare_yolo_dataset, preview_yolo_dataset
 from app.services.jobs import ACTIVE_JOB_STATUSES, attach_celery_task, cancel_job, create_job
 from app.services.project_storage import refresh_project_storage
 from app.services.releases import prepare_dataset_release
@@ -143,12 +162,38 @@ def download_release(
 @router.post("/{release_id}/prepare-yolo", response_model=PreparedDatasetRead)
 def prepare_release_yolo(
     release_id: str,
+    payload: PreparedDatasetRequest | None = Body(default=None),
     db: Session = Depends(db_session),
     user: User = Depends(current_user),
 ) -> PreparedDatasetRead:
     require_release_access(db, user, release_id)
     try:
-        prepared = prepare_yolo_dataset(db, release_id=release_id, artifact_store=S3ArtifactStore(get_settings()))
+        prepared = prepare_yolo_dataset(
+            db,
+            release_id=release_id,
+            artifact_store=S3ArtifactStore(get_settings()),
+            split_config=payload.splits if payload else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _prepared_dataset_read(release_id, prepared)
+
+
+@router.post("/{release_id}/prepare-yolo/preview", response_model=PreparedDatasetRead)
+def preview_release_yolo(
+    release_id: str,
+    payload: PreparedDatasetRequest | None = Body(default=None),
+    db: Session = Depends(db_session),
+    user: User = Depends(current_user),
+) -> PreparedDatasetRead:
+    require_release_access(db, user, release_id)
+    try:
+        prepared = preview_yolo_dataset(
+            db,
+            release_id=release_id,
+            artifact_store=S3ArtifactStore(get_settings()),
+            split_config=payload.splits if payload else None,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _prepared_dataset_read(release_id, prepared)

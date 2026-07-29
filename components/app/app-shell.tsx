@@ -55,11 +55,11 @@ function AppShellInner({
   }
 
   return (
-    <div className="flex min-h-svh bg-background">
+    <div className="flex h-svh overflow-hidden bg-background">
       <AppSidebar open={navOpen} onClose={() => setNavOpen(false)} />
-      <div className="flex min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <AppTopbar breadcrumb={resolvedBreadcrumb} onMenuClick={() => setNavOpen(true)} />
-        <main className="min-w-0 flex-1">{children}</main>
+        <main className="min-h-0 min-w-0 flex-1 overflow-y-auto">{children}</main>
       </div>
     </div>
   )

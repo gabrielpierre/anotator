@@ -32,6 +32,7 @@ from app.schemas import (
     ProjectRead,
     ProjectUpdate,
 )
+from app.services.annotations import FRAME_ACTIVE_ANNOTATION_EXCLUDED_STATES
 from app.services.cvat_client import CvatClient, CvatClientError
 from app.services.artifacts import S3ArtifactStore
 from app.services.project_cleanup import purge_project_derived_data
@@ -314,18 +315,9 @@ def project_dashboard(
             db.scalars(select(Task).where(Task.project_external_id == project.external_id)).all()
         )
 
-    labels: dict[str, int] = {}
-    for task in tasks:
-        for label in task.labels or []:
-            if isinstance(label, dict):
-                name = str(label.get("name") or label.get("label") or "unknown")
-                labels[name] = labels.get(name, 0) + 1
+    labels: dict[str, int] = _annotation_distribution(db, [task.external_id for task in tasks if task.external_id])
     if not labels:
-        label_query = select(CvatLabel)
-        if project:
-            label_query = label_query.where(CvatLabel.project_external_id == project.external_id)
-        for label in db.scalars(label_query).all():
-            labels[label.name] = labels.get(label.name, 0) + 1
+        labels = _catalog_label_distribution(db, project, tasks)
 
     total_labels = sum(labels.values()) or 1
     class_distribution = [
@@ -375,6 +367,41 @@ def project_dashboard(
         class_distribution=class_distribution,
         recent_jobs=recent_jobs,
     )
+
+
+def _annotation_distribution(db: Session, task_external_ids: list[str]) -> dict[str, int]:
+    if not task_external_ids:
+        return {}
+    active_annotation = ~AnnotationRecord.review_state.in_(FRAME_ACTIVE_ANNOTATION_EXCLUDED_STATES)
+    rows = db.execute(
+        select(AnnotationRecord.label_name, func.count(AnnotationRecord.id))
+        .where(
+            AnnotationRecord.task_external_id.in_(task_external_ids),
+            AnnotationRecord.label_name.is_not(None),
+            AnnotationRecord.label_name != "",
+            active_annotation,
+        )
+        .group_by(AnnotationRecord.label_name)
+    ).all()
+    return {str(name): int(count or 0) for name, count in rows if name}
+
+
+def _catalog_label_distribution(db: Session, project: Project | None, tasks: list[Task]) -> dict[str, int]:
+    labels: dict[str, int] = {}
+    for task in tasks:
+        for label in task.labels or []:
+            if isinstance(label, dict):
+                name = str(label.get("name") or label.get("label") or "unknown")
+                labels[name] = labels.get(name, 0) + 1
+    if labels:
+        return labels
+
+    label_query = select(CvatLabel)
+    if project:
+        label_query = label_query.where(CvatLabel.project_external_id == project.external_id)
+    for label in db.scalars(label_query).all():
+        labels[label.name] = labels.get(label.name, 0) + 1
+    return labels
 
 
 @router.get("/{project_id}/members", response_model=list[ProjectMemberRead])

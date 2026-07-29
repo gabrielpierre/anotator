@@ -24,9 +24,9 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/ca
 import { Button } from "@/components/ui/button"
 import { StatRow, Meter } from "@/components/app/primitives"
 import { SparkLineChart } from "@/components/app/charts"
-import { createTrainingRun, fetchDatasetRelease, fetchJobCapacity } from "@/lib/api/client"
+import { createTrainingRun, fetchDatasetRelease, fetchJobCapacity, previewDatasetReleaseYolo } from "@/lib/api/client"
 import { cn } from "@/lib/utils"
-import type { BackendComputeDevice, BackendDatasetRelease, BackendJobCapacity } from "@/lib/api/types"
+import type { BackendComputeDevice, BackendDatasetRelease, BackendJobCapacity, BackendPreparedDataset } from "@/lib/api/types"
 
 const STEPS = [
   { key: "dataset", label: "Dataset" },
@@ -53,9 +53,17 @@ export function TrainingWizard({ release }: { release: string }) {
   })
   const [capacity, setCapacity] = React.useState<BackendJobCapacity | null>(null)
   const [datasetRelease, setDatasetRelease] = React.useState<BackendDatasetRelease | null>(null)
+  const [splitPreview, setSplitPreview] = React.useState<BackendPreparedDataset | null>(null)
+  const [splitPreviewLoading, setSplitPreviewLoading] = React.useState(false)
+  const [splitPreviewError, setSplitPreviewError] = React.useState<string | null>(null)
   const [starting, setStarting] = React.useState(false)
   const [startError, setStartError] = React.useState<string | null>(null)
-  const datasetStats = React.useMemo(() => datasetStatsFromRelease(datasetRelease), [datasetRelease])
+  const splitPayload = React.useMemo(() => splitPayloadFromConfig(cfg), [cfg])
+  const splitPayloadKey = React.useMemo(() => JSON.stringify(splitPayload), [splitPayload])
+  const datasetStats = React.useMemo(
+    () => datasetStatsFromRelease(datasetRelease, splitPreview, splitPreviewLoading, splitPreviewError),
+    [datasetRelease, splitPreview, splitPreviewLoading, splitPreviewError],
+  )
   const validation = useSplitValidation(cfg, datasetStats)
   const deviceOptions = React.useMemo(() => deviceOptionsFromCapacity(capacity), [capacity])
   const selectedDeviceLabel = deviceLabel(deviceOptions, trainingCfg.device)
@@ -71,6 +79,36 @@ export function TrainingWizard({ release }: { release: string }) {
     fetchDatasetRelease(release, controller.signal).then(setDatasetRelease).catch(() => setDatasetRelease(null))
     return () => controller.abort()
   }, [release])
+
+  React.useEffect(() => {
+    if (!datasetRelease || datasetRelease.status !== "ready") {
+      setSplitPreview(null)
+      setSplitPreviewLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    setSplitPreviewLoading(true)
+    setSplitPreviewError(null)
+    const timeout = window.setTimeout(() => {
+      previewDatasetReleaseYolo(release, { splits: splitPayload }, controller.signal)
+        .then((preview) => {
+          setSplitPreview(preview)
+          setSplitPreviewError(null)
+        })
+        .catch((error) => {
+          if (error instanceof DOMException && error.name === "AbortError") return
+          setSplitPreview(null)
+          setSplitPreviewError(error instanceof Error ? error.message : "Falha ao calcular split no backend.")
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setSplitPreviewLoading(false)
+        })
+    }, 500)
+    return () => {
+      window.clearTimeout(timeout)
+      controller.abort()
+    }
+  }, [datasetRelease, release, splitPayload, splitPayloadKey])
 
   React.useEffect(() => {
     if (!deviceOptions.some((option) => optionValue(option) === trainingCfg.device)) {
@@ -106,7 +144,8 @@ export function TrainingWizard({ release }: { release: string }) {
         seed: intOr(trainingCfg.seed, 42),
         config: {
           model_name: trainingCfg.baseModel,
-          split: cfg,
+          split: splitPayload,
+          split_ui: cfg,
           resource_policy: {
             device: backendDevice ?? "auto",
             device_label: selectedDeviceLabel,
@@ -846,20 +885,32 @@ type DatasetClassStat = { name: string; total: number }
 
 type DatasetStats = {
   loaded: boolean
+  loading: boolean
+  error: string | null
   images: number
   objects: number
   videos: number
   minutes: number
   classes: DatasetClassStat[]
+  splitRows: SplitRow[] | null
+  classRows: ClassRow[] | null
+  healthWarnings: string[]
+  healthChecks: string[]
 }
 
 const EMPTY_DATASET_STATS: DatasetStats = {
   loaded: false,
+  loading: false,
+  error: null,
   images: 0,
   objects: 0,
   videos: 0,
   minutes: 0,
   classes: [],
+  splitRows: null,
+  classRows: null,
+  healthWarnings: [],
+  healthChecks: [],
 }
 
 export type SplitRow = {
@@ -901,7 +952,7 @@ function computeValidation(cfg: SplitConfig, stats: DatasetStats = EMPTY_DATASET
   const videoCounts = distributeCount(stats.videos, weights)
   const minuteCounts = distributeCount(stats.minutes, weights)
 
-  const rows: SplitRow[] = [
+  const estimatedRows: SplitRow[] = [
     {
       key: "train",
       label: "Train",
@@ -944,7 +995,8 @@ function computeValidation(cfg: SplitConfig, stats: DatasetStats = EMPTY_DATASET
     },
   ]
 
-  const classes: ClassRow[] = stats.classes.map((c) => ({
+  const rows = stats.splitRows ?? estimatedRows
+  const classes: ClassRow[] = stats.classRows ?? stats.classes.map((c) => ({
     name: c.name,
     train: Math.round((c.total * train) / 100),
     val: Math.round((c.total * val) / 100),
@@ -959,6 +1011,7 @@ function computeValidation(cfg: SplitConfig, stats: DatasetStats = EMPTY_DATASET
   if (sum !== 100) errors.push(`As porcentagens devem somar 100% (atual: ${sum}%)`)
   if (train <= 0) errors.push("O split de train deve ser maior que 0%")
   if (val <= 0) errors.push("O split de validação deve ser maior que 0%")
+  if (stats.error) warnings.push(`Preview do backend indisponível: ${stats.error}`)
 
   if (errors.length === 0) {
     const temporal = cfg.dataType !== "imagens"
@@ -966,7 +1019,11 @@ function computeValidation(cfg: SplitConfig, stats: DatasetStats = EMPTY_DATASET
       checks.push("Nenhum vídeo cruza train/val/test")
       if (cfg.keepTracks && cfg.preserveGroups) checks.push("Nenhum track cruza train/val/test")
     }
-    checks.push("Todas as classes aparecem em train e validação")
+    if (stats.classRows) {
+      checks.push("Distribuição por classe calculada pelo backend")
+    } else {
+      checks.push("Distribuição por classe estimada no frontend")
+    }
 
     if (test === 0) {
       warnings.push("Sem conjunto de teste: métricas finais não poderão ser calculadas")
@@ -978,12 +1035,14 @@ function computeValidation(cfg: SplitConfig, stats: DatasetStats = EMPTY_DATASET
       }
     }
     if (!cfg.stratify) {
-      warnings.push("Estratificação por classe desativada: distribuição pode ficar desbalanceada")
+      warnings.push("Balanceamento por classe desativado: classes raras podem ficar fora da validação")
     }
+    warnings.push(...stats.healthWarnings)
+    checks.push(...stats.healthChecks)
   }
 
   const status: ValidationResult["status"] =
-    errors.length > 0 ? "invalid" : warnings.length > 0 ? "warning" : "valid"
+    stats.loading ? "loading" : errors.length > 0 ? "invalid" : warnings.length > 0 ? "warning" : "valid"
 
   return { status, rows, classes, checks, warnings, errors }
 }
@@ -1023,38 +1082,184 @@ function useSplitValidation(cfg: SplitConfig, stats: DatasetStats, delay = 500):
   return result
 }
 
-function datasetStatsFromRelease(release: BackendDatasetRelease | null): DatasetStats {
-  if (!release) return EMPTY_DATASET_STATS
+function splitPayloadFromConfig(cfg: SplitConfig): Record<string, unknown> {
+  return {
+    train: percentRatio(cfg.train, 0.8),
+    val: percentRatio(cfg.val, 0.1),
+    test: percentRatio(cfg.test, 0.1),
+    seed: nonNegativeInteger(cfg.seed, 42),
+    strategy: cfg.stratify ? "class_balanced_best_effort" : "image_random",
+    stratify: cfg.stratify,
+    min_per_class_train: 1,
+    min_per_class_val: 1,
+    test_required: false,
+    rare_class_threshold: 5,
+    preserve_groups: cfg.dataType !== "imagens" && cfg.preserveGroups,
+    group_by: cfg.groupBy,
+    data_type: cfg.dataType,
+    keep_tracks: cfg.keepTracks,
+    lock_test: cfg.lockTest,
+  }
+}
+
+function percentRatio(value: string, fallback: number) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed / 100 : fallback
+}
+
+function nonNegativeInteger(value: string, fallback: number) {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback
+}
+
+function datasetStatsFromRelease(
+  release: BackendDatasetRelease | null,
+  preparedDataset: BackendPreparedDataset | null = null,
+  loading = false,
+  error: string | null = null,
+): DatasetStats {
+  if (!release) return { ...EMPTY_DATASET_STATS, loading, error }
   const snapshot = objectRecord(release.snapshot)
   const counts = objectRecord(snapshot.counts)
   const prepared = objectRecord(snapshot.prepared_dataset)
-  const manifest = objectRecord(prepared.manifest)
+  const manifest = objectRecord(preparedDataset?.manifest ?? prepared.manifest)
   const manifestImages = arrayOfRecords(manifest.images)
   const manifestClasses = stringArray(manifest.classes)
+  const classRows = classRowsFromManifest(manifest)
   const labelNames = arrayOfRecords(snapshot.labels)
     .map((label) => stringValue(label.name))
     .filter((name): name is string => Boolean(name))
-  const classNames = uniqueStrings(manifestClasses.length ? manifestClasses : labelNames)
+  const classNames = uniqueStrings([
+    ...classRows.map((row) => row.name),
+    ...manifestClasses,
+    ...labelNames,
+  ])
   const manifestObjectCount = manifestImages.reduce(
     (total, image) => total + (numberValue(image.boxes) ?? 0),
     0,
   )
+  const classObjectCount = classRows.reduce((total, row) => total + row.total, 0)
   const imageCount = manifestImages.length || numberValue(counts.images) || 0
   const objectCount =
-    manifestObjectCount || numberValue(counts.annotations) || numberValue(counts.objects) || 0
+    manifestObjectCount || classObjectCount || numberValue(counts.annotations) || numberValue(counts.objects) || 0
   const classes =
-    classNames.length === 1 && objectCount > 0
-      ? [{ name: classNames[0], total: objectCount }]
-      : classNames.map((name) => ({ name, total: 0 }))
+    classRows.length > 0
+      ? classRows.map((row) => ({ name: row.name, total: row.total }))
+      : classNames.length === 1 && objectCount > 0
+        ? [{ name: classNames[0], total: objectCount }]
+        : classNames.map((name) => ({ name, total: 0 }))
 
   return {
     loaded: true,
+    loading,
+    error,
     images: imageCount,
     objects: objectCount,
     videos: numberValue(counts.videos) || 0,
     minutes: numberValue(counts.minutes) || 0,
     classes,
+    splitRows: splitRowsFromManifest(manifest, manifestImages, imageCount, objectCount),
+    classRows: classRows.length ? classRows : null,
+    healthWarnings: healthMessages(manifest, "warnings"),
+    healthChecks: healthMessages(manifest, "checks"),
   }
+}
+
+function splitRowsFromManifest(
+  manifest: Record<string, unknown>,
+  manifestImages: Record<string, unknown>[],
+  fallbackImages: number,
+  fallbackObjects: number,
+): SplitRow[] | null {
+  const splitCounts = objectRecord(manifest.splits)
+  const splitPolicy = objectRecord(manifest.split_policy)
+  const hasManifestSplit =
+    manifestImages.length > 0 || ["train", "val", "test"].some((key) => numberValue(splitCounts[key]) !== null)
+  if (!hasManifestSplit) return null
+
+  const objectsBySplit: Record<"train" | "val" | "test", number> = { train: 0, val: 0, test: 0 }
+  for (const image of manifestImages) {
+    const split = splitKey(image.split)
+    if (!split) continue
+    objectsBySplit[split] += numberValue(image.boxes) ?? 0
+  }
+
+  const totalImages =
+    ["train", "val", "test"].reduce((total, key) => total + (numberValue(splitCounts[key]) ?? 0), 0) ||
+    fallbackImages
+  const rows: SplitRow[] = [
+    splitRowFromManifest("train", "Train", "bg-brand-green", splitCounts, splitPolicy, objectsBySplit, totalImages),
+    splitRowFromManifest("val", "Validação", "bg-brand-blue", splitCounts, splitPolicy, objectsBySplit, totalImages),
+    splitRowFromManifest("test", "Teste", "bg-brand-lavender", splitCounts, splitPolicy, objectsBySplit, totalImages),
+  ]
+  rows.push({
+    key: "total",
+    label: "Total",
+    dot: "",
+    pct: rows.reduce((total, row) => total + row.pct, 0),
+    images: rows.reduce((total, row) => total + row.images, 0) || fallbackImages,
+    objects: rows.reduce((total, row) => total + row.objects, 0) || fallbackObjects,
+    videos: 0,
+    minutes: 0,
+  })
+  return rows
+}
+
+function splitRowFromManifest(
+  key: "train" | "val" | "test",
+  label: string,
+  dot: string,
+  splitCounts: Record<string, unknown>,
+  splitPolicy: Record<string, unknown>,
+  objectsBySplit: Record<"train" | "val" | "test", number>,
+  totalImages: number,
+): SplitRow {
+  const images = numberValue(splitCounts[key]) ?? 0
+  const policyValue = numberValue(splitPolicy[key])
+  const pct =
+    policyValue !== null
+      ? Math.round((policyValue <= 1 ? policyValue * 100 : policyValue) * 100) / 100
+      : totalImages > 0
+        ? Math.round((images / totalImages) * 10000) / 100
+        : 0
+  return {
+    key,
+    label,
+    dot,
+    pct,
+    images,
+    objects: objectsBySplit[key],
+    videos: 0,
+    minutes: 0,
+  }
+}
+
+function splitKey(value: unknown): "train" | "val" | "test" | null {
+  return value === "train" || value === "val" || value === "test" ? value : null
+}
+
+function classRowsFromManifest(manifest: Record<string, unknown>): ClassRow[] {
+  return arrayOfRecords(manifest.class_distribution)
+    .map((row) => ({
+      name: stringValue(row.name) ?? "",
+      train: numberValue(row.train) ?? 0,
+      val: numberValue(row.val) ?? 0,
+      test: numberValue(row.test) ?? 0,
+      total: numberValue(row.total) ?? 0,
+    }))
+    .filter((row) => Boolean(row.name))
+}
+
+function healthMessages(manifest: Record<string, unknown>, key: "warnings" | "checks") {
+  const health = objectRecord(manifest.health)
+  return arrayOfRecords(health[key])
+    .map((item) => {
+      const message = stringValue(item.message)
+      const count = numberValue(item.count)
+      if (!message) return null
+      return count && count > 1 ? `${message} (${count.toLocaleString("pt-BR")})` : message
+    })
+    .filter((item): item is string => Boolean(item))
 }
 
 function objectRecord(value: unknown): Record<string, unknown> {
@@ -1285,7 +1490,7 @@ function DatasetStep({
         </div>
         <div className="mt-4 flex flex-wrap gap-x-6 gap-y-3">
           <Checkbox
-            label="Estratificar por classe"
+            label="Balancear classes no split"
             checked={cfg.stratify}
             onCheckedChange={(v) => set("stratify", v)}
           />
@@ -1387,8 +1592,9 @@ function SplitStatusChip({
   const { status } = validation
   const isInvalid = status === "invalid"
   const isLoading = status === "loading"
-  const label = isLoading ? "Calculando" : isInvalid ? "Divisão inválida" : "Divisão válida"
-  const Icon = isLoading ? Loader2 : isInvalid ? XCircle : CheckCircle2
+  const isWarning = status === "warning"
+  const label = isLoading ? "Calculando" : splitStatusMeta[status].label
+  const Icon = isLoading ? Loader2 : isInvalid ? XCircle : isWarning ? AlertTriangle : CheckCircle2
 
   return (
     <button
@@ -1399,6 +1605,8 @@ function SplitStatusChip({
         "inline-flex h-7 items-center gap-1.5 rounded-full border px-2.5 text-xs font-medium transition-colors",
         isInvalid
           ? "border-destructive/25 bg-destructive/10 text-destructive hover:bg-destructive/15"
+          : isWarning
+            ? "border-warning/25 bg-warning/10 text-warning hover:bg-warning/15"
           : "border-brand-green/25 bg-brand-green/10 text-brand-green hover:bg-brand-green/15",
         isLoading && "cursor-default border-border bg-muted text-muted-foreground hover:bg-muted",
       )}
@@ -1593,7 +1801,9 @@ function SplitDistributionPreview({
   return (
     <div className="mt-5 border-t border-border pt-4">
       <div className="mb-2 flex items-center justify-between gap-3">
-        <span className="text-xs font-medium text-muted-foreground">Distribuição estimada</span>
+        <span className="text-xs font-medium text-muted-foreground">
+          {stats.loading ? "Calculando distribuição" : stats.splitRows ? "Distribuição preparada" : "Distribuição estimada"}
+        </span>
         <span className="text-xs tabular-nums text-muted-foreground">
           {stats.loaded ? `${stats.images.toLocaleString("pt-BR")} imagens` : "Carregando dados"}
         </span>

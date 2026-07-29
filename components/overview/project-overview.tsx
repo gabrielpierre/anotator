@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import { flushSync } from "react-dom"
 import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import {
@@ -19,6 +20,7 @@ import {
   ChevronRight,
   FileClock,
   GitCommitVertical,
+  X,
 } from "lucide-react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/snowui/card"
 import { Button } from "@/components/ui/button"
@@ -34,13 +36,16 @@ import {
   fetchDatasetReleases,
   fetchJobs,
   fetchModelVersions,
+  fetchReviewAnnotations,
   fetchTasks,
   fetchTrainingRuns,
+  taskFrameAssetUrl,
 } from "@/lib/api/client"
-import { formatDateTimePt, formatPtNumber, labelsFromTasks, toUiJobStatus } from "@/lib/api/status"
+import { chartClassColor, formatDateTimePt, formatPercentPt, formatPtNumber, labelsFromTasks, percentFromCount, toUiJobStatus } from "@/lib/api/status"
 import { projectRecordFromBackend, useCurrentUser } from "@/lib/auth/user-context"
 import type {
   BackendAuditEvent,
+  BackendAnnotationRecord,
   BackendDashboard,
   BackendDatasetRelease,
   BackendJob,
@@ -57,14 +62,34 @@ const kpiMeta = [
   { label: "Anotações pendentes", subTone: "text-muted-foreground", icon: Clock, tone: "bg-warning/15 text-warning", valueTone: "text-warning" },
 ]
 
-const classColors = [
-  "var(--brand-blue)",
-  "var(--brand-green)",
-  "var(--brand-lavender)",
-  "var(--warning)",
-  "var(--brand-indigo)",
-  "var(--brand-sky)",
-]
+type ClassDistributionItem = {
+  name: string
+  count: number
+  color?: string
+}
+
+type AnnotationExample = {
+  id: string
+  label: string
+  taskExternalId: string
+  taskName: string
+  frame: number
+  count: number
+  previewUrl: string | null
+  color: string
+  updatedAt: string
+  boxes: AnnotationBox[]
+}
+
+type AnnotationBox = {
+  id: string
+  label: string
+  color: string
+  x: number
+  y: number
+  w: number
+  h: number
+}
 
 export function ProjectOverview() {
   const router = useRouter()
@@ -77,6 +102,12 @@ export function ProjectOverview() {
   const [models, setModels] = React.useState<BackendModelVersion[]>([])
   const [jobs, setJobs] = React.useState<BackendJob[]>([])
   const [auditEvents, setAuditEvents] = React.useState<BackendAuditEvent[]>([])
+  const [selectedClass, setSelectedClass] = React.useState<ClassDistributionItem | null>(null)
+  const [annotationExamples, setAnnotationExamples] = React.useState<AnnotationExample[]>([])
+  const [focusedAnnotationExample, setFocusedAnnotationExample] = React.useState<AnnotationExample | null>(null)
+  const [showAnnotationBoxes, setShowAnnotationBoxes] = React.useState(true)
+  const [annotationExamplesLoading, setAnnotationExamplesLoading] = React.useState(false)
+  const [annotationExamplesError, setAnnotationExamplesError] = React.useState<string | null>(null)
   const [importDialogOpen, setImportDialogOpen] = React.useState(false)
   const [customizeOpen, setCustomizeOpen] = React.useState(false)
   const { isAdmin, projects, activeProject, updateProject } = useCurrentUser()
@@ -103,6 +134,13 @@ export function ProjectOverview() {
     fetchAuditEvents({ limit: 5 }, controller.signal).then((page) => setAuditEvents(page.items)).catch(() => setAuditEvents([]))
     return () => controller.abort()
   }, [currentProjectExternalId, currentProjectId])
+
+  React.useEffect(() => {
+    setSelectedClass(null)
+    setAnnotationExamples([])
+    setFocusedAnnotationExample(null)
+    setAnnotationExamplesError(null)
+  }, [currentProjectExternalId])
 
   const stats = dashboard?.stats
   const taskList = tasks ?? []
@@ -147,22 +185,63 @@ export function ProjectOverview() {
   ]
 
   const taskClasses = labelsFromTasks(tasks)
-  const classItems =
+  const rawClassItems: ClassDistributionItem[] =
     dashboard?.class_distribution && dashboard.class_distribution.length > 0
-      ? dashboard.class_distribution.map((item, index) => ({
+      ? dashboard.class_distribution.map((item) => ({
           name: item.name,
           count: item.count,
-          share: item.share,
-          color: classColors[index % classColors.length],
         }))
       : taskClasses.length > 0
         ? taskClasses.map((item) => ({
             name: item.name,
             count: item.count ?? 1,
-            share: Math.round((100 / taskClasses.length) * 100) / 100,
             color: item.color,
           }))
       : []
+  const classTotal = rawClassItems.reduce((total, item) => total + item.count, 0)
+  const classItems = rawClassItems
+    .map((item) => ({
+      ...item,
+      share: percentFromCount(item.count, classTotal),
+    }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "pt-BR"))
+    .map((item, index) => ({ ...item, color: chartClassColor(index) }))
+
+  const selectedClassWithColor = selectedClass
+    ? classItems.find((item) => item.name === selectedClass.name) ?? selectedClass
+    : null
+
+  const updateAnnotationPanel = React.useCallback((update: () => void) => {
+    if (typeof document === "undefined" || !("startViewTransition" in document)) {
+      update()
+      return
+    }
+    ;(document as Document & { startViewTransition: (callback: () => void) => void }).startViewTransition(() => {
+      flushSync(update)
+    })
+  }, [])
+
+  React.useEffect(() => {
+    if (!selectedClassWithColor || !currentProjectExternalId) return
+    const controller = new AbortController()
+    setAnnotationExamplesLoading(true)
+    setFocusedAnnotationExample(null)
+    setAnnotationExamplesError(null)
+    fetchReviewAnnotations({ projectExternalId: currentProjectExternalId }, controller.signal)
+      .then((records) => {
+        setAnnotationExamples(annotationExamplesForClass(records, selectedClassWithColor, tasks ?? []))
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setAnnotationExamples([])
+          setAnnotationExamplesError(error instanceof Error ? error.message : "Nao foi possivel carregar exemplos.")
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setAnnotationExamplesLoading(false)
+      })
+    return () => controller.abort()
+  }, [currentProjectExternalId, selectedClassWithColor?.color, selectedClassWithColor?.name, tasks])
 
   const activeTrainingRuns = trainingRuns.filter((run) => run.status === "running" || run.status === "queued")
   const latestRelease = releases[0] ?? null
@@ -509,7 +588,13 @@ export function ProjectOverview() {
           </CardHeader>
           <CardContent className="flex flex-col items-center gap-4">
             <div className="relative w-44 max-w-full">
-              <DonutChart data={classItems.map((c) => ({ label: c.name, value: c.count, color: c.color }))} />
+              <DonutChart
+                data={classItems.map((c) => ({ label: c.name, value: c.count, color: c.color }))}
+                onSliceClick={(label) => {
+                  const item = classItems.find((candidate) => candidate.name === label)
+                  if (item) updateAnnotationPanel(() => setSelectedClass(item))
+                }}
+              />
               <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
                 <span className="text-lg font-semibold tabular-nums">
                   {formatPtNumber(classItems.reduce((total, item) => total + item.count, 0))}
@@ -524,31 +609,142 @@ export function ProjectOverview() {
                     <span className="size-2 rounded-full" style={{ background: c.color }} />
                     {c.name}
                   </span>
-                  <span className="tabular-nums text-muted-foreground">{c.share}%</span>
+                  <span className="tabular-nums text-muted-foreground">{formatPercentPt(c.share)}%</span>
                 </li>
               ))}
             </ul>
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Atividades recentes</CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-1">
-            {projectActivityItems.map((a) => (
-              <div key={a.id} className="flex items-center gap-3 rounded-lg py-2">
-                <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground [&_svg]:size-4">
-                  <a.icon />
-                </span>
-                <span className="flex-1 truncate text-sm">{a.title}</span>
-                <span className="shrink-0 text-xs text-muted-foreground">{a.time}</span>
-              </div>
-            ))}
-            {projectActivityItems.length === 0 && (
-              <p className="text-sm text-muted-foreground">Nenhuma atividade recente deste projeto.</p>
-            )}
-          </CardContent>
+        <Card className="overflow-visible">
+          {selectedClassWithColor ? (
+            <div className="overview-panel-transition">
+              <CardHeader>
+                <div className="flex min-w-0 items-center gap-2">
+                  <CardTitle>Exemplos de anotação</CardTitle>
+                  <span
+                    className="size-2.5 shrink-0 rounded-full"
+                    style={{ background: selectedClassWithColor.color }}
+                  />
+                  <span className="truncate text-xs font-medium text-muted-foreground">{selectedClassWithColor.name}</span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <Button
+                    variant={showAnnotationBoxes ? "secondary" : "ghost"}
+                    size="sm"
+                    aria-pressed={showAnnotationBoxes}
+                    onClick={() => updateAnnotationPanel(() => setShowAnnotationBoxes((current) => !current))}
+                  >
+                    <Box className="size-3.5" />
+                    Boxes
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    aria-label="Voltar para atividades recentes"
+                    onClick={() => updateAnnotationPanel(() => setSelectedClass(null))}
+                  >
+                    <X className="size-4" />
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent>
+                {annotationExamplesLoading ? (
+                  <div className="grid max-h-64 grid-cols-2 gap-3 overflow-x-hidden overflow-y-auto pr-1">
+                    {Array.from({ length: 6 }).map((_, index) => (
+                      <div key={index} className={`${exampleImageClass(index)} animate-pulse rounded-lg bg-muted`} />
+                    ))}
+                  </div>
+                ) : annotationExamplesError ? (
+                  <p className="text-sm text-muted-foreground">{annotationExamplesError}</p>
+                ) : focusedAnnotationExample ? (
+                  <div className="flex flex-col gap-3">
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      aria-label="Voltar para a colagem de exemplos"
+                      className="annotation-focus-transition cursor-zoom-out overflow-hidden rounded-lg border border-border bg-muted focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+                      style={{ borderTopColor: focusedAnnotationExample.color, borderTopWidth: 3 }}
+                      onClick={() => updateAnnotationPanel(() => setFocusedAnnotationExample(null))}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault()
+                          updateAnnotationPanel(() => setFocusedAnnotationExample(null))
+                        }
+                      }}
+                    >
+                      <AnnotationImageOverlay
+                        example={focusedAnnotationExample}
+                        className="bg-muted"
+                        showBoxes={showAnnotationBoxes}
+                      />
+                      <div className="flex items-center justify-between gap-3 bg-card/95 px-3 py-2 text-xs">
+                        <span className="min-w-0 truncate font-medium">
+                          {focusedAnnotationExample.taskName} · frame {focusedAnnotationExample.frame + 1}
+                        </span>
+                        <span className="shrink-0 tabular-nums text-muted-foreground">
+                          {focusedAnnotationExample.count} obj.
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ) : annotationExamples.length > 0 ? (
+                  <div className="max-h-64 overflow-x-hidden overflow-y-auto pr-1">
+                    <div className="columns-2 gap-3 [column-fill:_balance]">
+                    {annotationExamples.map((example, index) => (
+                      <button
+                        type="button"
+                        key={example.id}
+                        onClick={() => updateAnnotationPanel(() => setFocusedAnnotationExample(example))}
+                        className="annotation-example-tile group mb-3 block w-full break-inside-avoid overflow-hidden rounded-lg border border-border bg-muted text-left transition-transform duration-300 ease-out hover:-translate-y-0.5 hover:shadow-sm focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+                        style={{
+                          borderTopColor: example.color,
+                          borderTopWidth: 3,
+                          animationDelay: `${Math.min(index * 36, 220)}ms`,
+                        }}
+                      >
+                        <AnnotationImageOverlay
+                          example={example}
+                          className="bg-muted transition-transform duration-300 group-hover:scale-[1.02]"
+                          fallbackClassName={exampleImageClass(index)}
+                          showBoxes={showAnnotationBoxes}
+                        />
+                        <div className="flex items-center justify-between gap-2 bg-card/95 px-2.5 py-2 text-xs">
+                          <span className="min-w-0 truncate font-medium">{example.taskName}</span>
+                          <span className="shrink-0 tabular-nums text-muted-foreground">
+                            {example.count} obj.
+                          </span>
+                        </div>
+                      </button>
+                    ))}
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">Nenhum exemplo encontrado para esta classe.</p>
+                )}
+              </CardContent>
+            </div>
+          ) : (
+            <div className="overview-panel-transition">
+              <CardHeader>
+                <CardTitle>Atividades recentes</CardTitle>
+              </CardHeader>
+              <CardContent className="flex flex-col gap-1">
+                {projectActivityItems.map((a) => (
+                  <div key={a.id} className="flex items-center gap-3 rounded-lg py-2">
+                    <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground [&_svg]:size-4">
+                      <a.icon />
+                    </span>
+                    <span className="flex-1 truncate text-sm">{a.title}</span>
+                    <span className="shrink-0 text-xs text-muted-foreground">{a.time}</span>
+                  </div>
+                ))}
+                {projectActivityItems.length === 0 && (
+                  <p className="text-sm text-muted-foreground">Nenhuma atividade recente deste projeto.</p>
+                )}
+              </CardContent>
+            </div>
+          )}
         </Card>
       </div>
 
@@ -643,6 +839,184 @@ function modelStatus(status: string) {
 
 function numberFromRecord(record: Record<string, unknown>, key: string) {
   return numberFromUnknown(record[key])
+}
+
+function annotationExamplesForClass(
+  records: BackendAnnotationRecord[],
+  selectedClass: ClassDistributionItem,
+  tasks: BackendTask[],
+) {
+  const taskNames = new Map(tasks.map((task) => [task.external_id, task.name || `Task ${task.external_id}`]))
+  const byFrame = new Map<string, AnnotationExample>()
+  const selectedName = selectedClass.name.toLocaleLowerCase("pt-BR")
+
+  for (const record of records) {
+    if (!isActiveAnnotationRecord(record)) continue
+    if (!record.task_external_id || record.frame == null) continue
+    if ((record.label_name ?? "").toLocaleLowerCase("pt-BR") !== selectedName) continue
+    const box = annotationBoxFromRecord(record, selectedClass)
+    if (!box) continue
+
+    const key = `${record.task_external_id}:${record.frame}`
+    const current = byFrame.get(key)
+    if (current) {
+      current.count += 1
+      current.boxes.push(box)
+      if (record.updated_at > current.updatedAt) current.updatedAt = record.updated_at
+      continue
+    }
+
+    byFrame.set(key, {
+      id: key,
+      label: selectedClass.name,
+      taskExternalId: record.task_external_id,
+      taskName: taskNames.get(record.task_external_id) ?? `Task ${record.task_external_id}`,
+      frame: record.frame,
+      count: 1,
+      previewUrl: taskFrameAssetUrl(record.task_external_id, record.frame, { variant: "original" }),
+      color: selectedClass.color ?? "var(--brand-blue)",
+      updatedAt: record.updated_at,
+      boxes: [box],
+    })
+  }
+
+  return [...byFrame.values()]
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 9)
+}
+
+function isActiveAnnotationRecord(record: BackendAnnotationRecord) {
+  return !["deleted_by_reviewer", "needs_annotation", "rejected", "incorrect", "replaced_by_manual"].includes(
+    record.review_state,
+  )
+}
+
+function AnnotationImageOverlay({
+  example,
+  className,
+  fallbackClassName = "h-32",
+  showBoxes = true,
+}: {
+  example: AnnotationExample
+  className?: string
+  fallbackClassName?: string
+  showBoxes?: boolean
+}) {
+  return (
+    <div className={`relative overflow-hidden ${className ?? ""}`}>
+      {example.previewUrl ? (
+        <>
+          <img
+            src={example.previewUrl}
+            alt={`${example.label} frame ${example.frame + 1}`}
+            className="block h-auto w-full"
+          />
+          {showBoxes && (
+            <div className="pointer-events-none absolute inset-0" aria-hidden="true">
+              {example.boxes.map((box) => (
+                <span
+                  key={box.id}
+                  className="absolute rounded-[2px] border-2 shadow-[0_0_0_1px_rgba(0,0,0,0.55),0_0_10px_rgba(0,0,0,0.35)]"
+                  style={{
+                    borderColor: box.color,
+                    left: `${box.x * 100}%`,
+                    top: `${box.y * 100}%`,
+                    width: `${box.w * 100}%`,
+                    height: `${box.h * 100}%`,
+                  }}
+                />
+              ))}
+            </div>
+          )}
+        </>
+      ) : (
+        <div className={`flex w-full items-center justify-center text-muted-foreground ${fallbackClassName}`}>
+          <ImageIcon className="size-5" />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function annotationBoxFromRecord(
+  record: BackendAnnotationRecord,
+  selectedClass: ClassDistributionItem,
+): AnnotationBox | null {
+  const rawBox = normalizedBoxFromUnknown(record.raw.bbox_norm)
+  const pointsBox =
+    rawBox ??
+    normalizedBoxFromPoints(numberArrayFromUnknown(record.raw.points_norm)) ??
+    normalizedBoxFromAbsolutePoints(record)
+  if (!pointsBox) return null
+  return {
+    id: record.external_id,
+    label: selectedClass.name,
+    color: selectedClass.color ?? "var(--brand-blue)",
+    ...pointsBox,
+  }
+}
+
+function normalizedBoxFromUnknown(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const x = numberFromUnknown(record.x)
+  const y = numberFromUnknown(record.y)
+  const w = numberFromUnknown(record.w)
+  const h = numberFromUnknown(record.h)
+  if (x == null || y == null || w == null || h == null) return null
+  return normalizedBoxFromEdges(x, y, x + w, y + h)
+}
+
+function normalizedBoxFromPoints(points: number[]) {
+  if (points.length < 4 || !points.every(isNormalizedCoordinate)) return null
+  const xs = points.filter((_, index) => index % 2 === 0)
+  const ys = points.filter((_, index) => index % 2 === 1)
+  return normalizedBoxFromEdges(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys))
+}
+
+function normalizedBoxFromAbsolutePoints(record: BackendAnnotationRecord) {
+  const points = numberArrayFromUnknown(record.points)
+  if (points.length < 4 || points.every(isNormalizedCoordinate)) return null
+  const width = numberFromUnknown(record.raw.image_width) ?? numberFromUnknown(record.raw.width)
+  const height = numberFromUnknown(record.raw.image_height) ?? numberFromUnknown(record.raw.height)
+  if (!width || !height) return null
+  const normalized = points.map((point, index) => point / (index % 2 === 0 ? width : height))
+  return normalizedBoxFromPoints(normalized)
+}
+
+function normalizedBoxFromEdges(x1: number, y1: number, x2: number, y2: number) {
+  const left = clamp01(Math.min(x1, x2))
+  const top = clamp01(Math.min(y1, y2))
+  const right = clamp01(Math.max(x1, x2))
+  const bottom = clamp01(Math.max(y1, y2))
+  const w = right - left
+  const h = bottom - top
+  if (w <= 0 || h <= 0) return null
+  return { x: left, y: top, w, h }
+}
+
+function numberArrayFromUnknown(value: unknown) {
+  return Array.isArray(value) ? value.map(numberFromUnknown).filter((item): item is number => item != null) : []
+}
+
+function isNormalizedCoordinate(value: number) {
+  return Number.isFinite(value) && value >= 0 && value <= 1
+}
+
+function clamp01(value: number) {
+  return Math.min(1, Math.max(0, value))
+}
+
+function exampleImageClass(index: number) {
+  const sizes = [
+    "h-32",
+    "h-44",
+    "h-28",
+    "h-40",
+    "h-36",
+    "h-48",
+  ]
+  return `overflow-hidden bg-muted ${sizes[index % sizes.length]}`
 }
 
 function jobMatchesProject(

@@ -553,6 +553,10 @@ class PreparedDatasetRead(BaseModel):
     manifest: dict[str, Any] | None = None
 
 
+class PreparedDatasetRequest(BaseModel):
+    splits: dict[str, Any] | None = None
+
+
 class TrainingRunCreate(BaseModel):
     dataset_release_id: str
     base_model: str
