@@ -126,12 +126,13 @@ def preview_yolo_dataset(
 
 
 class CvatImage:
-    def __init__(self, name: str, width: int, height: int, frame: int, boxes: list["CvatBox"]):
+    def __init__(self, name: str, width: int, height: int, frame: int, boxes: list["CvatBox"], tags: list[str]):
         self.name = name
         self.width = width
         self.height = height
         self.frame = frame
         self.boxes = boxes
+        self.tags = tags
 
 
 class CvatBox:
@@ -205,6 +206,13 @@ def _build_yolo_dataset_plan(
             for box in boxes:
                 if box.label not in class_names:
                     class_names.append(box.label)
+            labels = _classification_labels_for_image(
+                xml_tags=item.tags,
+                local_annotations=local_annotations.get((task_external_id, item.frame), []),
+            )
+            for label in labels:
+                if label not in class_names:
+                    class_names.append(label)
             source_images.append(
                 {
                     "stable_key": stable_key,
@@ -216,6 +224,7 @@ def _build_yolo_dataset_plan(
                     "height": item.height,
                     "frame": item.frame,
                     "boxes": boxes,
+                    "labels": labels,
                     "source_artifact_uri": uri,
                 }
             )
@@ -298,6 +307,7 @@ def _read_cvat_zip(content: bytes) -> CvatZip:
                     height=height,
                     frame=frame if frame is not None else index,
                     boxes=boxes,
+                    tags=_tags_for_image(image),
                 )
             )
         return CvatZip(class_names=class_names, images=images, files=files)
@@ -320,6 +330,18 @@ def _boxes_for_image(image) -> list[CvatBox]:
             ys = points[1::2]
             boxes.append(CvatBox(label, min(xs), min(ys), max(xs), max(ys), shape_type="polygon", source="cvat_export"))
     return boxes
+
+
+def _tags_for_image(image) -> list[str]:
+    labels = []
+    seen = set()
+    for tag in image.findall("tag"):
+        label = str(tag.attrib.get("label") or "").strip()
+        key = label.casefold()
+        if label and key not in seen:
+            labels.append(label)
+            seen.add(key)
+    return labels
 
 
 def _yolo_label_line(class_id: int, box: CvatBox, width: int, height: int) -> str:
@@ -355,7 +377,8 @@ def _manifest_images(
         stable_key = str(source_image["stable_key"])
         split = assignments[stable_key]
         safe_stem = _safe_stem(stable_key)
-        class_counts = Counter(box.label for box in source_image["boxes"])
+        box_counts = Counter(box.label for box in source_image["boxes"])
+        class_counts = _source_image_class_counts(source_image)
         rows.append(
             {
                 "name": source_image["name"],
@@ -365,7 +388,9 @@ def _manifest_images(
                 "width": source_image["width"],
                 "height": source_image["height"],
                 "frame": source_image["frame"],
-                "boxes": sum(class_counts.values()),
+                "boxes": sum(box_counts.values()),
+                "annotations": sum(class_counts.values()),
+                "image_labels": sorted(set(source_image.get("labels", []))),
                 "classes": sorted(class_counts),
                 "class_counts": dict(sorted(class_counts.items())),
                 "class_ids": sorted(class_index[label] for label in class_counts if label in class_index),
@@ -505,10 +530,35 @@ def _local_annotations_by_frame(
             continue
         if (row.review_state or "").lower() in EXCLUDED_REVIEW_STATES:
             continue
-        if (row.shape_type or "").lower() not in {"rectangle", "polygon"}:
+        annotation_type = (row.annotation_type or "").lower()
+        shape_type = (row.shape_type or "").lower()
+        if annotation_type != "tag" and shape_type not in {"rectangle", "polygon"}:
             continue
         grouped.setdefault((task_external_id, int(row.frame)), []).append(row)
     return grouped
+
+
+def _classification_labels_for_image(xml_tags: list[str], local_annotations: list[AnnotationRecord]) -> list[str]:
+    labels = []
+    seen = set()
+    for label in xml_tags:
+        normalized = label.strip()
+        key = normalized.casefold()
+        if normalized and key not in seen:
+            labels.append(normalized)
+            seen.add(key)
+    for annotation in local_annotations:
+        if (annotation.annotation_type or "").lower() != "tag":
+            continue
+        label = annotation.label_name or _raw_label_name(annotation.raw)
+        if not label:
+            continue
+        normalized = label.strip()
+        key = normalized.casefold()
+        if normalized and key not in seen:
+            labels.append(normalized)
+            seen.add(key)
+    return labels
 
 
 def _local_boxes_for_image(
@@ -728,8 +778,8 @@ def _split_assignments(items: list[dict[str, Any]], split_policy: dict[str, Any]
 def _ratio_split_assignments(items: list[dict[str, Any]], splits: dict[str, Any]) -> dict[str, str]:
     counts = _balanced_split_counts(len(items), splits)
     assignments: dict[str, str] = {}
-    positive_items = [item for item in items if item.get("boxes")]
-    background_items = [item for item in items if not item.get("boxes")]
+    positive_items = [item for item in items if _source_image_annotation_count(item) > 0]
+    background_items = [item for item in items if _source_image_annotation_count(item) <= 0]
 
     positive_counts = _bounded_positive_split_counts(len(positive_items), counts, splits)
     remaining_counts = dict(counts)
@@ -792,7 +842,7 @@ def _split_units(items: list[dict[str, Any]], split_policy: dict[str, Any]) -> l
         grouped.setdefault(key, []).append(item)
     units = []
     for key, rows in grouped.items():
-        labels = sorted({box.label for row in rows for box in row.get("boxes", [])})
+        labels = sorted({label for row in rows for label in _source_image_class_counts(row)})
         units.append(
             {
                 "key": key,
@@ -999,7 +1049,7 @@ def _class_distribution(
     }
     for source_image in source_images:
         split = assignments[str(source_image["stable_key"])]
-        image_class_counts = Counter(box.label for box in source_image.get("boxes", []))
+        image_class_counts = _source_image_class_counts(source_image)
         for label, count in image_class_counts.items():
             if label not in rows:
                 rows[label] = {
@@ -1015,6 +1065,18 @@ def _class_distribution(
             rows[label]["images"][split] += 1
             rows[label]["images"]["total"] += 1
     return list(rows.values())
+
+
+def _source_image_class_counts(source_image: dict[str, Any]) -> Counter:
+    counts = Counter(box.label for box in source_image.get("boxes", []))
+    for label in source_image.get("labels", []):
+        if label:
+            counts[str(label)] += 1
+    return counts
+
+
+def _source_image_annotation_count(source_image: dict[str, Any]) -> int:
+    return sum(_source_image_class_counts(source_image).values())
 
 
 def _dataset_health(
@@ -1037,7 +1099,7 @@ def _dataset_health(
             }
         )
 
-    empty_images = [image["name"] for image in manifest_images if int(image.get("boxes") or 0) == 0]
+    empty_images = [image["name"] for image in manifest_images if int(image.get("annotations") or image.get("boxes") or 0) == 0]
     if empty_images:
         warnings.append(
             {
@@ -1051,7 +1113,7 @@ def _dataset_health(
         warnings.append(
             {
                 "code": "annotated_scope_contains_empty_images",
-                "message": "O release foi marcado como somente anotadas, mas o artefato contém imagens sem boxes.",
+                "message": "O release foi marcado como somente anotadas, mas o artefato contém imagens sem anotações.",
                 "count": len(empty_images),
             }
         )

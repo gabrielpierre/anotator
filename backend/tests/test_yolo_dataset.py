@@ -411,6 +411,48 @@ def test_preview_yolo_dataset_split_is_reproducible_for_same_seed() -> None:
         assert first_map == second_map
 
 
+def test_preview_yolo_dataset_counts_classification_tags_in_split_distribution() -> None:
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    source_uri = "s3://bucket/source.zip"
+    specs = [{"name": f"images/frame_{index:06d}.jpg", "boxes": []} for index in range(4)]
+    store = MemoryArtifactStore({source_uri: _cvat_export_zip_with_images(specs, labels=["daisy", "tulip"])})
+
+    with session_factory() as db:
+        db.add_all(
+            [
+                _classification_tag_record("21", 0, "daisy"),
+                _classification_tag_record("21", 1, "daisy"),
+                _classification_tag_record("21", 2, "tulip"),
+                _classification_tag_record("21", 3, "tulip"),
+            ]
+        )
+        release = DatasetRelease(
+            name="release_classification",
+            status="ready",
+            artifact_uri=source_uri,
+            immutable=True,
+            snapshot={
+                "splits": {"train": 0.5, "val": 0.5, "test": 0},
+                "artifacts": [{"uri": source_uri, "task_external_id": "21"}],
+            },
+        )
+        db.add(release)
+        db.commit()
+        db.refresh(release)
+
+        prepared = preview_yolo_dataset(db, release_id=release.id, artifact_store=store)
+        distribution = {row["name"]: row for row in prepared["manifest"]["class_distribution"]}
+        warnings = prepared["manifest"]["health"]["warnings"]
+
+        assert distribution["daisy"]["total"] == 2
+        assert distribution["tulip"]["total"] == 2
+        assert sum(row["annotations"] for row in prepared["manifest"]["images"]) == 4
+        assert all(row["boxes"] == 0 for row in prepared["manifest"]["images"])
+        assert not any(warning["code"] == "empty_images_included" for warning in warnings)
+
+
 def test_preview_yolo_dataset_preserves_folder_groups_when_requested() -> None:
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
     Base.metadata.create_all(bind=engine)
@@ -511,4 +553,22 @@ def _box_rows(boxes: list[dict]) -> str:
         f'    <box label="{box.get("label", "object")}" xtl="{box.get("xtl", 10)}" ytl="{box.get("ytl", 20)}" '
         f'xbr="{box.get("xbr", 50)}" ybr="{box.get("ybr", 60)}" />'
         for box in boxes
+    )
+
+
+def _classification_tag_record(task_external_id: str, frame: int, label: str) -> AnnotationRecord:
+    return AnnotationRecord(
+        external_id=f"classification:{task_external_id}:{frame}:{label}",
+        cvat_job_id=f"local:{task_external_id}",
+        task_external_id=task_external_id,
+        annotation_type="tag",
+        cvat_annotation_id=f"tag:{frame}:{label}",
+        frame=frame,
+        label_name=label,
+        shape_type=None,
+        source="dataset_import",
+        confidence=1.0,
+        points=[],
+        review_state="accepted",
+        raw={"annotation_kind": "classification", "label_name": label},
     )

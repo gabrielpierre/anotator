@@ -1134,11 +1134,11 @@ function datasetStatsFromRelease(
     ...manifestClasses,
     ...labelNames,
   ])
-  const manifestObjectCount = manifestImages.reduce(
-    (total, image) => total + (numberValue(image.boxes) ?? 0),
+  const manifestObjectCount = manifestImages.reduce<number>(
+    (total, image) => total + manifestImageAnnotationCount(image),
     0,
   )
-  const classObjectCount = classRows.reduce((total, row) => total + row.total, 0)
+  const classObjectCount = classRows.reduce<number>((total, row) => total + row.total, 0)
   const imageCount = manifestImages.length || numberValue(counts.images) || 0
   const objectCount =
     manifestObjectCount || classObjectCount || numberValue(counts.annotations) || numberValue(counts.objects) || 0
@@ -1181,7 +1181,7 @@ function splitRowsFromManifest(
   for (const image of manifestImages) {
     const split = splitKey(image.split)
     if (!split) continue
-    objectsBySplit[split] += numberValue(image.boxes) ?? 0
+    objectsBySplit[split] += manifestImageAnnotationCount(image)
   }
 
   const totalImages =
@@ -1248,6 +1248,18 @@ function classRowsFromManifest(manifest: Record<string, unknown>): ClassRow[] {
       total: numberValue(row.total) ?? 0,
     }))
     .filter((row) => Boolean(row.name))
+}
+
+function manifestImageAnnotationCount(image: Record<string, unknown>): number {
+  const explicitCount = numberValue(image.annotations)
+  if (explicitCount !== null) return explicitCount
+  const classCounts = objectRecord(image.class_counts)
+  const classCountTotal = Object.values(classCounts).reduce<number>(
+    (total, value) => total + (numberValue(value) ?? 0),
+    0,
+  )
+  if (classCountTotal > 0) return classCountTotal
+  return numberValue(image.boxes) ?? 0
 }
 
 function healthMessages(manifest: Record<string, unknown>, key: "warnings" | "checks") {
