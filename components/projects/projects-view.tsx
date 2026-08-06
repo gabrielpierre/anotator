@@ -2,11 +2,9 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
 import {
   AlertTriangle,
   ArrowRight,
-  Database,
   FolderKanban,
   FolderOpen,
   HardDrive,
@@ -22,18 +20,15 @@ import { Avatar } from "@/components/snowui/avatar"
 import { MetricCard } from "@/components/snowui/metric-card"
 import { PageHeader, ProgressBar } from "@/components/app/primitives"
 import { AdminOnly } from "@/components/app/admin-only"
-import { ImportDatasetDialog } from "@/components/data/import-dataset-dialog"
 import { ProjectDialog, type ProjectDialogTarget } from "@/components/projects/project-dialog"
 import { useCurrentUser, projectRecordFromBackend, type ProjectRecord } from "@/lib/auth/user-context"
 import type { BackendProject } from "@/lib/api/types"
 
 export function ProjectsView() {
-  const router = useRouter()
   const { users, projects, addProject, updateProject, removeProject, setActiveProjectId } = useCurrentUser()
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [dialogMode, setDialogMode] = React.useState<"create" | "edit">("create")
   const [editTarget, setEditTarget] = React.useState<ProjectDialogTarget | null>(null)
-  const [datasetImportOpen, setDatasetImportOpen] = React.useState(false)
   const [deleteTarget, setDeleteTarget] = React.useState<ProjectRecord | null>(null)
   const [deleteSubmitting, setDeleteSubmitting] = React.useState(false)
   const [deleteError, setDeleteError] = React.useState<string | null>(null)
@@ -100,16 +95,10 @@ export function ProjectsView() {
         title="Projetos"
         subtitle="Gerencie os projetos de anotação, o storage reservado e os acessos da equipe."
         actions={
-          <>
-            <Button size="lg" variant="outline" onClick={() => setDatasetImportOpen(true)}>
-              <Database className="size-4" />
-              Importar dataset
-            </Button>
-            <Button size="lg" onClick={openCreate}>
-              <Plus className="size-4" />
-              Novo projeto
-            </Button>
-          </>
+          <Button size="lg" onClick={openCreate}>
+            <Plus className="size-4" />
+            Novo projeto
+          </Button>
         }
       />
 
@@ -135,17 +124,6 @@ export function ProjectsView() {
         project={editTarget}
         onClose={() => setDialogOpen(false)}
         onSaved={handleSaved}
-      />
-      <ImportDatasetDialog
-        open={datasetImportOpen}
-        onClose={() => setDatasetImportOpen(false)}
-        onImported={(_, projectId) => {
-          setDatasetImportOpen(false)
-          if (projectId) {
-            setActiveProjectId(projectId)
-            router.push(`/dados?project=${encodeURIComponent(projectId)}`)
-          }
-        }}
       />
       <DeleteProjectDialog
         project={deleteTarget}

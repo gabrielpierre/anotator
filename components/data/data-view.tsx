@@ -4,7 +4,6 @@ import * as React from "react"
 import { useRouter } from "next/navigation"
 import {
   AlertTriangle,
-  Download,
   Filter,
   FolderKanban,
   HardDrive,
@@ -21,7 +20,7 @@ import { Card, CardHeader, CardTitle, CardContent } from "@/components/snowui/ca
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/snowui/input"
 import { MetricCard } from "@/components/snowui/metric-card"
-import { PageHeader, StatusBadge, ProgressBar } from "@/components/app/primitives"
+import { PageHeader, ProgressBar } from "@/components/app/primitives"
 import { DerivedDatasetDialog } from "@/components/data/derived-dataset-dialog"
 import { ImportBatchDialog } from "@/components/data/import-batch-dialog"
 import { ImportDatasetDialog } from "@/components/data/import-dataset-dialog"
@@ -29,23 +28,17 @@ import {
   apiAssetUrl,
   assignTaskAssignee,
   deleteTask,
-  derivedAssetDownloadPath,
-  downloadBackendFile,
   fetchDashboard,
-  fetchDerivedAssets,
   fetchImportJob,
-  fetchPipelineRuns,
   fetchTaskDeleteImpact,
   fetchTasks,
   fetchUsers,
 } from "@/lib/api/client"
-import { chartClassColor, formatDateTimePt, formatPercentPt, formatPtNumber, labelsFromTasks, percentFromCount, toUiJobStatus } from "@/lib/api/status"
+import { chartClassColor, formatDateTimePt, formatPercentPt, formatPtNumber, labelsFromTasks, percentFromCount } from "@/lib/api/status"
 import { useCurrentUser, type ProjectRecord } from "@/lib/auth/user-context"
 import type {
   BackendDashboard,
-  BackendDerivedAsset,
   BackendImportJob,
-  BackendPipelineRun,
   BackendTask,
   BackendTaskDeleteImpact,
   BackendUser,
@@ -66,9 +59,6 @@ export function DataView() {
   const router = useRouter()
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [dashboard, setDashboard] = React.useState<BackendDashboard | null>(null)
-  const [derivedAssets, setDerivedAssets] = React.useState<BackendDerivedAsset[] | null>(null)
-  const [pipelineRuns, setPipelineRuns] = React.useState<BackendPipelineRun[] | null>(null)
-  const [pipelineError, setPipelineError] = React.useState<string | null>(null)
   const [importDialogOpen, setImportDialogOpen] = React.useState(false)
   const [datasetImportDialogOpen, setDatasetImportDialogOpen] = React.useState(false)
   const [derivedDialogOpen, setDerivedDialogOpen] = React.useState(false)
@@ -95,15 +85,11 @@ export function DataView() {
     if (!currentProjectRecord) {
       setTasks([])
       setDashboard(null)
-      setDerivedAssets([])
-      setPipelineRuns([])
       setUsers(null)
       return
     }
     fetchTasks({ projectExternalId: currentProjectExternalId }, signal).then(setTasks).catch(() => setTasks(null))
     fetchDashboard(currentProjectId, signal).then(setDashboard).catch(() => setDashboard(null))
-    fetchDerivedAssets({ projectId: currentProjectId, limit: 8 }, signal).then(setDerivedAssets).catch(() => setDerivedAssets(null))
-    fetchPipelineRuns({ projectId: currentProjectId }, signal).then(setPipelineRuns).catch(() => setPipelineRuns(null))
     if (isAdmin) fetchUsers(signal).then(setUsers).catch(() => setUsers(null))
     else setUsers(null)
   }, [currentProjectExternalId, currentProjectId, currentProjectRecord, isAdmin])
@@ -210,7 +196,6 @@ export function DataView() {
   const imageCount = dashboard?.stats.images ?? batches.reduce((total, batch) => total + batch.images, 0)
   const annotatedCount = batches.reduce((total, batch) => total + batch.annotatedImages, 0)
   const objectCount = batches.reduce((total, batch) => total + batch.annotations, 0)
-  const latestPipeline = pipelineRuns?.[0] ?? null
   const storage = storageFromDashboard(dashboard, currentProjectRecord)
 
   function closeDeleteDialog() {
@@ -350,10 +335,7 @@ export function DataView() {
         classCount={classDistribution.length}
         projectId={currentProjectId}
         onClose={() => setDerivedDialogOpen(false)}
-        onCreated={(run) => {
-          setPipelineError(null)
-          setPipelineRuns((current) => [run, ...(current ?? [])])
-        }}
+        onCreated={() => loadData()}
       />
       <DeleteBatchDialog
         task={deleteTarget}
@@ -365,7 +347,7 @@ export function DataView() {
         onConfirm={confirmDeleteTask}
       />
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <MetricCard
           label="Imagens importadas"
           value={formatPtNumber(imageCount)}
@@ -384,14 +366,7 @@ export function DataView() {
           hint="Anotações salvas"
           tone="purple"
         />
-        <MetricCard
-          label="Crops derivados"
-          value={formatPtNumber(derivedAssets?.length ?? 0)}
-          hint={latestPipeline ? `Pipeline ${latestPipeline.status}` : "datasets de classificacao"}
-          tone="subtle"
-        />
       </div>
-      {pipelineError && <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{pipelineError}</p>}
       {assignmentError && (
         <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{assignmentError}</p>
       )}
@@ -587,56 +562,6 @@ export function DataView() {
             </CardContent>
           </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Dataset derivado</CardTitle>
-              {latestPipeline && <StatusBadge status={toUiJobStatus(latestPipeline.status)} />}
-            </CardHeader>
-            <CardContent className="flex flex-col gap-3">
-              {latestPipeline ? (
-                <div className="rounded-lg bg-surface-subtle p-3 text-xs text-muted-foreground">
-                  <p className="font-medium text-foreground">{latestPipeline.name}</p>
-                  <p>Release: {String(latestPipeline.lineage.derived_release_id ?? "--").slice(0, 12)}</p>
-                  <p>Assets: {String(latestPipeline.lineage.derived_asset_count ?? derivedAssets?.length ?? 0)}</p>
-                </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">Nenhum pipeline derivado executado.</p>
-              )}
-              <div className="divide-y divide-border">
-                {(derivedAssets ?? []).slice(0, 6).map((asset) => (
-                  <div key={asset.id} className="flex items-center gap-3 py-2.5">
-                    {apiAssetUrl(asset.preview_url) ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={apiAssetUrl(asset.preview_url) ?? undefined}
-                        alt=""
-                        className="size-8 shrink-0 rounded-lg object-cover"
-                      />
-                    ) : (
-                      <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-surface-blue text-brand-blue">
-                        <Scissors className="size-4" />
-                      </span>
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium text-foreground">{asset.label_name ?? "classe"}</p>
-                      <p className="truncate text-xs text-muted-foreground">
-                        {asset.split} - frame {asset.frame ?? "--"} - {asset.source_track_id ? "track" : "shape"}
-                      </p>
-                    </div>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label="Baixar crop"
-                      disabled={!asset.crop_uri}
-                      onClick={() => void downloadBackendFile(derivedAssetDownloadPath(asset.id), `${asset.id}.png`)}
-                    >
-                      <Download className="size-4" />
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
         </div>
       </div>
     </div>

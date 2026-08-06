@@ -110,11 +110,46 @@ const initialShapes: Shape[] = []
 
 type FrameDimensions = { width: number; height: number }
 type StageSize = { width: number; height: number }
+type AnnotatedGalleryLabel = { name: string; color: string; count: number }
+type AnnotatedGalleryBox = { id: string; label: string; color: string; x: number; y: number; w: number; h: number }
+type AnnotatedGalleryExample = {
+  id: string
+  taskName: string
+  frame: number
+  previewUrl: string | null
+  labels: AnnotatedGalleryLabel[]
+  boxes: AnnotatedGalleryBox[]
+  annotationCount: number
+  updatedAt: string
+}
+type AnnotatedGalleryPlacement = {
+  example: AnnotatedGalleryExample
+  index: number
+  column: number
+  rowStart: number
+  rowSpan: number
+  columnSpan: number
+  imageHeight: number
+}
+type AnnotatedGallerySkeletonPlacement = {
+  index: number
+  column: number
+  rowStart: number
+  rowSpan: number
+  columnSpan: number
+  imageHeight: number
+}
 
 const clamp = (v: number, min = 0, max = 1) => Math.min(max, Math.max(min, v))
 const MIN_SCALE = 0.4
 const MAX_SCALE = 8
 const MIN_BOX = 0.01
+const ANNOTATED_GALLERY_INITIAL_BATCH_SIZE = 24
+const ANNOTATED_GALLERY_BATCH_SIZE = 24
+const ANNOTATED_GALLERY_LOAD_DELAY_MS = 260
+const ANNOTATED_GALLERY_GRID_ROW_HEIGHT = 8
+const ANNOTATED_GALLERY_GRID_GAP = 16
+const ANNOTATED_GALLERY_FOOTER_HEIGHT = 78
 
 type Handle = "n" | "s" | "e" | "w" | "ne" | "nw" | "se" | "sw"
 
@@ -137,6 +172,7 @@ export function AnnotateView() {
   const [tasks, setTasks] = useState<BackendTask[] | null>(null)
   const [backendLabels, setBackendLabels] = useState<BackendCvatLabel[]>([])
   const [taskMeta, setTaskMeta] = useState<BackendTaskDataMeta | null>(null)
+  const [taskMetaLoading, setTaskMetaLoading] = useState(false)
   const [modelVersions, setModelVersions] = useState<BackendModelVersion[]>([])
   const { currentUser, activeProject, projects } = useCurrentUser()
   const activeProjectId = activeProject?.id ?? projects[0]?.id ?? null
@@ -237,6 +273,9 @@ export function AnnotateView() {
   const [imageIndex, setImageIndex] = useState(0)
   const [onlyUnannotated, setOnlyUnannotated] = useState(false)
   const [annotatedFrames, setAnnotatedFrames] = useState<Set<number>>(() => new Set())
+  const [annotatedFramesLoading, setAnnotatedFramesLoading] = useState(false)
+  const [taskAnnotationRecords, setTaskAnnotationRecords] = useState<BackendAnnotationRecord[]>([])
+  const [blockedDataOpen, setBlockedDataOpen] = useState(false)
   const loadedAnnotationKeys = useRef(new Set<string>())
   const dirtyFrameSignatures = useRef(new Map<string, string>())
   const handledJobEvents = useRef(new Set<string>())
@@ -289,6 +328,12 @@ export function AnnotateView() {
   const currentTaskId = currentTask?.external_id ?? currentTask?.id
   const currentFrameKey = `${currentTaskId ?? "no-task"}:${currentFrame}`
   const previewSrc = taskFrameAssetUrl(currentTaskId, currentFrame) ?? "/placeholder.svg"
+  const annotationImportTarget = taskAnnotationImportTarget(currentTask)
+  const blockedAnnotatedExamples = useMemo(
+    () => (currentTask ? annotatedGalleryExamplesForTask(taskAnnotationRecords, currentTask, colorFor) : []),
+    [colorFor, currentTask, taskAnnotationRecords],
+  )
+  const needsAnnotatedFrameIndex = annotationImportTarget === "review" || annotationImportTarget === "ready"
   const blockedAnnotationFrames = useMemo(() => {
     const frames = new Set<number>()
     for (const state of taskMeta?.frame_workflow_states ?? []) {
@@ -296,17 +341,20 @@ export function AnnotateView() {
         frames.add(state.frame)
       }
     }
-    if (taskAnnotationImportTarget(currentTask) === "review") {
+    if (needsAnnotatedFrameIndex) {
       for (const frame of annotatedFrames) frames.add(frame)
     }
     return frames
-  }, [annotatedFrames, currentTask, taskMeta?.frame_workflow_states])
+  }, [annotatedFrames, needsAnnotatedFrameIndex, taskMeta?.frame_workflow_states])
   const hasAnnotatableFrame = useMemo(() => {
     for (let frame = 0; frame < totalImages; frame += 1) {
       if (!blockedAnnotationFrames.has(frame)) return true
     }
     return false
   }, [blockedAnnotationFrames, totalImages])
+  const isCheckingAnnotationAvailability = Boolean(
+    currentTask && (taskMetaLoading || (needsAnnotatedFrameIndex && annotatedFramesLoading)),
+  )
   const knownAnnotatedFrames = useMemo(() => {
     const frames = new Set(annotatedFrames)
     if (!currentTaskId) return frames
@@ -421,18 +469,26 @@ export function AnnotateView() {
     setPolyDraft(null)
     setClassPicker(null)
     setAnnotatedFrames(new Set())
+    setTaskAnnotationRecords([])
+    setBlockedDataOpen(false)
   }, [currentTaskId])
 
   useEffect(() => {
     if (!currentTaskId) {
       setTaskMeta(null)
+      setTaskMetaLoading(false)
       return
     }
+    setTaskMeta(null)
+    setTaskMetaLoading(true)
     const controller = new AbortController()
     fetchTaskDataMeta(currentTaskId, controller.signal)
       .then(setTaskMeta)
       .catch(() => {
         if (!controller.signal.aborted) setTaskMeta(null)
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setTaskMetaLoading(false)
       })
     return () => controller.abort()
   }, [currentTaskId])
@@ -441,11 +497,18 @@ export function AnnotateView() {
     const taskExternalId = currentTask?.external_id
     if (!taskExternalId) {
       setAnnotatedFrames(new Set())
+      setTaskAnnotationRecords([])
+      setAnnotatedFramesLoading(false)
       return
     }
+    setAnnotatedFrames(new Set())
+    setTaskAnnotationRecords([])
+    setAnnotatedFramesLoading(true)
     const controller = new AbortController()
     fetchReviewAnnotations({ taskExternalId }, controller.signal)
       .then((records) => {
+        if (controller.signal.aborted) return
+        setTaskAnnotationRecords(records)
         const frames = new Set<number>()
         records.forEach((record) => {
           if (!isEditableAnnotationRecord(record) || record.frame == null) return
@@ -454,7 +517,13 @@ export function AnnotateView() {
         setAnnotatedFrames(frames)
       })
       .catch(() => {
-        if (!controller.signal.aborted) setAnnotatedFrames(new Set())
+        if (!controller.signal.aborted) {
+          setAnnotatedFrames(new Set())
+          setTaskAnnotationRecords([])
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setAnnotatedFramesLoading(false)
       })
     return () => controller.abort()
   }, [currentTask?.external_id])
@@ -1634,7 +1703,38 @@ export function AnnotateView() {
     )
   }
 
-  if (taskMeta && !hasAnnotatableFrame) {
+  if (isCheckingAnnotationAvailability) {
+    return (
+      <div className="flex h-[calc(100dvh-3.5rem)] items-center justify-center p-6">
+        <div className="flex max-w-md flex-col items-center gap-3 text-center">
+          <span className="flex size-12 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
+            <span className="size-5 animate-spin rounded-full border-2 border-brand-blue/30 border-t-brand-blue" />
+          </span>
+          <div className="flex flex-col gap-1">
+            <p className="text-base font-medium text-foreground">Verificando disponibilidade do lote</p>
+            <p className="text-sm text-muted-foreground">
+              Conferindo quais imagens podem abrir para anotação.
+            </p>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (!hasAnnotatableFrame) {
+    if (blockedDataOpen) {
+      return (
+        <AnnotatedTaskDataGallery
+          task={currentTask}
+          examples={blockedAnnotatedExamples}
+          totalImages={totalImages}
+          loading={annotatedFramesLoading}
+          onBack={() => setBlockedDataOpen(false)}
+          onReview={() => router.push(projectScopedHref("/revisar", activeProjectId))}
+        />
+      )
+    }
+
     return (
       <div className="flex h-[calc(100dvh-3.5rem)] items-center justify-center p-6">
         <div className="flex max-w-md flex-col items-center gap-3 text-center">
@@ -1651,7 +1751,7 @@ export function AnnotateView() {
             <Button onClick={() => router.push(projectScopedHref("/revisar", activeProjectId))}>
               Ir para revisar
             </Button>
-            <Button variant="outline" onClick={() => router.push(projectScopedHref("/dados", activeProjectId))}>
+            <Button variant="outline" onClick={() => setBlockedDataOpen(true)}>
               Ver dados
             </Button>
           </div>
@@ -2577,6 +2677,582 @@ export function AnnotateView() {
   )
 }
 
+function AnnotatedTaskDataGallery({
+  task,
+  examples,
+  totalImages,
+  loading,
+  onBack,
+  onReview,
+}: {
+  task: BackendTask | null
+  examples: AnnotatedGalleryExample[]
+  totalImages: number
+  loading: boolean
+  onBack: () => void
+  onReview: () => void
+}) {
+  const annotatedCount = examples.length
+  const annotatedText = `${annotatedCount.toLocaleString("pt-BR")} ${
+    annotatedCount === 1 ? "imagem anotada" : "imagens anotadas"
+  }`
+  const totalText = `${totalImages.toLocaleString("pt-BR")} ${totalImages === 1 ? "imagem" : "imagens"} no lote`
+  const scrollRootRef = useRef<HTMLDivElement>(null)
+  const galleryRef = useRef<HTMLDivElement>(null)
+  const loadMoreRef = useRef<HTMLDivElement>(null)
+  const [visibleCount, setVisibleCount] = useState(ANNOTATED_GALLERY_INITIAL_BATCH_SIZE)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [focusedExampleId, setFocusedExampleId] = useState<string | null>(null)
+  const [imageAspectRatios, setImageAspectRatios] = useState<Record<string, number>>({})
+  const columnCount = useResponsiveMasonryColumnCount()
+  const galleryWidth = useElementWidth(galleryRef)
+  const columnWidth = annotationGalleryColumnWidth(galleryWidth, columnCount)
+  const visibleExamples = useMemo(() => examples.slice(0, visibleCount), [examples, visibleCount])
+  const hasMoreExamples = visibleCount < examples.length
+  const focusedExampleIndex = useMemo(
+    () => examples.findIndex((example) => example.id === focusedExampleId),
+    [examples, focusedExampleId],
+  )
+  const focusedExample = focusedExampleIndex >= 0 ? examples[focusedExampleIndex] : null
+  const skeletonItems = useMemo(
+    () => Array.from({ length: 12 }, (_, index) => index),
+    [],
+  )
+  const loadMoreSkeletonItems = useMemo(
+    () => Array.from({ length: Math.min(8, Math.max(0, examples.length - visibleCount)) }, (_, index) => visibleCount + index),
+    [examples.length, visibleCount],
+  )
+  const galleryPlacements = useMemo(
+    () => buildAnnotatedGalleryPlacements(visibleExamples, columnCount, columnWidth, imageAspectRatios, focusedExampleId),
+    [columnCount, columnWidth, focusedExampleId, imageAspectRatios, visibleExamples],
+  )
+  const skeletonPlacements = useMemo(
+    () => buildAnnotationGallerySkeletonPlacements(skeletonItems, columnCount, columnWidth),
+    [columnCount, columnWidth, skeletonItems],
+  )
+  const loadMoreSkeletonPlacements = useMemo(
+    () => buildAnnotationGallerySkeletonPlacements(loadMoreSkeletonItems, columnCount, columnWidth),
+    [columnCount, columnWidth, loadMoreSkeletonItems],
+  )
+  const galleryGridStyle = useMemo(
+    () => ({
+      gridAutoRows: `${ANNOTATED_GALLERY_GRID_ROW_HEIGHT}px`,
+      gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))`,
+    }),
+    [columnCount],
+  )
+
+  useEffect(() => {
+    setVisibleCount(ANNOTATED_GALLERY_INITIAL_BATCH_SIZE)
+    setLoadingMore(false)
+    setFocusedExampleId(null)
+    setImageAspectRatios({})
+  }, [task?.external_id, examples.length])
+
+  const rememberExampleAspectRatio = useCallback((exampleId: string, aspectRatio: number) => {
+    setImageAspectRatios((current) => {
+      if (current[exampleId] === aspectRatio) return current
+      return { ...current, [exampleId]: aspectRatio }
+    })
+  }, [])
+
+  useEffect(() => {
+    if (loading || loadingMore || !hasMoreExamples) return
+    const target = loadMoreRef.current
+    if (!target) return
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) setLoadingMore(true)
+      },
+      {
+        root: scrollRootRef.current,
+        rootMargin: "720px 0px",
+        threshold: 0,
+      },
+    )
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [hasMoreExamples, loading, loadingMore])
+
+  useEffect(() => {
+    if (!loadingMore) return
+    const timer = window.setTimeout(() => {
+      setVisibleCount((current) => Math.min(current + ANNOTATED_GALLERY_BATCH_SIZE, examples.length))
+      setLoadingMore(false)
+    }, ANNOTATED_GALLERY_LOAD_DELAY_MS)
+    return () => window.clearTimeout(timer)
+  }, [examples.length, loadingMore])
+
+  const updateFocusedExampleId = useCallback(
+    (next: string | null | ((current: string | null) => string | null)) => {
+      setFocusedExampleId(next)
+    },
+    [],
+  )
+
+  const focusExampleAt = useCallback(
+    (nextIndex: number) => {
+      const example = examples[nextIndex]
+      if (!example) return
+      setVisibleCount((current) => Math.max(current, Math.min(examples.length, nextIndex + 1)))
+      setFocusedExampleId(example.id)
+    },
+    [examples],
+  )
+
+  useEffect(() => {
+    if (!focusedExample) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault()
+        updateFocusedExampleId(null)
+      } else if (event.key === "ArrowLeft" && focusedExampleIndex > 0) {
+        event.preventDefault()
+        focusExampleAt(focusedExampleIndex - 1)
+      } else if (event.key === "ArrowRight" && focusedExampleIndex + 1 < examples.length) {
+        event.preventDefault()
+        focusExampleAt(focusedExampleIndex + 1)
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [examples.length, focusExampleAt, focusedExample, focusedExampleIndex, updateFocusedExampleId])
+
+  return (
+    <div ref={scrollRootRef} className="h-[calc(100dvh-3.5rem)] overflow-y-auto bg-background">
+      <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-5 py-6 lg:px-8">
+        <header className="flex flex-col gap-4 border-b border-border pb-5 sm:flex-row sm:items-end sm:justify-between">
+          <div className="flex min-w-0 flex-col gap-2">
+            <Button variant="ghost" size="sm" className="w-fit -translate-x-2" onClick={onBack}>
+              <ChevronLeft className="size-4" />
+              Voltar
+            </Button>
+            <div className="min-w-0">
+              <p className="text-xs font-medium uppercase text-muted-foreground">Lote em revisão</p>
+              <h1 className="truncate text-2xl font-semibold text-foreground">Imagens anotadas</h1>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {task?.name ?? "Lote sem nome"} · {annotatedText} · {totalText}
+              </p>
+            </div>
+          </div>
+          <Button onClick={onReview}>Ir para revisar</Button>
+        </header>
+
+        <div ref={galleryRef}>
+        {loading ? (
+          <div className="grid gap-4" style={galleryGridStyle}>
+            {skeletonPlacements.map((placement) => (
+              <div
+                key={placement.index}
+                className="w-full animate-pulse rounded-xl bg-muted"
+                style={annotationGalleryPlacementStyle(placement)}
+              />
+            ))}
+          </div>
+        ) : examples.length > 0 ? (
+          <>
+            <div className="grid gap-4" style={galleryGridStyle}>
+              {galleryPlacements.map((placement) => (
+                <AnnotatedTaskGalleryTile
+                  key={placement.example.id}
+                  placement={placement}
+                  isFocused={placement.example.id === focusedExampleId}
+                  onAspectRatio={rememberExampleAspectRatio}
+                  onSelect={() =>
+                    updateFocusedExampleId((current) =>
+                      current === placement.example.id ? null : placement.example.id,
+                    )
+                  }
+                />
+              ))}
+            </div>
+            {hasMoreExamples && (
+              <div ref={loadMoreRef} className="min-h-24 pt-1">
+                {loadingMore ? (
+                  <div className="grid gap-4" style={galleryGridStyle}>
+                    {loadMoreSkeletonPlacements.map((placement) => (
+                      <div
+                        key={placement.index}
+                        className="annotation-example-tile w-full animate-pulse rounded-xl bg-muted"
+                        style={{
+                          ...annotationGalleryPlacementStyle(placement),
+                          animationDelay: `${Math.min((placement.index - visibleCount) * 36, 180)}ms`,
+                        }}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="h-24" aria-hidden="true" />
+                )}
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="flex min-h-96 items-center justify-center">
+            <div className="flex max-w-md flex-col items-center gap-3 text-center">
+              <span className="flex size-12 items-center justify-center rounded-xl bg-surface-blue text-brand-blue">
+                <FolderKanban className="size-6" />
+              </span>
+              <div className="flex flex-col gap-1">
+                <p className="text-base font-medium text-foreground">Nenhuma imagem anotada encontrada</p>
+                <p className="text-sm text-muted-foreground">
+                  Este lote está bloqueado para anotação, mas não retornou registros anotados para montar a galeria.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AnnotatedTaskGalleryTile({
+  placement,
+  isFocused,
+  onAspectRatio,
+  onSelect,
+}: {
+  placement: AnnotatedGalleryPlacement
+  isFocused: boolean
+  onAspectRatio: (exampleId: string, aspectRatio: number) => void
+  onSelect: () => void
+}) {
+  const { example, index, imageHeight } = placement
+  const [imageLoaded, setImageLoaded] = useState(false)
+  const primaryLabel = example.labels[0]
+  const primaryColor = primaryLabel?.color ?? "var(--brand-blue)"
+  const showContent = imageLoaded || !example.previewUrl
+
+  useEffect(() => {
+    setImageLoaded(false)
+  }, [example.previewUrl])
+
+  const markLoaded = useCallback((event: React.SyntheticEvent<HTMLImageElement>) => {
+    const { naturalWidth, naturalHeight } = event.currentTarget
+    if (naturalWidth > 0 && naturalHeight > 0) onAspectRatio(example.id, naturalWidth / naturalHeight)
+    setImageLoaded(true)
+  }, [example.id, onAspectRatio])
+
+  return (
+    <article
+      className={cn(
+        "annotation-example-tile group block w-full self-start overflow-hidden rounded-xl border border-border bg-muted transition-[box-shadow,border-color,transform] duration-300 ease-out",
+        showContent && !isFocused && "bg-card shadow-sm hover:-translate-y-0.5 hover:shadow-md",
+        showContent && isFocused && "bg-card shadow-md",
+      )}
+      style={{
+        ...annotationGalleryPlacementStyle(placement),
+        borderTopColor: showContent ? primaryColor : undefined,
+        borderTopWidth: showContent ? 3 : undefined,
+        animationDelay: `${Math.min(index * 18, 220)}ms`,
+      }}
+    >
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-pressed={isFocused}
+        className={cn(
+          "block w-full cursor-zoom-in text-left focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+          isFocused && "cursor-zoom-out",
+        )}
+      >
+      <div
+        className="relative overflow-hidden bg-muted transition-[height] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]"
+        style={{ height: imageHeight }}
+      >
+        {example.previewUrl ? (
+          <>
+            {!imageLoaded && <div className="size-full animate-pulse bg-muted" />}
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={example.previewUrl}
+              alt={`${example.taskName} frame ${example.frame + 1}`}
+              decoding="async"
+              loading="eager"
+              onLoad={markLoaded}
+              onError={markLoaded}
+              className={cn(
+                "block size-full transition duration-300",
+                imageLoaded ? "opacity-100" : "opacity-0",
+                "object-contain",
+              )}
+            />
+            {imageLoaded && (
+              <div className="pointer-events-none absolute inset-0" aria-hidden="true">
+                {example.boxes.length > 0 ? (
+                  example.boxes.map((box) => (
+                    <span
+                      key={box.id}
+                      className="absolute rounded-[2px] border-2 shadow-[0_0_0_1px_rgba(0,0,0,0.45),0_0_10px_rgba(0,0,0,0.25)]"
+                      style={{
+                        borderColor: box.color,
+                        left: `${box.x * 100}%`,
+                        top: `${box.y * 100}%`,
+                        width: `${box.w * 100}%`,
+                        height: `${box.h * 100}%`,
+                      }}
+                    />
+                  ))
+                ) : (
+                  <span
+                    className="absolute inset-0 border-[3px] shadow-[inset_0_0_0_1px_rgba(0,0,0,0.28)]"
+                    style={{ borderColor: primaryColor }}
+                  />
+                )}
+              </div>
+            )}
+          </>
+        ) : (
+          <div className={cn("flex w-full items-center justify-center text-muted-foreground", annotationGalleryImageClass(index))}>
+            <FolderKanban className="size-5" />
+          </div>
+        )}
+      </div>
+
+      {showContent && (
+        <div className="flex flex-col gap-2 bg-card/95 px-3 py-2.5 text-xs">
+          <div className="flex items-center justify-between gap-3">
+            <span className="min-w-0 truncate font-medium text-foreground">{example.taskName}</span>
+            <span className="shrink-0 tabular-nums text-muted-foreground">Frame {example.frame + 1}</span>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+              {example.labels.slice(0, 3).map((label) => (
+                <span key={label.name} className="inline-flex max-w-32 items-center gap-1 truncate text-muted-foreground">
+                  <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: label.color }} />
+                  <span className="truncate">{label.name}</span>
+                  {label.count > 1 && <span className="shrink-0 tabular-nums">x{label.count}</span>}
+                </span>
+              ))}
+              {example.labels.length > 3 && (
+                <span className="shrink-0 text-muted-foreground">+{example.labels.length - 3}</span>
+              )}
+            </div>
+            <span className="shrink-0 tabular-nums text-muted-foreground">
+              {example.annotationCount} anot.
+            </span>
+          </div>
+        </div>
+      )}
+      </button>
+    </article>
+  )
+}
+
+function buildAnnotatedGalleryPlacements(
+  examples: AnnotatedGalleryExample[],
+  columnCount: number,
+  columnWidth: number,
+  imageAspectRatios: Record<string, number>,
+  focusedExampleId: string | null,
+) {
+  const normalColumns = buildAnnotatedGalleryNormalColumns(examples, columnCount, columnWidth, imageAspectRatios)
+  const columnRows = createAnnotatedGalleryColumnRows(columnCount)
+  const placements: AnnotatedGalleryPlacement[] = []
+
+  examples.forEach((example, index) => {
+    const isFocused = example.id === focusedExampleId
+    const normalColumn = normalColumns.get(example.id) ?? shortestAnnotatedGalleryColumnIndex(columnRows)
+    const columnSpan = isFocused ? annotationGalleryFocusedColumnSpan(normalColumn, columnCount) : 1
+    const column = isFocused ? annotationGalleryFocusedColumnStart(normalColumn, columnSpan, columnCount) : shortestAnnotatedGalleryColumnIndex(columnRows)
+    const rowStart = maxAnnotatedGalleryColumnRows(columnRows, column, columnSpan)
+    const imageHeight = annotationGalleryImageHeight({
+      index,
+      columnSpan,
+      columnWidth,
+      aspectRatio: imageAspectRatios[example.id],
+    })
+    const rowSpan = annotationGalleryRowSpan(imageHeight + ANNOTATED_GALLERY_FOOTER_HEIGHT)
+
+    placements.push({
+      example,
+      index,
+      column,
+      rowStart,
+      rowSpan,
+      columnSpan,
+      imageHeight,
+    })
+
+    for (let offset = 0; offset < columnSpan; offset += 1) {
+      columnRows[column + offset] = rowStart + rowSpan
+    }
+  })
+
+  return placements
+}
+
+function buildAnnotatedGalleryNormalColumns(
+  examples: AnnotatedGalleryExample[],
+  columnCount: number,
+  columnWidth: number,
+  imageAspectRatios: Record<string, number>,
+) {
+  const columns = new Map<string, number>()
+  const columnRows = createAnnotatedGalleryColumnRows(columnCount)
+
+  examples.forEach((example, index) => {
+    const column = shortestAnnotatedGalleryColumnIndex(columnRows)
+    const imageHeight = annotationGalleryImageHeight({
+      index,
+      columnSpan: 1,
+      columnWidth,
+      aspectRatio: imageAspectRatios[example.id],
+    })
+    const rowSpan = annotationGalleryRowSpan(imageHeight + ANNOTATED_GALLERY_FOOTER_HEIGHT)
+    columns.set(example.id, column)
+    columnRows[column] += rowSpan
+  })
+
+  return columns
+}
+
+function buildAnnotationGallerySkeletonPlacements(
+  indexes: number[],
+  columnCount: number,
+  columnWidth: number,
+) {
+  const columnRows = createAnnotatedGalleryColumnRows(columnCount)
+  const placements: AnnotatedGallerySkeletonPlacement[] = []
+
+  indexes.forEach((index) => {
+    const column = shortestAnnotatedGalleryColumnIndex(columnRows)
+    const imageHeight = annotationGalleryImageHeight({ index, columnSpan: 1, columnWidth })
+    const rowSpan = annotationGalleryRowSpan(imageHeight + ANNOTATED_GALLERY_FOOTER_HEIGHT)
+    placements.push({ index, column, rowStart: columnRows[column], rowSpan, columnSpan: 1, imageHeight })
+    columnRows[column] += rowSpan
+  })
+
+  return placements
+}
+
+function annotationGalleryPlacementStyle(
+  placement: Pick<AnnotatedGalleryPlacement, "column" | "rowStart" | "rowSpan" | "columnSpan">,
+) {
+  return {
+    gridColumn: `${placement.column + 1} / span ${placement.columnSpan}`,
+    gridRowStart: placement.rowStart + 1,
+    gridRowEnd: `span ${placement.rowSpan}`,
+  }
+}
+
+function createAnnotatedGalleryColumnRows(columnCount: number) {
+  return Array.from({ length: Math.max(1, columnCount) }, () => 0)
+}
+
+function shortestAnnotatedGalleryColumnIndex(columnRows: number[]) {
+  let columnIndex = 0
+  for (let index = 1; index < columnRows.length; index += 1) {
+    if (columnRows[index] < columnRows[columnIndex]) columnIndex = index
+  }
+  return columnIndex
+}
+
+function maxAnnotatedGalleryColumnRows(columnRows: number[], column: number, columnSpan: number) {
+  let row = columnRows[column] ?? 0
+  for (let offset = 1; offset < columnSpan; offset += 1) {
+    row = Math.max(row, columnRows[column + offset] ?? 0)
+  }
+  return row
+}
+
+function annotationGalleryFocusedColumnSpan(normalColumn: number, columnCount: number) {
+  if (columnCount <= 1) return 1
+  if (normalColumn + 1 >= columnCount && columnCount < 3) return 1
+  return 2
+}
+
+function annotationGalleryFocusedColumnStart(normalColumn: number, columnSpan: number, columnCount: number) {
+  return Math.min(normalColumn, Math.max(0, columnCount - columnSpan))
+}
+
+function annotationGalleryColumnWidth(galleryWidth: number, columnCount: number) {
+  if (galleryWidth <= 0) return 288
+  return (galleryWidth - ANNOTATED_GALLERY_GRID_GAP * Math.max(0, columnCount - 1)) / Math.max(1, columnCount)
+}
+
+function annotationGalleryImageHeight({
+  index,
+  columnSpan,
+  columnWidth,
+  aspectRatio,
+}: {
+  index: number
+  columnSpan: number
+  columnWidth: number
+  aspectRatio?: number
+}) {
+  const imageWidth = columnWidth * columnSpan + ANNOTATED_GALLERY_GRID_GAP * Math.max(0, columnSpan - 1)
+  if (aspectRatio && aspectRatio > 0 && Number.isFinite(aspectRatio)) {
+    return Math.max(120, Math.round(imageWidth / aspectRatio))
+  }
+  return annotationGalleryEstimatedHeight(index) * columnSpan
+}
+
+function annotationGalleryRowSpan(height: number) {
+  return Math.max(
+    1,
+    Math.ceil(
+      (height + ANNOTATED_GALLERY_GRID_GAP) /
+        (ANNOTATED_GALLERY_GRID_ROW_HEIGHT + ANNOTATED_GALLERY_GRID_GAP),
+    ),
+  )
+}
+
+function useResponsiveMasonryColumnCount() {
+  const [columnCount, setColumnCount] = useState(1)
+
+  useLayoutEffect(() => {
+    const updateColumnCount = () => {
+      const width = window.innerWidth
+      if (width >= 1536) {
+        setColumnCount(4)
+      } else if (width >= 1280) {
+        setColumnCount(3)
+      } else if (width >= 640) {
+        setColumnCount(2)
+      } else {
+        setColumnCount(1)
+      }
+    }
+
+    updateColumnCount()
+    window.addEventListener("resize", updateColumnCount)
+    return () => window.removeEventListener("resize", updateColumnCount)
+  }, [])
+
+  return columnCount
+}
+
+function useElementWidth(ref: React.RefObject<HTMLElement | null>) {
+  const [width, setWidth] = useState(0)
+
+  useLayoutEffect(() => {
+    const element = ref.current
+    if (!element) return
+
+    const updateWidth = () => setWidth(element.getBoundingClientRect().width)
+    updateWidth()
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateWidth)
+      return () => window.removeEventListener("resize", updateWidth)
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0]
+      if (entry) setWidth(entry.contentRect.width)
+    })
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [ref])
+
+  return width
+}
+
 function ClassActionDialog({
   target,
   value,
@@ -3130,11 +3806,150 @@ function classItemsFromAnnotationRecords(records: BackendAnnotationRecord[], exi
   return mergeClassItems(items)
 }
 
-function taskAnnotationImportTarget(task: BackendTask | null): "annotation" | "review" | null {
+function annotatedGalleryExamplesForTask(
+  records: BackendAnnotationRecord[],
+  task: BackendTask,
+  colorFor: (className: string) => string,
+) {
+  const byFrame = new Map<number, AnnotatedGalleryExample>()
+  const seenRecords = new Set<string>()
+
+  for (const record of records) {
+    if (!isEditableAnnotationRecord(record) || record.frame == null) continue
+    if (record.task_external_id && record.task_external_id !== task.external_id) continue
+    const label = record.label_name ?? stringFromRecord(record.raw, "label_name")
+    if (!label) continue
+
+    const color = annotationRecordColor(record) ?? colorFor(label)
+    const box = annotationGalleryBoxFromRecord(record, label, color)
+    const identity = annotationGalleryRecordIdentity(record, label, box)
+    if (seenRecords.has(identity)) continue
+    seenRecords.add(identity)
+
+    const frame = record.frame
+    const current =
+      byFrame.get(frame) ??
+      ({
+        id: `${task.external_id}:${frame}`,
+        taskName: task.name || `Task ${task.external_id}`,
+        frame,
+        previewUrl: taskFrameAssetUrl(task.external_id, frame, { variant: "original" }),
+        labels: [],
+        boxes: [],
+        annotationCount: 0,
+        updatedAt: record.updated_at,
+      } satisfies AnnotatedGalleryExample)
+
+    const existingLabel = current.labels.find((item) => item.name.toLowerCase() === label.toLowerCase())
+    if (existingLabel) {
+      existingLabel.count += 1
+    } else {
+      current.labels.push({ name: label, color, count: 1 })
+    }
+    if (box) current.boxes.push(box)
+    current.annotationCount += 1
+    if (record.updated_at > current.updatedAt) current.updatedAt = record.updated_at
+    byFrame.set(frame, current)
+  }
+
+  return [...byFrame.values()]
+    .map((example) => ({
+      ...example,
+      labels: [...example.labels].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "pt-BR")),
+    }))
+    .sort((a, b) => a.frame - b.frame || b.updatedAt.localeCompare(a.updatedAt))
+}
+
+function annotationRecordColor(record: BackendAnnotationRecord) {
+  return (
+    stringFromRecord(record.raw, "label_color") ??
+    stringFromRecord(record.raw, "color") ??
+    stringFromRecord(record.raw, "labelColor")
+  )
+}
+
+function annotationGalleryBoxFromRecord(
+  record: BackendAnnotationRecord,
+  label: string,
+  color: string,
+): AnnotatedGalleryBox | null {
+  if (record.annotation_type === "tag") return null
+  const rawBox = normalizedBoxFromRecord(record.raw.bbox_norm)
+  const pointsNorm = numberArrayFromUnknown(record.raw.points_norm)
+  const points = numberArrayFromUnknown(record.points)
+  const pointsNormBox = bboxFromNormalizedPoints(pointsNorm)
+  const normalizedPointsBox = points.every(isNormalizedCoordinate)
+    ? bboxFromNormalizedPoints(points)
+    : null
+  const box = rawBox ?? pointsNormBox ?? normalizedPointsBox
+  if (!box || box.w <= 0 || box.h <= 0) return null
+  return {
+    id: record.external_id,
+    label,
+    color,
+    ...box,
+  }
+}
+
+function annotationGalleryRecordIdentity(
+  record: BackendAnnotationRecord,
+  label: string,
+  box: AnnotatedGalleryBox | null,
+) {
+  const shapeType = record.shape_type ?? stringFromRecord(record.raw, "type") ?? record.annotation_type
+  const taskId = record.task_external_id ?? "task"
+  const frame = record.frame ?? "frame"
+  if (box) {
+    return [
+      taskId,
+      frame,
+      label.toLowerCase(),
+      shapeType,
+      roundGalleryCoordinate(box.x),
+      roundGalleryCoordinate(box.y),
+      roundGalleryCoordinate(box.w),
+      roundGalleryCoordinate(box.h),
+    ].join(":")
+  }
+  const pointsNorm = numberArrayFromUnknown(record.raw.points_norm)
+  const points = pointsNorm.length > 0 ? pointsNorm : numberArrayFromUnknown(record.points)
+  return [
+    taskId,
+    frame,
+    label.toLowerCase(),
+    shapeType,
+    points.map(roundGalleryCoordinate).join(","),
+  ].join(":")
+}
+
+function roundGalleryCoordinate(value: number) {
+  return Number.isFinite(value) ? Math.round(value * 10000) / 10000 : 0
+}
+
+const annotationGalleryImageSizes = [
+  { className: "h-44", height: 176 },
+  { className: "h-64", height: 256 },
+  { className: "h-52", height: 208 },
+  { className: "h-72", height: 288 },
+  { className: "h-56", height: 224 },
+  { className: "h-80", height: 320 },
+  { className: "h-48", height: 192 },
+  { className: "h-60", height: 240 },
+]
+
+function annotationGalleryImageClass(index: number) {
+  return annotationGalleryImageSizes[index % annotationGalleryImageSizes.length].className
+}
+
+function annotationGalleryEstimatedHeight(index: number) {
+  return annotationGalleryImageSizes[index % annotationGalleryImageSizes.length].height
+}
+
+function taskAnnotationImportTarget(task: BackendTask | null): "annotation" | "review" | "ready" | null {
   const datasetImport = task?.raw?.dataset_import
   if (!datasetImport || typeof datasetImport !== "object" || Array.isArray(datasetImport)) return null
   const target = (datasetImport as Record<string, unknown>).annotation_import_target
-  return target === "annotation" || target === "review" ? target : null
+  return target === "annotation" || target === "review" || target === "ready" ? target : null
 }
 
 function frameDimensionsFromMeta(meta: BackendTaskDataMeta | null, frame: number): FrameDimensions | null {

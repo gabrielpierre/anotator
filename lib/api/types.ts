@@ -84,6 +84,11 @@ export type BackendDirectoryListing = {
   entries: BackendDirectoryEntry[]
 }
 
+export type BackendDirectoryCreate = {
+  parent_path?: string | null
+  name: string
+}
+
 export type BackendTask = {
   id: string
   external_id: string
@@ -632,7 +637,8 @@ export type BackendImportTaskCreate = {
   assignee_user_id?: string | null
   labels?: Record<string, unknown>[]
   class_mappings?: Record<string, unknown>[]
-  annotation_import_target?: "annotation" | "review"
+  annotation_import_target?: "annotation" | "review" | "ready"
+  duplicate_policy?: "review" | "ignore" | "include"
   source_path?: string | null
   estimated_bytes?: number | null
   sync_after_import?: boolean

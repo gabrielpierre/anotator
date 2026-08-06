@@ -1,10 +1,10 @@
 "use client"
 
 import * as React from "react"
-import { X, FolderOpen, Check, Users, ChevronRight } from "lucide-react"
+import { X, FolderOpen, Check, Users, ChevronRight, FolderPlus } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Avatar } from "@/components/snowui/avatar"
-import { apiBaseUrl, createProject, fetchDirectories, updateProject } from "@/lib/api/client"
+import { apiBaseUrl, createDirectory, createProject, fetchDirectories, updateProject } from "@/lib/api/client"
 import { useCurrentUser } from "@/lib/auth/user-context"
 import type { BackendDirectoryListing, BackendProject } from "@/lib/api/types"
 
@@ -45,6 +45,9 @@ export function ProjectDialog({
   const [directoryListing, setDirectoryListing] = React.useState<BackendDirectoryListing | null>(null)
   const [directoryLoading, setDirectoryLoading] = React.useState(false)
   const [directoryError, setDirectoryError] = React.useState<string | null>(null)
+  const [newDirectoryName, setNewDirectoryName] = React.useState("")
+  const [newDirectoryOpen, setNewDirectoryOpen] = React.useState(false)
+  const [creatingDirectory, setCreatingDirectory] = React.useState(false)
 
   // Sincroniza os campos ao abrir (ou ao trocar o projeto em edição).
   React.useEffect(() => {
@@ -90,6 +93,8 @@ export function ProjectDialog({
     try {
       const listing = await fetchDirectories(path)
       setDirectoryListing(listing)
+      setNewDirectoryOpen(false)
+      setNewDirectoryName("")
     } catch (err) {
       if (opts.fallbackToHome) {
         try {
@@ -116,12 +121,43 @@ export function ProjectDialog({
     await loadDirectories(startPath, { fallbackToHome: Boolean(startPath) })
   }
 
+  async function handleCreateDirectory(event: React.FormEvent) {
+    event.preventDefault()
+    if (!directoryListing) return
+    const folderName = newDirectoryName.trim()
+    if (!folderName) {
+      setDirectoryError("Informe um nome para a nova pasta.")
+      return
+    }
+    if (/[\\/]/.test(folderName) || folderName === "." || folderName === "..") {
+      setDirectoryError("Use apenas o nome da pasta, sem barras.")
+      return
+    }
+    setCreatingDirectory(true)
+    setDirectoryError(null)
+    try {
+      const listing = await createDirectory({ parent_path: directoryListing.path, name: folderName })
+      setDirectoryListing(listing)
+      setStoragePath(listing.path)
+      setNewDirectoryName("")
+      setNewDirectoryOpen(false)
+    } catch (err) {
+      setDirectoryError(directoryPickerErrorMessage(err))
+    } finally {
+      setCreatingDirectory(false)
+    }
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault()
     const resolvedQuota = Number(customQuota || quotaGb)
     const resolvedPath = normalizeStoragePath(storagePath)
-    if (!name.trim() || !Number.isFinite(resolvedQuota) || resolvedQuota <= 0) {
-      setError("Preencha o nome e um limite de storage válido.")
+    if (!name.trim()) {
+      setError("Informe o nome do projeto.")
+      return
+    }
+    if (!Number.isFinite(resolvedQuota) || resolvedQuota <= 0) {
+      setError("Informe um limite de storage válido.")
       return
     }
     if (!resolvedPath) {
@@ -366,6 +402,18 @@ export function ProjectDialog({
               </Button>
               <Button
                 type="button"
+                variant="outline"
+                disabled={!directoryListing || directoryLoading}
+                onClick={() => {
+                  setNewDirectoryOpen((current) => !current)
+                  setDirectoryError(null)
+                }}
+              >
+                <FolderPlus className="size-4" />
+                Nova pasta
+              </Button>
+              <Button
+                type="button"
                 className="ml-auto"
                 disabled={!directoryListing || directoryLoading}
                 onClick={() => {
@@ -382,6 +430,32 @@ export function ProjectDialog({
             </div>
 
             <div className="max-h-80 overflow-y-auto p-3">
+              {newDirectoryOpen && (
+                <form onSubmit={handleCreateDirectory} className="mb-3 flex flex-wrap items-center gap-2 rounded-lg bg-muted p-2">
+                  <input
+                    value={newDirectoryName}
+                    onChange={(event) => setNewDirectoryName(event.target.value)}
+                    autoFocus
+                    placeholder="Nome da pasta"
+                    className="h-9 min-w-0 flex-1 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue"
+                  />
+                  <Button type="submit" size="sm" disabled={creatingDirectory}>
+                    {creatingDirectory ? "Criando..." : "Criar"}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={creatingDirectory}
+                    onClick={() => {
+                      setNewDirectoryOpen(false)
+                      setNewDirectoryName("")
+                    }}
+                  >
+                    Cancelar
+                  </Button>
+                </form>
+              )}
               {directoryLoading && <p className="px-2 py-6 text-center text-sm text-muted-foreground">Carregando pastas...</p>}
               {directoryError && <p className="mb-2 rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{directoryError}</p>}
               {!directoryLoading && directoryListing?.entries.length === 0 && (

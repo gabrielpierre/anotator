@@ -267,6 +267,8 @@ if user:
 require_command docker
 require_command ss
 
+export ANOTATOR_HOST_HOME="${ANOTATOR_HOST_HOME:-$HOME}"
+
 if ! docker info >/dev/null 2>&1; then
   echo "Docker nao esta respondendo. Abra/inicie o Docker e rode ./start.sh novamente." >&2
   exit 1

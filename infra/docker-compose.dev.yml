@@ -66,12 +66,14 @@ services:
       S3_SECRET_ACCESS_KEY: minioadmin
       CORS_ORIGINS: http://localhost:3000
       AUTO_CREATE_TABLES: "false"
+      SYSTEM_DIRECTORY_HOME: ${ANOTATOR_HOST_HOME:-/home}
       ANOTATOR_DOCKER_GPU_ENABLED: ${ANOTATOR_DOCKER_GPU_ENABLED:-false}
       HOST_NVIDIA_GPUS: ${HOST_NVIDIA_GPUS:-}
     ports:
       - "${BACKEND_PORT:-8020}:8000"
     volumes:
       - ../backend:/app/backend
+      - "${ANOTATOR_HOST_HOME:-/home}:${ANOTATOR_HOST_HOME:-/home}"
     shm_size: ${TRAINING_SHM_SIZE:-2gb}
     healthcheck:
       test:
@@ -136,6 +138,7 @@ services:
       HOST_NVIDIA_GPUS: ${HOST_NVIDIA_GPUS:-}
     volumes:
       - ../backend:/app/backend
+      - "${ANOTATOR_HOST_HOME:-/home}:${ANOTATOR_HOST_HOME:-/home}"
       - worker_artifacts:/artifacts
     depends_on:
       backend:
@@ -187,6 +190,7 @@ services:
       HOST_NVIDIA_GPUS: ${HOST_NVIDIA_GPUS:-}
     volumes:
       - ../backend:/app/backend
+      - "${ANOTATOR_HOST_HOME:-/home}:${ANOTATOR_HOST_HOME:-/home}"
       - worker_artifacts:/artifacts
     shm_size: ${TRAINING_SHM_SIZE:-2gb}
     depends_on:

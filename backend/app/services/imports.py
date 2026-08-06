@@ -25,6 +25,7 @@ from app.models import (
 from app.schemas import ImportTaskCreate
 from app.services.annotations import (
     FRAME_ANNOTATION_PENDING,
+    FRAME_APPROVED,
     FRAME_REVIEW_PENDING,
     sync_job_annotations,
     upsert_frame_workflow_state,
@@ -40,6 +41,15 @@ ANNOTATION_EXTENSIONS = {".txt", ".json", ".xml", ".yaml", ".yml", ".names"}
 CLASS_FILE_NAMES = {"classes.txt", "obj.names", "data.yaml", "dataset.yaml"}
 DATASET_IMPORT_EXTENSIONS = IMAGE_EXTENSIONS | ANNOTATION_EXTENSIONS
 ACTIVE_IMPORT_STATUSES = {"queued", "running", "paused"}
+CLASSIFICATION_SPLIT_FOLDERS = {
+    "train",
+    "training",
+    "val",
+    "valid",
+    "validation",
+    "test",
+    "testing",
+}
 
 COCO80_CLASS_NAMES = [
     "person",
@@ -183,6 +193,10 @@ def run_import_task_job(
     if not files and payload.source_path:
         files = _files_from_source_path(Path(payload.source_path))
     media_files = _image_files(files)
+    media_files, duplicate_review = dedupe_classification_folder_upload_files(
+        media_files,
+        duplicate_policy=payload.duplicate_policy,
+    )
     if not media_files:
         raise RuntimeError("Dataset import requires at least one image file")
     import_manifest = build_import_file_manifest(media_files)
@@ -192,9 +206,11 @@ def run_import_task_job(
         import_manifest,
         artifact_store=artifact_store,
         current_job_id=job.id,
+        allow_incoming_duplicates=payload.duplicate_policy == "include",
     )
     max_upload_bytes = _cvat_import_max_upload_bytes(settings)
-    media_batches = _media_file_batches(media_files, max_upload_bytes)
+    max_upload_files = _cvat_import_max_upload_files(settings)
+    media_batches = _media_file_batches(media_files, max_upload_bytes, max_upload_files)
     total_batches = len(media_batches)
     total_bytes = _files_size(media_files)
     batching_payload = {
@@ -202,6 +218,7 @@ def run_import_task_job(
         "total_images": len(media_files),
         "total_bytes": total_bytes,
         "max_upload_bytes": max_upload_bytes,
+        "max_upload_files": max_upload_files,
     }
     if total_batches > 1:
         update_job_progress(
@@ -277,7 +294,11 @@ def run_import_task_job(
             detail=f"Task CVAT {index}/{total_batches} criada ({len(batch_files)} imagens).",
         )
 
-        upload_result = client.upload_task_data(task_id, files=batch_files)
+        try:
+            upload_result = client.upload_task_data(task_id, files=batch_files)
+        except Exception:
+            _cleanup_partial_import_task(db, client, task_id_str)
+            raise
         batch_payload["upload_result"] = upload_result
         _persist_import_task_progress(
             db,
@@ -360,6 +381,7 @@ def run_import_task_job(
         "assignees": assignees,
         "import_batching": batching_payload,
         "import_manifest": {"files": import_manifest, "batches": import_batches},
+        "upload_duplicate_review": duplicate_review,
         "dataset_import": dataset_import,
         "dataset_imports": annotation_imports,
         "upload_result": import_batches[0].get("upload_result") if import_batches else None,
@@ -428,9 +450,10 @@ def _image_files(files: list[tuple[str, bytes, str]]) -> list[tuple[str, bytes, 
 def _media_file_batches(
     media_files: list[tuple[str, bytes, str]],
     max_upload_bytes: int,
+    max_upload_files: int,
 ) -> list[list[tuple[str, bytes, str]]]:
     ordered_files = sorted(media_files, key=lambda item: _safe_relative_path(item[0]).casefold())
-    if max_upload_bytes <= 0:
+    if max_upload_bytes <= 0 and max_upload_files <= 0:
         return [ordered_files]
 
     batches: list[list[tuple[str, bytes, str]]] = []
@@ -444,7 +467,9 @@ def _media_file_batches(
                 f"Arquivo {filename} tem {_format_bytes(file_size)} e excede o limite seguro "
                 f"por task CVAT ({_format_bytes(max_upload_bytes)})."
             )
-        if current and current_size + file_size > max_upload_bytes:
+        exceeds_bytes = max_upload_bytes > 0 and current_size + file_size > max_upload_bytes
+        exceeds_files = max_upload_files > 0 and len(current) >= max_upload_files
+        if current and (exceeds_bytes or exceeds_files):
             batches.append(current)
             current = []
             current_size = 0
@@ -459,6 +484,11 @@ def _media_file_batches(
 def _cvat_import_max_upload_bytes(settings: Settings) -> int:
     value = _int_value(getattr(settings, "import_cvat_max_upload_bytes", None))
     return value if value is not None else 805_306_368
+
+
+def _cvat_import_max_upload_files(settings: Settings) -> int:
+    value = _int_value(getattr(settings, "import_cvat_max_upload_files", None))
+    return value if value is not None else 500
 
 
 def _files_size(files: list[tuple[str, bytes, str]]) -> int:
@@ -532,6 +562,22 @@ def _persist_import_task_progress(
     db.refresh(live_job)
 
 
+def _cleanup_partial_import_task(db: Session, client: CvatClient, task_external_id: str) -> None:
+    try:
+        client.delete_task(task_external_id)
+    except Exception:
+        pass
+
+    task = db.scalar(select(Task).where(Task.external_id == task_external_id))
+    if task is None:
+        return
+    from app.services.tasks import delete_local_task_records
+
+    delete_local_task_records(db, task_external_id)
+    db.delete(task)
+    db.commit()
+
+
 def _summarize_annotation_imports(annotation_imports: list[dict[str, Any]]) -> dict[str, Any]:
     if not annotation_imports:
         return {"format": None, "imported": 0, "skipped": 0, "cvat_synced": False, "tasks": []}
@@ -562,12 +608,108 @@ def build_import_file_manifest(files: list[tuple[str, bytes, str]]) -> list[dict
                 "relative_path": relative_path,
                 "normalized_filename": _normalized_filename(safe_filename),
                 "normalized_relative_path": relative_path.casefold(),
+                "source_class": _classification_folder_class_name(relative_path),
                 "sha256": hashlib.sha256(content).hexdigest(),
                 "size_bytes": len(content),
                 "content_type": content_type or "application/octet-stream",
             }
         )
     return manifest
+
+
+def dedupe_classification_folder_upload_files(
+    files: list[tuple[str, bytes, str]],
+    *,
+    duplicate_policy: str = "review",
+) -> tuple[list[tuple[str, bytes, str]], dict[str, Any]]:
+    image_items: list[dict[str, Any]] = []
+    for index, (filename, content, content_type) in enumerate(files):
+        if not is_import_image_file(filename, content_type):
+            continue
+        source_class = _classification_folder_class_name(filename)
+        if not source_class:
+            continue
+        relative_path = _safe_relative_path(filename)
+        image_items.append(
+            {
+                "index": index,
+                "filename": _safe_filename(filename),
+                "relative_path": relative_path,
+                "normalized_filename": _normalized_filename(filename),
+                "normalized_relative_path": relative_path.casefold(),
+                "source_class": source_class,
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "size_bytes": len(content),
+                "content_type": content_type or "application/octet-stream",
+            }
+        )
+
+    classes = {str(item["source_class"]).casefold() for item in image_items}
+    if len(classes) < 2:
+        return files, {"format": None, "skipped_duplicate_count": 0, "skipped_duplicates": []}
+    if duplicate_policy == "include":
+        return files, {
+            "format": "classification-folder",
+            "duplicate_policy": "include",
+            "skipped_duplicate_count": 0,
+            "skipped_duplicates": [],
+        }
+
+    by_hash: dict[str, list[dict[str, Any]]] = {}
+    for item in image_items:
+        by_hash.setdefault(str(item["sha256"]), []).append(item)
+
+    skipped_indices: set[int] = set()
+    skipped_duplicates: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    for group in by_hash.values():
+        if len(group) < 2:
+            continue
+        ordered = sorted(group, key=lambda item: str(item["relative_path"]).casefold())
+        group_classes = {str(item["source_class"]).casefold() for item in ordered}
+        first = ordered[0]
+        if len(group_classes) > 1:
+            for item in ordered[1:]:
+                conflict = _conflict_payload(item, first, reason="classe", scope="upload")
+                if duplicate_policy == "ignore":
+                    skipped_indices.add(int(item["index"]))
+                    skipped_duplicates.append(conflict)
+                else:
+                    conflicts.append(conflict)
+            continue
+        for item in ordered[1:]:
+            skipped_indices.add(int(item["index"]))
+            skipped_duplicates.append(
+                {
+                    "filename": item.get("filename"),
+                    "relative_path": item.get("relative_path"),
+                    "source_class": item.get("source_class"),
+                    "existing_filename": first.get("filename"),
+                    "existing_relative_path": first.get("relative_path"),
+                    "existing_source_class": first.get("source_class"),
+                    "reason": "conteudo",
+                    "scope": "upload",
+                }
+            )
+
+    if conflicts:
+        raise DuplicateImportImagesError(conflicts)
+
+    if not skipped_indices:
+        return files, {
+            "format": "classification-folder",
+            "duplicate_policy": duplicate_policy,
+            "skipped_duplicate_count": 0,
+            "skipped_duplicates": [],
+        }
+
+    filtered = [file for index, file in enumerate(files) if index not in skipped_indices]
+    return filtered, {
+        "format": "classification-folder",
+        "duplicate_policy": duplicate_policy,
+        "skipped_duplicate_count": len(skipped_indices),
+        "skipped_duplicates": skipped_duplicates[:50],
+    }
 
 
 def validate_import_file_manifest_unique(
@@ -577,21 +719,24 @@ def validate_import_file_manifest_unique(
     *,
     artifact_store: ArtifactStore | None = None,
     current_job_id: str | None = None,
+    allow_incoming_duplicates: bool = False,
 ) -> None:
     if not manifest:
         return
     project = _resolve_project(db, payload.project_id)
-    conflicts = [
-        *_incoming_manifest_conflicts(manifest),
-        *_existing_manifest_conflicts(
+    conflicts = []
+    if not allow_incoming_duplicates:
+        conflicts.extend(_incoming_manifest_conflicts(manifest))
+    conflicts.extend(
+        _existing_manifest_conflicts(
             db,
             payload,
             manifest,
             project=project,
             artifact_store=artifact_store,
             current_job_id=current_job_id,
-        ),
-    ]
+        )
+    )
     if conflicts:
         raise DuplicateImportImagesError(conflicts)
 
@@ -711,10 +856,13 @@ def _materialize_dataset_annotations(
 ) -> dict[str, Any]:
     yolo_files = _yolo_annotation_files(files)
     coco_files = [] if yolo_files else _coco_annotation_files(files)
+    classification_items = [] if yolo_files or coco_files else _classification_folder_items(media_files)
     if yolo_files:
         format_name = "yolo"
     elif coco_files:
         format_name = "coco"
+    elif classification_items:
+        format_name = "classification-folder"
     else:
         return {"format": None, "imported": 0, "skipped": 0, "cvat_synced": False}
 
@@ -729,11 +877,12 @@ def _materialize_dataset_annotations(
         }
 
     class_names = _dataset_class_names(files)
-    parsed_items = (
-        _parsed_yolo_items(yolo_files, class_names)
-        if yolo_files
-        else _parsed_coco_items(coco_files)
-    )
+    if yolo_files:
+        parsed_items = _parsed_yolo_items(yolo_files, class_names)
+    elif coco_files:
+        parsed_items = _parsed_coco_items(coco_files)
+    else:
+        parsed_items = classification_items
     if not parsed_items:
         return {"format": format_name, "imported": 0, "skipped": 0, "cvat_synced": False}
 
@@ -745,12 +894,13 @@ def _materialize_dataset_annotations(
     label_lookup = _label_lookup(db, task)
     cvat_job = _cvat_job_for_task(db, task_external_id)
     cvat_job_id = _external_cvat_job_id(cvat_job)
+    cvat_tags: list[dict[str, Any]] = []
     cvat_shapes: list[dict[str, Any]] = []
     local_records: list[dict[str, Any]] = []
     skipped = 0
 
     for item in parsed_items:
-        frame_info = frame_index.get(item["image_stem"])
+        frame_info = _dataset_frame_info(frame_index, item)
         if frame_info is None:
             skipped += 1
             continue
@@ -758,19 +908,7 @@ def _materialize_dataset_annotations(
         label_name, label_color = _target_label(item["source_name"], class_mapping)
         label = label_lookup.get(label_name.casefold())
         label_id = _label_raw_id(label)
-        width = (
-            _float_value(frame_info.get("width")) or _float_value(item.get("image_width")) or 1.0
-        )
-        height = (
-            _float_value(frame_info.get("height")) or _float_value(item.get("image_height")) or 1.0
-        )
-        shape = _shape_from_dataset_item(item, width, height)
-        if shape is None:
-            skipped += 1
-            continue
-
         record_payload = {
-            **shape,
             "frame": int(frame_info["frame"]),
             "label_id": label_id,
             "label_name": label_name,
@@ -778,28 +916,56 @@ def _materialize_dataset_annotations(
             "source_name": item["source_name"],
             "source_class_id": item["class_id"],
             "source_file": item["filename"],
+            "source_format": item.get("format") or format_name,
+            "annotation_type": "shape",
         }
+
+        if item.get("format") == "classification-folder":
+            record_payload["annotation_type"] = "tag"
+        else:
+            width = (
+                _float_value(frame_info.get("width")) or _float_value(item.get("image_width")) or 1.0
+            )
+            height = (
+                _float_value(frame_info.get("height")) or _float_value(item.get("image_height")) or 1.0
+            )
+            shape = _shape_from_dataset_item(item, width, height)
+            if shape is None:
+                skipped += 1
+                continue
+            record_payload.update(shape)
+
         local_records.append(record_payload)
         if cvat_job_id and label_id is not None:
-            cvat_shapes.append(
-                {
-                    "type": "rectangle",
-                    "frame": record_payload["frame"],
-                    "label_id": label_id,
-                    "points": record_payload["points"],
-                    "source": "manual",
-                    "attributes": [],
-                }
-            )
+            if record_payload["annotation_type"] == "tag":
+                cvat_tags.append(
+                    {
+                        "frame": record_payload["frame"],
+                        "label_id": label_id,
+                        "source": "manual",
+                        "attributes": [],
+                    }
+                )
+            else:
+                cvat_shapes.append(
+                    {
+                        "type": "rectangle",
+                        "frame": record_payload["frame"],
+                        "label_id": label_id,
+                        "points": record_payload["points"],
+                        "source": "manual",
+                        "attributes": [],
+                    }
+                )
 
     if not local_records:
         return {"format": format_name, "imported": 0, "skipped": skipped, "cvat_synced": False}
 
     cvat_error: str | None = None
     cvat_synced = False
-    if cvat_job_id and len(cvat_shapes) == len(local_records):
+    if cvat_job_id and len(cvat_shapes) + len(cvat_tags) == len(local_records):
         try:
-            body: dict[str, Any] = {"tags": [], "shapes": cvat_shapes, "tracks": []}
+            body: dict[str, Any] = {"tags": cvat_tags, "shapes": cvat_shapes, "tracks": []}
             version = _cvat_annotation_version(client, cvat_job_id)
             if version is not None:
                 body["version"] = version
@@ -810,47 +976,70 @@ def _materialize_dataset_annotations(
         except Exception as exc:
             cvat_error = str(exc)
 
+    target = payload.annotation_import_target
+    review_state = "accepted" if target == "ready" else "pending"
+    release_ready = target == "ready"
+
     for index, record_payload in enumerate(local_records):
         external_id = _dataset_annotation_external_id(task_external_id, record_payload, index)
         row = db.scalar(select(AnnotationRecord).where(AnnotationRecord.external_id == external_id))
+        annotation_type = str(record_payload.get("annotation_type") or "shape")
         if row is None:
             row = AnnotationRecord(
                 external_id=external_id,
                 cvat_job_id=cvat_job_id or f"local:{task_external_id}",
-                annotation_type="shape",
+                annotation_type=annotation_type,
                 cvat_annotation_id=external_id.rsplit(":", 1)[-1],
             )
+        is_tag = annotation_type == "tag"
         raw = {
             "id": row.cvat_annotation_id,
-            "type": "rectangle",
             "frame": record_payload["frame"],
             "label_id": record_payload["label_id"],
             "label_name": record_payload["label_name"],
             "label_color": record_payload["label_color"],
             "source": "dataset_import",
-            "points": record_payload["points"],
             "attributes": [],
-            "bbox_norm": record_payload["bbox_norm"],
-            "points_norm": record_payload["points_norm"],
-            "coordinate_space": "image-normalized",
             "origin": "dataset_import",
             "source_name": record_payload["source_name"],
             "source_class_id": record_payload["source_class_id"],
             "source_file": record_payload["source_file"],
+            "source_format": record_payload["source_format"],
             "cvat_synced": cvat_synced,
             "cvat_error": cvat_error,
+            "annotation_import_target": target,
         }
+        if release_ready:
+            raw.update(
+                {
+                    "review_status": "accepted",
+                    "release_ready": True,
+                    "accepted_by": "dataset import",
+                }
+            )
+        if is_tag:
+            raw["annotation_kind"] = "classification"
+        else:
+            raw.update(
+                {
+                    "type": "rectangle",
+                    "points": record_payload["points"],
+                    "bbox_norm": record_payload["bbox_norm"],
+                    "points_norm": record_payload["points_norm"],
+                    "coordinate_space": "image-normalized",
+                }
+            )
         row.cvat_job_id = cvat_job_id or f"local:{task_external_id}"
         row.task_external_id = task_external_id
-        row.annotation_type = "shape"
+        row.annotation_type = annotation_type
         row.frame = record_payload["frame"]
         row.label_id = record_payload["label_id"]
         row.label_name = record_payload["label_name"]
-        row.shape_type = "rectangle"
+        row.shape_type = None if is_tag else "rectangle"
         row.source = "dataset_import"
         row.confidence = 1.0
-        row.points = record_payload["points"]
-        row.review_state = "pending"
+        row.points = [] if is_tag else record_payload["points"]
+        row.review_state = review_state
         row.raw = raw
         db.add(row)
 
@@ -880,7 +1069,12 @@ def _upsert_dataset_import_frame_states(
         frame_counts[frame] = frame_counts.get(frame, 0) + 1
 
     target = payload.annotation_import_target
-    status = FRAME_ANNOTATION_PENDING if target == "annotation" else FRAME_REVIEW_PENDING
+    if target == "annotation":
+        status = FRAME_ANNOTATION_PENDING
+    elif target == "ready":
+        status = FRAME_APPROVED
+    else:
+        status = FRAME_REVIEW_PENDING
     for frame, count in frame_counts.items():
         upsert_frame_workflow_state(
             db,
@@ -1007,6 +1201,63 @@ def _parsed_coco_items(coco_files: list[tuple[str, dict[str, Any]]]) -> list[dic
                 }
             )
     return items
+
+
+def _classification_folder_items(
+    media_files: list[tuple[str, bytes, str]]
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    class_counts: dict[str, int] = {}
+    for filename, _content, content_type in media_files:
+        if not is_import_image_file(filename, content_type):
+            continue
+        source_name = _classification_folder_class_name(filename)
+        if not source_name:
+            continue
+        relative_path = _safe_relative_path(filename)
+        class_counts[source_name.casefold()] = class_counts.get(source_name.casefold(), 0) + 1
+        items.append(
+            {
+                "format": "classification-folder",
+                "filename": relative_path,
+                "image_filename": relative_path,
+                "image_key": relative_path.casefold(),
+                "image_stem": Path(_safe_filename(relative_path)).stem.casefold(),
+                "source_name": source_name,
+                "class_id": source_name,
+                "row_index": class_counts[source_name.casefold()] - 1,
+            }
+        )
+    return items
+
+
+def _classification_folder_class_name(filename: str) -> str | None:
+    parts = [part for part in _safe_relative_path(filename).split("/") if part]
+    dirs = parts[:-1]
+    if not dirs:
+        return None
+
+    split_index = next(
+        (
+            index
+            for index, part in enumerate(dirs)
+            if part.casefold() in CLASSIFICATION_SPLIT_FOLDERS
+        ),
+        -1,
+    )
+    if split_index >= 0:
+        if split_index + 1 >= len(dirs):
+            return None
+        return _clean_dataset_label_name(dirs[split_index + 1])
+
+    if len(dirs) < 2:
+        return None
+    return _clean_dataset_label_name(dirs[-1])
+
+
+def _clean_dataset_label_name(value: str) -> str | None:
+    name = value.strip().strip("'\"")
+    return name or None
 
 
 def _coco_categories_by_id(categories: Any) -> dict[int, str]:
@@ -1300,27 +1551,58 @@ def _dataset_frame_index(
         )
         if not filename:
             continue
-        stem = Path(_safe_filename(str(filename))).stem.casefold()
+        relative_path = _safe_relative_path(str(filename))
+        stem = Path(_safe_filename(relative_path)).stem.casefold()
         dimensions = dimensions_by_stem.get(stem, {})
-        indexed[stem] = {
+        frame_info = {
             "frame": frame_index,
             "width": _float_value(frame.get("width")) or dimensions.get("width"),
             "height": _float_value(frame.get("height")) or dimensions.get("height"),
         }
+        indexed[relative_path.casefold()] = frame_info
+        indexed[_safe_filename(relative_path).casefold()] = frame_info
+        indexed.setdefault(stem, frame_info)
     if indexed:
         return indexed
 
     for frame_index, (filename, _content, _content_type) in enumerate(
         sorted(media_files, key=lambda item: _safe_relative_path(item[0]).casefold())
     ):
-        stem = Path(_safe_filename(filename)).stem.casefold()
+        relative_path = _safe_relative_path(filename)
+        stem = Path(_safe_filename(relative_path)).stem.casefold()
         dimensions = dimensions_by_stem.get(stem, {})
-        indexed[stem] = {
+        frame_info = {
             "frame": frame_index,
             "width": dimensions.get("width"),
             "height": dimensions.get("height"),
         }
+        indexed[relative_path.casefold()] = frame_info
+        indexed[_safe_filename(relative_path).casefold()] = frame_info
+        indexed.setdefault(stem, frame_info)
     return indexed
+
+
+def _dataset_frame_info(
+    frame_index: dict[str, dict[str, Any]], item: dict[str, Any]
+) -> dict[str, Any] | None:
+    keys = [
+        item.get("image_key"),
+        item.get("image_filename"),
+        item.get("filename"),
+        item.get("image_stem"),
+    ]
+    for key in keys:
+        if key is None:
+            continue
+        normalized = _safe_relative_path(str(key)).casefold()
+        match = frame_index.get(normalized) or frame_index.get(_safe_filename(normalized).casefold())
+        if match is not None:
+            return match
+        if "/" not in normalized:
+            match = frame_index.get(Path(normalized).stem.casefold())
+            if match is not None:
+                return match
+    return None
 
 
 def _media_dimensions_by_stem(
@@ -1528,7 +1810,7 @@ def _incoming_manifest_conflicts(manifest: list[dict[str, Any]]) -> list[dict[st
     seen_names: dict[str, dict[str, Any]] = {}
     seen_hashes: dict[str, dict[str, Any]] = {}
     for item in manifest:
-        name_key = str(item.get("normalized_filename") or "")
+        name_key = str(item.get("normalized_relative_path") or item.get("normalized_filename") or "")
         sha256 = str(item.get("sha256") or "")
         if name_key and name_key in seen_names:
             conflicts.append(
@@ -1760,6 +2042,10 @@ def _existing_image_payload(
         "normalized_filename": str(
             item.get("normalized_filename") or _normalized_filename(filename)
         ),
+        "normalized_relative_path": str(
+            item.get("normalized_relative_path") or _safe_relative_path(filename).casefold()
+        ),
+        "source_class": item.get("source_class") or _classification_folder_class_name(filename),
         "sha256": item.get("sha256"),
         "size_bytes": item.get("size_bytes"),
         "content_type": item.get("content_type"),
@@ -1777,9 +2063,13 @@ def _conflict_payload(
 ) -> dict[str, Any]:
     return {
         "filename": incoming.get("filename"),
+        "relative_path": incoming.get("relative_path"),
+        "source_class": incoming.get("source_class"),
         "reason": reason,
         "scope": scope,
         "existing_filename": existing.get("filename"),
+        "existing_relative_path": existing.get("relative_path"),
+        "existing_source_class": existing.get("source_class"),
         "task_name": existing.get("task_name"),
         "task_external_id": existing.get("task_external_id"),
     }
@@ -1817,13 +2107,25 @@ def _duplicate_import_message(conflicts: list[dict[str, Any]]) -> str:
     visible = conflicts[:5]
     parts = []
     for conflict in visible:
-        filename = str(conflict.get("filename") or "arquivo")
+        filename = str(conflict.get("relative_path") or conflict.get("filename") or "arquivo")
+        existing_filename = str(
+            conflict.get("existing_relative_path")
+            or conflict.get("existing_filename")
+            or "arquivo existente"
+        )
+        if conflict.get("reason") == "classe":
+            source_class = str(conflict.get("source_class") or "sem classe")
+            existing_class = str(conflict.get("existing_source_class") or "sem classe")
+            parts.append(
+                f"{filename} ({source_class}) duplica {existing_filename} ({existing_class})"
+            )
+            continue
         reason = "mesmo conteudo" if conflict.get("reason") == "conteudo" else "mesmo nome"
         if conflict.get("scope") == "upload":
-            parts.append(f"{filename} ({reason} no proprio upload)")
+            parts.append(f"{filename} ({reason} de {existing_filename} no proprio upload)")
         else:
             task_name = str(conflict.get("task_name") or "outro lote")
-            parts.append(f"{filename} ({reason} em {task_name})")
+            parts.append(f"{filename} ({reason} de {existing_filename} em {task_name})")
     hidden = len(conflicts) - len(visible)
     suffix = f" e mais {hidden}" if hidden > 0 else ""
     return f"Imagens duplicadas ou ja importadas neste projeto: {', '.join(parts)}{suffix}."

@@ -11,6 +11,7 @@ import type {
   BackendImportJob,
   BackendImportTaskCreate,
   BackendDirectoryListing,
+  BackendDirectoryCreate,
   BackendInferenceRunCreate,
   BackendInferenceSuggestion,
   BackendJob,
@@ -282,6 +283,10 @@ export function putProjectMembers(projectId: string, userIds: string[], signal?:
 export function fetchDirectories(path?: string, signal?: AbortSignal) {
   const query = path ? `?${new URLSearchParams({ path }).toString()}` : ""
   return getJson<BackendDirectoryListing>(`/system/directories${query}`, signal)
+}
+
+export function createDirectory(payload: BackendDirectoryCreate, signal?: AbortSignal) {
+  return postJson<BackendDirectoryListing>("/system/directories", payload, signal)
 }
 
 export function fetchDashboard(projectId = "default", signal?: AbortSignal) {

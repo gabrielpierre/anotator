@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     import_cvat_max_upload_bytes: int = Field(
         default=805_306_368, alias="IMPORT_CVAT_MAX_UPLOAD_BYTES"
     )
+    import_cvat_max_upload_files: int = Field(default=500, alias="IMPORT_CVAT_MAX_UPLOAD_FILES")
     annotation_frame_max_side: int = Field(default=1920, alias="ANNOTATION_FRAME_MAX_SIDE")
     annotation_frame_jpeg_quality: int = Field(default=84, alias="ANNOTATION_FRAME_JPEG_QUALITY")
     annotation_frame_source_quality: str = Field(
@@ -63,6 +64,7 @@ class Settings(BaseSettings):
     training_min_shm_per_worker_mb: int = Field(default=256, alias="TRAINING_MIN_SHM_PER_WORKER_MB")
     training_heartbeat_seconds: int = Field(default=20, alias="TRAINING_HEARTBEAT_SECONDS")
     training_isolate_process: bool = Field(default=True, alias="TRAINING_ISOLATE_PROCESS")
+    system_directory_home: str | None = Field(default=None, alias="SYSTEM_DIRECTORY_HOME")
 
     @property
     def cors_origins(self) -> list[str]:

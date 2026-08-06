@@ -30,21 +30,46 @@ type ClassMapping = {
   count: number
 }
 
-type AnnotationImportTarget = "review" | "annotation"
+type AnnotationImportTarget = "review" | "annotation" | "ready"
+type DuplicatePolicy = "review" | "ignore" | "include"
+
+type DuplicateConflict = {
+  id: string
+  keepPath: string
+  keepClass: string
+  keepPreviewUrl: string | null
+  duplicatePath: string
+  duplicateClass: string
+  duplicatePreviewUrl: string | null
+}
 
 type DatasetProfile = {
+  sourceFiles: File[]
+  sourceImages: File[]
   files: File[]
   images: File[]
   totalBytes: number
   format: string
   annotationFiles: number
+  annotationCount: number
   classes: Array<{ name: string; count: number }>
   warnings: string[]
+  blockingIssues: string[]
+  duplicateConflicts: DuplicateConflict[]
+}
+
+type DirectoryDuplicateReview = {
+  files: File[]
+  images: File[]
+  skippedByClass: Map<string, number>
+  skippedCount: number
+  conflicts: DuplicateConflict[]
 }
 
 const imageExtensions = new Set([".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"])
 const annotationExtensions = new Set([".txt", ".json", ".xml"])
 const classFileNames = new Set(["classes.txt", "obj.names", "data.yaml", "dataset.yaml"])
+const splitFolderNames = new Set(["train", "training", "val", "valid", "validation", "test", "testing"])
 const fallbackColors = [
   "#4f8cff",
   "#22c55e",
@@ -166,6 +191,9 @@ export function ImportDatasetDialog({
   const [progress, setProgress] = React.useState({ loaded: 0, total: 0, percent: 0 })
   const [mappingEditorOpen, setMappingEditorOpen] = React.useState(false)
   const [annotationImportTarget, setAnnotationImportTarget] = React.useState<AnnotationImportTarget>("review")
+  const [duplicatePolicy, setDuplicatePolicy] = React.useState<DuplicatePolicy>("review")
+  const [duplicateResolverOpen, setDuplicateResolverOpen] = React.useState(false)
+  const [duplicateResolutions, setDuplicateResolutions] = React.useState<Record<string, string>>({})
   const analysisToken = React.useRef(0)
 
   const selectedProject = React.useMemo(
@@ -180,16 +208,18 @@ export function ImportDatasetDialog({
     return map
   }, [labels])
   const unresolvedMappings = mappings.filter((mapping) => !mapping.targetName.trim()).length
-  const canSubmit =
-    Boolean(selectedProjectId) &&
-    Boolean(profile?.images.length) &&
-    unresolvedMappings === 0 &&
-    phase !== "analyzing" &&
-    phase !== "creating" &&
-    phase !== "uploading" &&
-    phase !== "processing" &&
-    !result
   const busy = phase !== "idle"
+  const submitBlockReason = importSubmitBlockReason({
+    selectedProjectId,
+    profile,
+    unresolvedMappings,
+    duplicatePolicy,
+    duplicateResolutions,
+  })
+  const canSubmit =
+    !submitBlockReason &&
+    !busy &&
+    !result
 
   React.useEffect(() => {
     if (!open) return
@@ -206,6 +236,9 @@ export function ImportDatasetDialog({
     setProgress({ loaded: 0, total: 0, percent: 0 })
     setMappingEditorOpen(false)
     setAnnotationImportTarget("review")
+    setDuplicatePolicy("review")
+    setDuplicateResolverOpen(false)
+    setDuplicateResolutions({})
     analysisToken.current += 1
   }, [activeProject?.id, initialProjectId, open, projects])
 
@@ -235,6 +268,9 @@ export function ImportDatasetDialog({
     setProfile(null)
     setMappings([])
     setMappingEditorOpen(false)
+    setDuplicatePolicy("review")
+    setDuplicateResolverOpen(false)
+    setDuplicateResolutions({})
     if (files.length === 0) return
     setPhase("analyzing")
     setProgress({ loaded: 0, total: files.length, percent: 1 })
@@ -247,6 +283,7 @@ export function ImportDatasetDialog({
       if (analysisToken.current !== token) return
       setProfile(nextProfile)
       setMappings(buildMappings(nextProfile.classes, labels))
+      setDuplicateResolverOpen((nextProfile.duplicateConflicts?.length ?? 0) > 0)
       setProgress({ loaded: files.length, total: files.length, percent: 100 })
       if (nextProfile.images.length === 0) {
         setError("Nenhuma imagem foi encontrada. Se for um ZIP, extraia a pasta antes de importar.")
@@ -272,16 +309,23 @@ export function ImportDatasetDialog({
       setError("Resolva todas as classes antes de importar.")
       return
     }
+    const duplicateBlockReason = duplicateSubmitBlockReason(profile, duplicatePolicy, duplicateResolutions)
+    if (duplicateBlockReason) {
+      setError(duplicateBlockReason)
+      return
+    }
+    const importFiles = importFilesForDuplicatePolicy(profile, duplicatePolicy, duplicateResolutions)
+    const importBytes = importFiles.reduce((total, file) => total + file.size, 0)
     setError(null)
     setPhase("creating")
-    setProgress({ loaded: 0, total: profile.totalBytes, percent: 1 })
+    setProgress({ loaded: 0, total: importBytes, percent: 1 })
     try {
       const assigneeId = isAdmin ? assigneeUserId || null : currentUser.role === "anotador" ? currentUser.id || null : null
       const created = await createImportTask({
         project_id: selectedProjectId,
         name: name.trim() || defaultDatasetName(),
         assignee_user_id: assigneeId,
-        estimated_bytes: profile.totalBytes,
+        estimated_bytes: importBytes,
         labels: labelsFromMappings(mappings),
         class_mappings: mappings.map((mapping) => ({
           source_name: mapping.sourceName,
@@ -289,15 +333,16 @@ export function ImportDatasetDialog({
           color: mapping.color,
           count: mapping.count,
         })),
-        annotation_import_target: profile.annotationFiles > 0 ? annotationImportTarget : "annotation",
+        annotation_import_target: profileAnnotationCount(profile) > 0 ? annotationImportTarget : "annotation",
+        duplicate_policy: duplicatePolicy,
         sync_after_import: true,
       })
       setPhase("uploading")
-      const uploaded = await uploadImportTaskFilesWithProgress(created.job.id, profile.files, (uploadProgress) => {
+      const uploaded = await uploadImportTaskFilesWithProgress(created.job.id, importFiles, (uploadProgress) => {
         setProgress(uploadProgress)
       })
       setPhase("processing")
-      setProgress({ loaded: profile.totalBytes, total: profile.totalBytes, percent: 100 })
+      setProgress({ loaded: importBytes, total: importBytes, percent: 100 })
       setResult(uploaded)
       onImported?.(uploaded, selectedProjectId)
     } catch (err) {
@@ -340,7 +385,7 @@ export function ImportDatasetDialog({
 
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="flex flex-col gap-4 p-5">
-            <div className="grid gap-3 sm:grid-cols-2">
+            <div className={`grid gap-3 ${lockProject ? "" : "sm:grid-cols-2"}`}>
               <label className="flex flex-col gap-1.5">
                 <span className="text-sm font-medium text-foreground">Nome no CVAT</span>
                 <input
@@ -351,22 +396,24 @@ export function ImportDatasetDialog({
                 />
               </label>
 
-              <label className="flex flex-col gap-1.5">
-                <span className="text-sm font-medium text-foreground">Projeto de destino</span>
-                <select
-                  value={selectedProjectId}
-                  onChange={(event) => setSelectedProjectId(event.target.value)}
-                  disabled={lockProject || busy || Boolean(result)}
-                  className="h-10 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue disabled:bg-muted disabled:text-muted-foreground"
-                >
-                  <option value="">Selecione um projeto</option>
-                  {projectOptions.map((project) => (
-                    <option key={project.id} value={project.id}>
-                      {project.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              {!lockProject && (
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-sm font-medium text-foreground">Projeto de destino</span>
+                  <select
+                    value={selectedProjectId}
+                    onChange={(event) => setSelectedProjectId(event.target.value)}
+                    disabled={busy || Boolean(result)}
+                    className="h-10 rounded-lg border border-border bg-background px-3 text-sm outline-none focus:border-brand-blue disabled:bg-muted disabled:text-muted-foreground"
+                  >
+                    <option value="">Selecione um projeto</option>
+                    {projectOptions.map((project) => (
+                      <option key={project.id} value={project.id}>
+                        {project.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
             </div>
 
             {isAdmin && (
@@ -446,7 +493,7 @@ export function ImportDatasetDialog({
               />
             )}
 
-            {profile && profile.annotationFiles > 0 && (
+            {profile && profileAnnotationCount(profile) > 0 && (
               <AnnotationImportTargetControl
                 value={annotationImportTarget}
                 disabled={busy || Boolean(result)}
@@ -471,10 +518,30 @@ export function ImportDatasetDialog({
               />
             )}
 
+            {profile && (profile.duplicateConflicts?.length ?? 0) > 0 && (
+              <DuplicateReviewControl
+                conflicts={profile.duplicateConflicts}
+                policy={duplicatePolicy}
+                resolverOpen={duplicateResolverOpen}
+                resolutions={duplicateResolutions}
+                onPolicyChange={setDuplicatePolicy}
+                onResolverOpenChange={setDuplicateResolverOpen}
+                onResolve={(conflictId, keepPath) => {
+                  setDuplicateResolutions((current) => ({ ...current, [conflictId]: keepPath }))
+                }}
+              />
+            )}
+
             {profile?.warnings.map((warning) => (
-              <div key={warning} className="flex items-start gap-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <div key={warning} className="flex items-start gap-2 rounded-lg bg-muted px-3 py-2 text-xs text-muted-foreground">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                 <span>{warning}</span>
+              </div>
+            ))}
+            {profile?.blockingIssues?.map((issue) => (
+              <div key={issue} className="flex items-start gap-2 rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                <span>{issue}</span>
               </div>
             ))}
             {error && <p className="rounded-lg bg-destructive/10 px-3 py-2 text-sm text-destructive">{error}</p>}
@@ -489,17 +556,23 @@ export function ImportDatasetDialog({
         </div>
 
         <div className="flex items-center justify-between gap-3 border-t border-border p-4">
-          <span className="text-xs text-muted-foreground">
-            {profile
-              ? `${profile.images.length.toLocaleString("pt-BR")} imagens - ${mappings.length} classes`
-              : "Selecione a pasta antes de importar"}
+          <span className="flex min-w-0 flex-col gap-0.5 text-xs">
+            {!busy && !result && submitBlockReason ? (
+              <span className="truncate text-destructive">{submitBlockReason}</span>
+            ) : (
+              <span className="text-muted-foreground">
+                {profile
+                  ? `${profile.images.length.toLocaleString("pt-BR")} imagens - ${mappings.length} classes`
+                  : "Selecione a pasta antes de importar"}
+              </span>
+            )}
           </span>
           <div className="flex items-center gap-2">
             <Button type="button" variant="outline" onClick={onClose}>
               {result ? "Fechar" : "Cancelar"}
             </Button>
             {!result && (
-              <Button type="submit" disabled={!canSubmit}>
+              <Button type="submit" disabled={!canSubmit} title={submitBlockReason ?? undefined}>
                 {busy ? <Loader2 className="size-4 animate-spin" /> : <Upload className="size-4" />}
                 Importar dataset
               </Button>
@@ -509,6 +582,231 @@ export function ImportDatasetDialog({
       </form>
     </div>
   )
+}
+
+function importSubmitBlockReason({
+  selectedProjectId,
+  profile,
+  unresolvedMappings,
+  duplicatePolicy,
+  duplicateResolutions,
+}: {
+  selectedProjectId: string
+  profile: DatasetProfile | null
+  unresolvedMappings: number
+  duplicatePolicy: DuplicatePolicy
+  duplicateResolutions: Record<string, string>
+}) {
+  if (!selectedProjectId) return "Selecione um projeto de destino para importar."
+  if (!profile) return "Selecione a pasta do dataset antes de importar."
+  const duplicateBlockReason = duplicateSubmitBlockReason(profile, duplicatePolicy, duplicateResolutions)
+  if (duplicateBlockReason) return duplicateBlockReason
+  if (profile.images.length === 0) return "A pasta selecionada não possui imagens importáveis."
+  if (unresolvedMappings > 0) return "Resolva todas as classes antes de importar."
+  return null
+}
+
+function profileAnnotationCount(profile: DatasetProfile) {
+  return profile.annotationCount ?? profile.annotationFiles ?? 0
+}
+
+function DuplicateReviewControl({
+  conflicts,
+  policy,
+  resolverOpen,
+  resolutions,
+  onPolicyChange,
+  onResolverOpenChange,
+  onResolve,
+}: {
+  conflicts: DuplicateConflict[]
+  policy: DuplicatePolicy
+  resolverOpen: boolean
+  resolutions: Record<string, string>
+  onPolicyChange: (policy: DuplicatePolicy) => void
+  onResolverOpenChange: (open: boolean) => void
+  onResolve: (conflictId: string, keepPath: string) => void
+}) {
+  const resolved = conflicts.filter((conflict) => Boolean(resolutions[conflict.id])).length
+  const allResolved = resolved === conflicts.length
+  const status =
+    policy === "include"
+      ? "Todas serão adicionadas."
+      : policy === "ignore"
+        ? "Duplicatas conflitantes serão ignoradas."
+        : allResolved
+          ? "Conflitos resolvidos."
+          : `${resolved.toLocaleString("pt-BR")} de ${conflicts.length.toLocaleString("pt-BR")} resolvido(s).`
+
+  return (
+    <div className="rounded-xl border border-border bg-muted/20 p-3">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <AlertTriangle className="size-4 text-muted-foreground" />
+            Duplicatas com classes diferentes
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">{status}</p>
+        </div>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => onResolverOpenChange(!resolverOpen)}
+        >
+          {resolverOpen ? "Fechar" : "Resolver"}
+        </Button>
+      </div>
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-3">
+        <DuplicatePolicyButton
+          active={policy === "review"}
+          label="Resolver"
+          description="Escolher classe por conflito"
+          onClick={() => {
+            onPolicyChange("review")
+            onResolverOpenChange(true)
+          }}
+        />
+        <DuplicatePolicyButton
+          active={policy === "ignore"}
+          label="Ignorar tudo"
+          description="Manter a primeira ocorrência"
+          onClick={() => onPolicyChange("ignore")}
+        />
+        <DuplicatePolicyButton
+          active={policy === "include"}
+          label="Adicionar tudo"
+          description="Importar mesmo com conflito"
+          onClick={() => onPolicyChange("include")}
+        />
+      </div>
+
+      {resolverOpen && policy === "review" && (
+        <div className="mt-3 space-y-2">
+          {conflicts.map((conflict) => {
+            const selected = resolutions[conflict.id]
+            return (
+              <div key={conflict.id}>
+                <p className="mb-2 truncate text-xs text-muted-foreground" title={`${conflict.keepPath} / ${conflict.duplicatePath}`}>
+                  Mesmo arquivo em duas classes
+                </p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <DuplicateChoiceButton
+                    active={selected === conflict.keepPath}
+                    classNameLabel={conflict.keepClass}
+                    path={conflict.keepPath}
+                    previewUrl={conflict.keepPreviewUrl}
+                    onClick={() => onResolve(conflict.id, conflict.keepPath)}
+                  />
+                  <DuplicateChoiceButton
+                    active={selected === conflict.duplicatePath}
+                    classNameLabel={conflict.duplicateClass}
+                    path={conflict.duplicatePath}
+                    previewUrl={conflict.duplicatePreviewUrl}
+                    onClick={() => onResolve(conflict.id, conflict.duplicatePath)}
+                  />
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DuplicatePolicyButton({
+  active,
+  label,
+  description,
+  onClick,
+}: {
+  active: boolean
+  label: string
+  description: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-lg border px-3 py-2 text-left transition ${
+        active ? "border-brand-blue bg-brand-blue/10 text-foreground" : "border-border bg-card text-foreground hover:bg-muted"
+      }`}
+    >
+      <span className="block text-sm font-medium">{label}</span>
+      <span className="mt-0.5 block truncate text-xs text-muted-foreground">{description}</span>
+    </button>
+  )
+}
+
+function DuplicateChoiceButton({
+  active,
+  classNameLabel,
+  path,
+  previewUrl,
+  onClick,
+}: {
+  active: boolean
+  classNameLabel: string
+  path: string
+  previewUrl: string | null
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`min-w-0 rounded-lg text-left transition ${
+        active ? "text-foreground" : "text-foreground hover:bg-muted/60"
+      }`}
+    >
+      <span className={`block aspect-[4/3] overflow-hidden rounded-lg border ${
+        active ? "border-brand-blue ring-2 ring-brand-blue/20" : "border-border"
+      }`}>
+        {previewUrl ? (
+          <img src={previewUrl} alt="" className="size-full object-cover" />
+        ) : (
+          <span className="flex size-full items-center justify-center text-xs text-muted-foreground">Sem preview</span>
+        )}
+      </span>
+      <span className="block px-1.5 py-2">
+        <span className="block truncate text-sm font-medium text-foreground">{classNameLabel}</span>
+        <span className="mt-0.5 block truncate text-xs text-muted-foreground" title={path}>
+          {path}
+        </span>
+      </span>
+    </button>
+  )
+}
+
+function duplicateSubmitBlockReason(
+  profile: DatasetProfile,
+  duplicatePolicy: DuplicatePolicy,
+  duplicateResolutions: Record<string, string>,
+) {
+  const conflicts = profile.duplicateConflicts ?? []
+  if (conflicts.length === 0 || duplicatePolicy !== "review") return null
+  const unresolved = conflicts.filter((conflict) => !duplicateResolutions[conflict.id]).length
+  if (unresolved === 0) return null
+  return `Resolva ${unresolved.toLocaleString("pt-BR")} duplicata(s) com classes diferentes antes de importar.`
+}
+
+function importFilesForDuplicatePolicy(
+  profile: DatasetProfile,
+  duplicatePolicy: DuplicatePolicy,
+  duplicateResolutions: Record<string, string>,
+) {
+  const conflicts = profile.duplicateConflicts ?? []
+  if (duplicatePolicy === "include") return profile.sourceFiles ?? profile.files
+  const skippedPaths = new Set<string>()
+  for (const conflict of conflicts) {
+    const keepPath = duplicatePolicy === "ignore" ? conflict.keepPath : duplicateResolutions[conflict.id]
+    if (!keepPath) continue
+    skippedPaths.add(keepPath === conflict.keepPath ? conflict.duplicatePath : conflict.keepPath)
+  }
+  return profile.files.filter((file) => !skippedPaths.has(relativeName(file)))
 }
 
 function AnnotationImportTargetControl({
@@ -531,12 +829,17 @@ function AnnotationImportTargetControl({
       label: "Anotação",
       detail: "Frames anotados abrem para ajuste",
     },
+    {
+      value: "ready",
+      label: "Pronto para treino",
+      detail: "Importa como aprovado e disponível",
+    },
   ]
 
   return (
     <div className="rounded-xl border border-border bg-muted/20 p-3">
       <p className="mb-2 text-sm font-medium text-foreground">Destino das anotações importadas</p>
-      <div className="grid gap-2 sm:grid-cols-2">
+      <div className="grid gap-2 sm:grid-cols-3">
         {options.map((option) => {
           const selected = option.value === value
           return (
@@ -675,7 +978,7 @@ function DatasetImportReviewStrip({
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-[1fr_.8fr_.8fr_1.25fr]">
         <CompactSummaryTile label="Formato" value={profile.format} />
         <CompactSummaryTile label="Imagens" value={profile.images.length.toLocaleString("pt-BR")} />
-        <CompactSummaryTile label="Anotações" value={profile.annotationFiles.toLocaleString("pt-BR")} />
+        <CompactSummaryTile label="Anotações" value={profileAnnotationCount(profile).toLocaleString("pt-BR")} />
         <div className="min-w-0 rounded-lg bg-card px-3 py-2">
           <p className="text-xs text-muted-foreground">Classes</p>
           <p className="text-sm font-semibold text-foreground">{mappings.length.toLocaleString("pt-BR")}</p>
@@ -709,14 +1012,18 @@ async function analyzeDataset(
   files: File[],
   onProgress: (loaded: number, total: number) => void,
 ): Promise<DatasetProfile> {
-  const images = files.filter(isImageFile)
+  let effectiveFiles = files
+  let images = files.filter(isImageFile)
   const annotationCandidates = files.filter(isAnnotationFile)
-  const totalBytes = files.reduce((total, file) => total + file.size, 0)
+  let totalBytes = files.reduce((total, file) => total + file.size, 0)
   const warnings: string[] = []
+  const blockingIssues: string[] = []
+  let duplicateConflicts: DuplicateConflict[] = []
   const classNames = new Set<string>()
   const classCounts = new Map<string, number>()
   const yoloClassIds = new Map<number, number>()
   let annotationFileCount = 0
+  let annotationCount = 0
   let detectedFormat = images.length > 0 ? "Pasta de imagens" : "Desconhecido"
   let loaded = 0
   const totalToRead = Math.min(annotationCandidates.length, 1200)
@@ -738,6 +1045,7 @@ async function analyzeDataset(
         for (const label of labels) classNames.add(label)
         detectedFormat = "COCO JSON"
         annotationFileCount += 1
+        annotationCount += parseCocoAnnotationCount(text)
       }
     } else if (name.endsWith(".xml")) {
       const labels = parseCvatXmlLabels(text)
@@ -745,11 +1053,13 @@ async function analyzeDataset(
         for (const label of labels) classNames.add(label)
         detectedFormat = "CVAT XML"
         annotationFileCount += 1
+        annotationCount += parseCvatXmlAnnotationCount(text)
       }
     } else if (name.endsWith(".txt")) {
       const ids = parseYoloLabelIds(text)
       if (ids.length > 0 || isYoloLabelPath(name)) {
         annotationFileCount += 1
+        annotationCount += ids.length
         for (const classId of ids) {
           yoloClassIds.set(classId, (yoloClassIds.get(classId) ?? 0) + 1)
         }
@@ -780,6 +1090,26 @@ async function analyzeDataset(
     classCounts.set(name, (classCounts.get(name) ?? 0) + count)
     classNames.add(name)
   }
+  if (classNames.size === 0 && yoloClassIds.size === 0) {
+    const directoryClasses = directoryClassCounts(images)
+    if (directoryClasses.size >= 2) {
+      detectedFormat = "Classificação por pastas"
+      const duplicateReview = await reviewDirectoryDuplicates(files, images)
+      for (const [name, count] of directoryClasses) {
+        const skipped = duplicateReview.skippedByClass.get(name.toLocaleLowerCase("pt-BR")) ?? 0
+        const importableCount = Math.max(0, count - skipped)
+        classNames.add(name)
+        classCounts.set(name, importableCount)
+        annotationCount += importableCount
+      }
+      effectiveFiles = duplicateReview.files
+      images = duplicateReview.images
+      totalBytes = effectiveFiles.reduce((total, file) => total + file.size, 0)
+      if (duplicateReview.conflicts.length > 0) {
+        duplicateConflicts = duplicateReview.conflicts
+      }
+    }
+  }
   for (const name of classNames) {
     if (!classCounts.has(name)) classCounts.set(name, 0)
   }
@@ -788,15 +1118,20 @@ async function analyzeDataset(
   }
 
   return {
-    files,
+    sourceFiles: files,
+    sourceImages: files.filter(isImageFile),
+    files: effectiveFiles,
     images,
     totalBytes,
     format: detectedFormat,
     annotationFiles: annotationFileCount,
+    annotationCount,
     classes: Array.from(classCounts.entries())
       .map(([name, count]) => ({ name, count }))
       .sort((a, b) => a.name.localeCompare(b.name, "pt-BR")),
     warnings,
+    blockingIssues,
+    duplicateConflicts,
   }
 }
 
@@ -882,10 +1217,23 @@ function parseCocoCategories(text: string) {
   }
 }
 
+function parseCocoAnnotationCount(text: string) {
+  try {
+    const parsed = JSON.parse(text) as { annotations?: unknown }
+    return Array.isArray(parsed.annotations) ? parsed.annotations.length : 0
+  } catch {
+    return 0
+  }
+}
+
 function parseCvatXmlLabels(text: string) {
   return Array.from(text.matchAll(/<label>[\s\S]*?<name>([^<]+)<\/name>[\s\S]*?<\/label>/g))
     .map((match) => cleanLabelName(match[1]))
     .filter(Boolean)
+}
+
+function parseCvatXmlAnnotationCount(text: string) {
+  return Array.from(text.matchAll(/<(?:box|polygon|polyline|points|ellipse|cuboid|tag)\b/g)).length
 }
 
 function parseYoloLabelIds(text: string) {
@@ -908,6 +1256,103 @@ function looksLikeCocoDataset(files: File[]) {
     const path = relativeName(file).toLocaleLowerCase("pt-BR")
     return path.includes("coco128") || path.includes("coco/")
   })
+}
+
+function directoryClassCounts(images: File[]) {
+  const counts = new Map<string, number>()
+  for (const image of images) {
+    const className = directoryClassName(image)
+    if (!className) continue
+    counts.set(className, (counts.get(className) ?? 0) + 1)
+  }
+  return new Map(Array.from(counts.entries()).sort((a, b) => a[0].localeCompare(b[0], "pt-BR")))
+}
+
+function directoryClassName(file: File) {
+  const segments = relativeName(file).split(/[\\/]/).filter(Boolean)
+  const dirs = segments.slice(0, -1)
+  if (dirs.length === 0) return null
+
+  const splitIndex = dirs.findIndex((segment) => splitFolderNames.has(segment.toLocaleLowerCase("pt-BR")))
+  if (splitIndex >= 0) {
+    const afterSplit = dirs[splitIndex + 1]
+    return afterSplit ? cleanLabelName(afterSplit) : null
+  }
+
+  if (dirs.length < 2) return null
+  return cleanLabelName(dirs[dirs.length - 1]) || null
+}
+
+async function reviewDirectoryDuplicates(files: File[], images: File[]): Promise<DirectoryDuplicateReview> {
+  const fallback: DirectoryDuplicateReview = {
+    files,
+    images,
+    skippedByClass: new Map<string, number>(),
+    skippedCount: 0,
+    conflicts: [],
+  }
+  if (!globalThis.crypto?.subtle) return fallback
+
+  const annotatedImages = images
+    .map((file) => ({ file, path: relativeName(file), className: directoryClassName(file) }))
+    .filter((item): item is { file: File; path: string; className: string } => Boolean(item.className))
+    .sort((a, b) => a.path.localeCompare(b.path, "pt-BR"))
+
+  const byHash = new Map<string, Array<{ file: File; path: string; className: string }>>()
+  for (const item of annotatedImages) {
+    const hash = await fileSha256(item.file)
+    const group = byHash.get(hash) ?? []
+    group.push(item)
+    byHash.set(hash, group)
+    if (group.length % 40 === 0) await nextFrame()
+  }
+
+  const skippedPaths = new Set<string>()
+  const skippedByClass = new Map<string, number>()
+  const conflicts: DuplicateConflict[] = []
+  for (const group of byHash.values()) {
+    if (group.length < 2) continue
+    const classes = new Set(group.map((item) => item.className.toLocaleLowerCase("pt-BR")))
+    const first = group[0]
+    if (classes.size > 1) {
+      for (const item of group.slice(1)) {
+        conflicts.push({
+          id: `${first.path}::${item.path}`,
+          keepPath: first.path,
+          keepClass: first.className,
+          keepPreviewUrl: URL.createObjectURL(first.file),
+          duplicatePath: item.path,
+          duplicateClass: item.className,
+          duplicatePreviewUrl: URL.createObjectURL(item.file),
+        })
+      }
+      continue
+    }
+    for (const item of group.slice(1)) {
+      skippedPaths.add(item.path)
+      const key = item.className.toLocaleLowerCase("pt-BR")
+      skippedByClass.set(key, (skippedByClass.get(key) ?? 0) + 1)
+    }
+  }
+
+  if (skippedPaths.size === 0) {
+    return { ...fallback, conflicts }
+  }
+
+  return {
+    files: files.filter((file) => !skippedPaths.has(relativeName(file))),
+    images: images.filter((file) => !skippedPaths.has(relativeName(file))),
+    skippedByClass,
+    skippedCount: skippedPaths.size,
+    conflicts,
+  }
+}
+
+async function fileSha256(file: File) {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", await file.arrayBuffer())
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
 }
 
 function cleanLabelName(value: string) {

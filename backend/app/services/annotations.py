@@ -378,10 +378,10 @@ def _sync_frame_workflow_after_review(db: Session, annotation: AnnotationRecord,
 
 
 def _is_reviewable_shape_record(annotation: AnnotationRecord) -> bool:
-    if annotation.annotation_type == "tag":
-        return False
     if annotation.frame is None or not annotation.task_external_id:
         return False
+    if annotation.annotation_type == "tag":
+        return bool(annotation.label_id is not None or annotation.label_name)
     if (annotation.shape_type or "").lower() not in {"rectangle", "polygon"}:
         return False
     points = annotation.points if isinstance(annotation.points, list) else []
@@ -949,6 +949,26 @@ def _cvat_patch_item(annotation: AnnotationRecord, raw: dict[str, Any]) -> dict[
 
     frame = _int_or_none(raw.get("frame")) if raw.get("frame") is not None else annotation.frame
     label_id = _int_or_none(raw.get("label_id")) if raw.get("label_id") is not None else annotation.label_id
+    attributes = raw.get("attributes")
+    if annotation.annotation_type == "tag":
+        missing = []
+        if frame is None:
+            missing.append("frame")
+        if label_id is None:
+            missing.append("label_id")
+        if missing:
+            raise ValueError(f"CVAT patch missing required fields: {', '.join(missing)}")
+        item: dict[str, Any] = {
+            "id": annotation_id,
+            "frame": frame,
+            "label_id": label_id,
+        }
+        if isinstance(attributes, list):
+            item["attributes"] = attributes
+        if "source" in raw:
+            item["source"] = raw["source"]
+        return item
+
     points = raw.get("points") if isinstance(raw.get("points"), list) else annotation.points
     shape_type = raw.get("type") or annotation.shape_type or "rectangle"
 
@@ -969,7 +989,6 @@ def _cvat_patch_item(annotation: AnnotationRecord, raw: dict[str, Any]) -> dict[
         "label_id": label_id,
         "points": points,
     }
-    attributes = raw.get("attributes")
     if isinstance(attributes, list):
         item["attributes"] = attributes
     for key in ("occluded", "outside", "z_order", "rotation", "group", "source"):

@@ -7,7 +7,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import {
   Sliders,
   Upload,
-  HardDrive,
+  Database,
   ImageIcon,
   PenLine,
   Box,
@@ -29,6 +29,7 @@ import { DonutChart } from "@/components/snowui/charts"
 import { MetricLineChart, SparkLineChart } from "@/components/app/charts"
 import { StatusBadge, ProgressBar } from "@/components/app/primitives"
 import { ImportBatchDialog } from "@/components/data/import-batch-dialog"
+import { ImportDatasetDialog } from "@/components/data/import-dataset-dialog"
 import { ProjectDialog, type ProjectDialogTarget } from "@/components/projects/project-dialog"
 import {
   fetchAuditEvents,
@@ -43,6 +44,7 @@ import {
 } from "@/lib/api/client"
 import { chartClassColor, formatDateTimePt, formatPercentPt, formatPtNumber, labelsFromTasks, percentFromCount, toUiJobStatus } from "@/lib/api/status"
 import { projectRecordFromBackend, useCurrentUser } from "@/lib/auth/user-context"
+import { cn } from "@/lib/utils"
 import type {
   BackendAuditEvent,
   BackendAnnotationRecord,
@@ -109,6 +111,7 @@ export function ProjectOverview() {
   const [annotationExamplesLoading, setAnnotationExamplesLoading] = React.useState(false)
   const [annotationExamplesError, setAnnotationExamplesError] = React.useState<string | null>(null)
   const [importDialogOpen, setImportDialogOpen] = React.useState(false)
+  const [datasetImportDialogOpen, setDatasetImportDialogOpen] = React.useState(false)
   const [customizeOpen, setCustomizeOpen] = React.useState(false)
   const { isAdmin, projects, activeProject, updateProject } = useCurrentUser()
   const currentProjectId = activeProject?.id ?? projects[0]?.id ?? null
@@ -340,15 +343,28 @@ export function ProjectOverview() {
 
   return (
     <div className="flex flex-col gap-6 p-4 md:p-6">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-        <div className="flex flex-col gap-1">
-          <h1 className="text-2xl font-semibold tracking-tight">Visão geral do projeto</h1>
-          <p className="text-sm text-muted-foreground text-pretty">
-            Resumo do estado atual e próximos passos recomendados.
-          </p>
+      <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
+        <div className="min-w-0">
+            <h1 className="text-2xl font-semibold tracking-tight">Visão geral do projeto</h1>
+            <p className="text-sm text-muted-foreground text-pretty">
+              Resumo do estado atual e próximos passos recomendados.
+            </p>
         </div>
         {isAdmin && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2 xl:justify-end">
+            {currentProjectStorage && (
+              <div className="mr-1 flex h-10 w-full min-w-60 max-w-sm flex-col justify-center gap-1 rounded-full border border-border bg-background px-4 sm:w-72">
+                <div className="flex items-center justify-between gap-3 text-xs leading-none">
+                  <span className="truncate text-muted-foreground" title={currentProjectStorage.path}>
+                    Storage
+                  </span>
+                  <span className="shrink-0 font-medium tabular-nums text-foreground">
+                    {currentProjectStorage.usedGb.toFixed(1)} / {currentProjectStorage.quotaGb} GB
+                  </span>
+                </div>
+                <ProgressBar value={currentProjectStorage.percent} color="bg-brand-blue" />
+              </div>
+            )}
             <Button
               variant="outline"
               size="lg"
@@ -357,6 +373,15 @@ export function ProjectOverview() {
             >
               <Sliders className="size-4" />
               Personalizar
+            </Button>
+            <Button
+              variant="outline"
+              size="lg"
+              onClick={() => setDatasetImportDialogOpen(true)}
+              disabled={!currentProjectId}
+            >
+              <Database className="size-4" />
+              Importar dataset
             </Button>
             <Button size="lg" onClick={() => setImportDialogOpen(true)}>
               <Upload className="size-4" />
@@ -372,6 +397,16 @@ export function ProjectOverview() {
         onImported={() => {
           setImportDialogOpen(false)
           const projectId = contextProject?.id ?? dashboard?.project?.id
+          router.push(projectId ? `/jobs?project=${encodeURIComponent(projectId)}` : "/jobs")
+        }}
+      />
+      <ImportDatasetDialog
+        open={datasetImportDialogOpen}
+        initialProjectId={currentProjectId}
+        lockProject
+        onClose={() => setDatasetImportDialogOpen(false)}
+        onImported={(_, projectId) => {
+          setDatasetImportDialogOpen(false)
           router.push(projectId ? `/jobs?project=${encodeURIComponent(projectId)}` : "/jobs")
         }}
       />
@@ -433,30 +468,6 @@ export function ProjectOverview() {
           </Card>
         ))}
       </div>
-      {currentProjectStorage && (
-        <Card>
-          <CardContent className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
-            <div className="flex items-center gap-3">
-              <span className="flex size-10 items-center justify-center rounded-lg bg-surface-blue text-brand-blue">
-                <HardDrive className="size-5" />
-              </span>
-              <div>
-                <p className="text-sm font-medium text-foreground">Storage do projeto</p>
-                <p className="text-xs text-muted-foreground">{currentProjectStorage.path}</p>
-              </div>
-            </div>
-            <div className="flex min-w-48 flex-col gap-1">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground">Uso</span>
-                <span className="font-medium tabular-nums text-foreground">
-                  {currentProjectStorage.usedGb.toFixed(1)} / {currentProjectStorage.quotaGb} GB
-                </span>
-              </div>
-              <ProgressBar value={currentProjectStorage.percent} color="bg-brand-blue" />
-            </div>
-          </CardContent>
-        </Card>
-      )}
 
       {/* Model / trainings / release */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -692,30 +703,13 @@ export function ProjectOverview() {
                   <div className="max-h-64 overflow-x-hidden overflow-y-auto pr-1">
                     <div className="columns-2 gap-3 [column-fill:_balance]">
                     {annotationExamples.map((example, index) => (
-                      <button
-                        type="button"
+                      <AnnotationExampleTile
                         key={example.id}
-                        onClick={() => updateAnnotationPanel(() => setFocusedAnnotationExample(example))}
-                        className="annotation-example-tile group mb-3 block w-full break-inside-avoid overflow-hidden rounded-lg border border-border bg-muted text-left transition-transform duration-300 ease-out hover:-translate-y-0.5 hover:shadow-sm focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
-                        style={{
-                          borderTopColor: example.color,
-                          borderTopWidth: 3,
-                          animationDelay: `${Math.min(index * 36, 220)}ms`,
-                        }}
-                      >
-                        <AnnotationImageOverlay
-                          example={example}
-                          className="bg-muted transition-transform duration-300 group-hover:scale-[1.02]"
-                          fallbackClassName={exampleImageClass(index)}
-                          showBoxes={showAnnotationBoxes}
-                        />
-                        <div className="flex items-center justify-between gap-2 bg-card/95 px-2.5 py-2 text-xs">
-                          <span className="min-w-0 truncate font-medium">{example.taskName}</span>
-                          <span className="shrink-0 tabular-nums text-muted-foreground">
-                            {example.count} obj.
-                          </span>
-                        </div>
-                      </button>
+                        example={example}
+                        index={index}
+                        showBoxes={showAnnotationBoxes}
+                        onSelect={() => updateAnnotationPanel(() => setFocusedAnnotationExample(example))}
+                      />
                     ))}
                     </div>
                   </div>
@@ -855,13 +849,16 @@ function annotationExamplesForClass(
     if (!record.task_external_id || record.frame == null) continue
     if ((record.label_name ?? "").toLocaleLowerCase("pt-BR") !== selectedName) continue
     const box = annotationBoxFromRecord(record, selectedClass)
-    if (!box) continue
+    const isClassificationTag = record.annotation_type === "tag"
+    if (!box && !isClassificationTag) continue
 
     const key = `${record.task_external_id}:${record.frame}`
     const current = byFrame.get(key)
     if (current) {
-      current.count += 1
-      current.boxes.push(box)
+      if (box) {
+        current.count += 1
+        current.boxes.push(box)
+      }
       if (record.updated_at > current.updatedAt) current.updatedAt = record.updated_at
       continue
     }
@@ -876,7 +873,7 @@ function annotationExamplesForClass(
       previewUrl: taskFrameAssetUrl(record.task_external_id, record.frame, { variant: "original" }),
       color: selectedClass.color ?? "var(--brand-blue)",
       updatedAt: record.updated_at,
-      boxes: [box],
+      boxes: box ? [box] : [],
     })
   }
 
@@ -891,41 +888,115 @@ function isActiveAnnotationRecord(record: BackendAnnotationRecord) {
   )
 }
 
+function AnnotationExampleTile({
+  example,
+  index,
+  showBoxes,
+  onSelect,
+}: {
+  example: AnnotationExample
+  index: number
+  showBoxes: boolean
+  onSelect: () => void
+}) {
+  const [imageLoaded, setImageLoaded] = React.useState(false)
+
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={cn(
+        "annotation-example-tile group mb-3 block w-full break-inside-avoid overflow-hidden rounded-lg border border-border bg-muted text-left transition-transform duration-300 ease-out focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+        imageLoaded && "hover:-translate-y-0.5 hover:shadow-sm",
+      )}
+      style={{
+        borderTopColor: imageLoaded ? example.color : undefined,
+        borderTopWidth: imageLoaded ? 3 : undefined,
+        animationDelay: `${Math.min(index * 36, 220)}ms`,
+      }}
+    >
+      <AnnotationImageOverlay
+        example={example}
+        className={cn("bg-muted", imageLoaded && "transition-transform duration-300 group-hover:scale-[1.02]")}
+        fallbackClassName={exampleImageClass(index)}
+        showBoxes={showBoxes}
+        onLoadStateChange={setImageLoaded}
+      />
+      {imageLoaded && (
+        <div className="flex items-center justify-between gap-2 bg-card/95 px-2.5 py-2 text-xs">
+          <span className="min-w-0 truncate font-medium">{example.taskName}</span>
+          <span className="shrink-0 tabular-nums text-muted-foreground">{example.count} obj.</span>
+        </div>
+      )}
+    </button>
+  )
+}
+
 function AnnotationImageOverlay({
   example,
   className,
   fallbackClassName = "h-32",
   showBoxes = true,
+  onLoadStateChange,
 }: {
   example: AnnotationExample
   className?: string
   fallbackClassName?: string
   showBoxes?: boolean
+  onLoadStateChange?: (loaded: boolean) => void
 }) {
+  const [loaded, setLoaded] = React.useState(false)
+
+  React.useEffect(() => {
+    if (!example.previewUrl) {
+      setLoaded(false)
+      onLoadStateChange?.(false)
+      return
+    }
+    setLoaded(false)
+    onLoadStateChange?.(false)
+  }, [example.previewUrl, onLoadStateChange])
+
+  const markLoaded = React.useCallback(() => {
+    setLoaded(true)
+    onLoadStateChange?.(true)
+  }, [onLoadStateChange])
+
   return (
     <div className={`relative overflow-hidden ${className ?? ""}`}>
       {example.previewUrl ? (
         <>
+          {!loaded && <div className={`${fallbackClassName} w-full animate-pulse bg-muted`} />}
           <img
             src={example.previewUrl}
             alt={`${example.label} frame ${example.frame + 1}`}
-            className="block h-auto w-full"
+            decoding="async"
+            onLoad={markLoaded}
+            onError={markLoaded}
+            className={cn("h-auto w-full", loaded ? "block" : "hidden")}
           />
-          {showBoxes && (
+          {loaded && showBoxes && (
             <div className="pointer-events-none absolute inset-0" aria-hidden="true">
-              {example.boxes.map((box) => (
+              {example.boxes.length > 0 ? (
+                example.boxes.map((box) => (
+                  <span
+                    key={box.id}
+                    className="absolute rounded-[2px] border-2 shadow-[0_0_0_1px_rgba(0,0,0,0.55),0_0_10px_rgba(0,0,0,0.35)]"
+                    style={{
+                      borderColor: box.color,
+                      left: `${box.x * 100}%`,
+                      top: `${box.y * 100}%`,
+                      width: `${box.w * 100}%`,
+                      height: `${box.h * 100}%`,
+                    }}
+                  />
+                ))
+              ) : (
                 <span
-                  key={box.id}
-                  className="absolute rounded-[2px] border-2 shadow-[0_0_0_1px_rgba(0,0,0,0.55),0_0_10px_rgba(0,0,0,0.35)]"
-                  style={{
-                    borderColor: box.color,
-                    left: `${box.x * 100}%`,
-                    top: `${box.y * 100}%`,
-                    width: `${box.w * 100}%`,
-                    height: `${box.h * 100}%`,
-                  }}
+                  className="absolute inset-0 border-[3px] shadow-[inset_0_0_0_1px_rgba(0,0,0,0.35)]"
+                  style={{ borderColor: example.color }}
                 />
-              ))}
+              )}
             </div>
           )}
         </>

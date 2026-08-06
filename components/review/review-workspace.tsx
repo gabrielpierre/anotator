@@ -172,6 +172,10 @@ function boxFromAnnotation(item: ReviewAnnotation): Box | null {
   }
 }
 
+function isClassificationAnnotation(item: ReviewAnnotation) {
+  return item.annotationType === "tag"
+}
+
 function normalizedPointsForReview(points: number[], item: ReviewAnnotation) {
   const rawPointsNorm = Array.isArray(item.raw?.points_norm)
     ? item.raw.points_norm.map(Number).filter(Number.isFinite)
@@ -290,6 +294,9 @@ const emptyAnnotation: ReviewAnnotation = {
   color: "var(--muted-foreground)",
 }
 
+const REVIEW_QUEUE_REFRESH_DEBOUNCE_MS = 700
+const REVIEW_COUNT_EVENT_DEBOUNCE_MS = 700
+
 export function ReviewWorkspace() {
   const [tasks, setTasks] = React.useState<BackendTask[] | null>(null)
   const [reviewQueue, setReviewQueue] = React.useState<BackendReviewQueueItem[] | null>(null)
@@ -346,6 +353,9 @@ export function ReviewWorkspace() {
   scaleRef.current = scale
   const panRef = React.useRef(pan)
   panRef.current = pan
+  const refreshQueueTimeoutRef = React.useRef<number | null>(null)
+  const refreshQueueControllerRef = React.useRef<AbortController | null>(null)
+  const reviewCountEventTimeoutRef = React.useRef<number | null>(null)
 
   // ---- Correcao de objeto ----
   const [clsOverride, setClsOverride] = React.useState<Record<number, string>>({})
@@ -371,10 +381,50 @@ export function ReviewWorkspace() {
         fetchReviewQueue({ projectExternalId: currentProjectExternalId, state: "pending" }, signal),
         fetchReviewQueue({ projectExternalId: currentProjectExternalId, state: "approved" }, signal),
       ])
-      setReviewQueue(pending)
-      setApprovedQueue(approved)
+      React.startTransition(() => {
+        setReviewQueue(pending)
+        setApprovedQueue(approved)
+      })
     },
     [currentProjectExternalId],
+  )
+
+  const scheduleReviewQueueRefresh = React.useCallback(() => {
+    if (refreshQueueTimeoutRef.current) {
+      window.clearTimeout(refreshQueueTimeoutRef.current)
+    }
+    refreshQueueTimeoutRef.current = window.setTimeout(() => {
+      refreshQueueTimeoutRef.current = null
+      refreshQueueControllerRef.current?.abort()
+      const controller = new AbortController()
+      refreshQueueControllerRef.current = controller
+      refreshReviewQueues(controller.signal)
+        .catch(() => undefined)
+        .finally(() => {
+          if (refreshQueueControllerRef.current === controller) {
+            refreshQueueControllerRef.current = null
+          }
+        })
+    }, REVIEW_QUEUE_REFRESH_DEBOUNCE_MS)
+  }, [refreshReviewQueues])
+
+  const scheduleReviewCountUpdate = React.useCallback(() => {
+    if (reviewCountEventTimeoutRef.current) {
+      window.clearTimeout(reviewCountEventTimeoutRef.current)
+    }
+    reviewCountEventTimeoutRef.current = window.setTimeout(() => {
+      reviewCountEventTimeoutRef.current = null
+      window.dispatchEvent(new Event("review-queue-updated"))
+    }, REVIEW_COUNT_EVENT_DEBOUNCE_MS)
+  }, [])
+
+  React.useEffect(
+    () => () => {
+      if (refreshQueueTimeoutRef.current) window.clearTimeout(refreshQueueTimeoutRef.current)
+      if (reviewCountEventTimeoutRef.current) window.clearTimeout(reviewCountEventTimeoutRef.current)
+      refreshQueueControllerRef.current?.abort()
+    },
+    [],
   )
 
   React.useEffect(() => {
@@ -500,6 +550,7 @@ export function ReviewWorkspace() {
   const boxAreaMax = parseOptionalDecimal(boxAreaMaxInput)
   const hasCustomBoxArea = boxAreaMin !== null || boxAreaMax !== null
   const hasBoxSizeFilter = sizeFilter !== "all" && (sizeFilter !== "custom" || hasCustomBoxArea)
+  const visibleDecisionState = onlyUnreviewed ? decisions : null
 
   const toggleClass = React.useCallback((name: string) => {
     setCheckedClasses((prev) => {
@@ -515,11 +566,14 @@ export function ReviewWorkspace() {
       reviewItems
         .filter((a) => {
           const b = boxState[a.id]
-          if (!b || !checkedClasses.has(a.cls)) return false
-          if (onlyUnreviewed && decisions[a.id]) return false
+          const isClassification = isClassificationAnnotation(a)
+          if (!checkedClasses.has(a.cls)) return false
+          if (!b && !isClassification) return false
+          if (visibleDecisionState?.[a.id]) return false
           if (onlyThisClass && selectedCls && a.cls !== selectedCls) return false
           if (a.conf < minConf) return false
           if (hasBoxSizeFilter) {
+            if (!b) return false
             const areaPct = boxAreaPct(b)
             if (sizeFilter === "custom") {
               if (boxAreaMin !== null && areaPct < boxAreaMin) return false
@@ -537,14 +591,13 @@ export function ReviewWorkspace() {
       boxAreaMin,
       boxState,
       checkedClasses,
-      decisions,
       hasBoxSizeFilter,
       minConf,
       onlyThisClass,
-      onlyUnreviewed,
       reviewItems,
       selectedCls,
       sizeFilter,
+      visibleDecisionState,
     ],
   )
   const visibleFrameGroups = React.useMemo(() => groupReviewFrames(visibleAnnotations), [visibleAnnotations])
@@ -559,6 +612,12 @@ export function ReviewWorkspace() {
     ? currentFrameAnnotations.find((annotation) => annotation.id === selectedId) ?? currentFrameGroup.representative
     : emptyAnnotation
   const frameAnnotationTotal = currentFrameAnnotations.length
+  const currentFrameBoxAnnotations = currentFrameAnnotations.filter((annotation) => Boolean(boxState[annotation.id]))
+  const currentFrameTagAnnotations = currentFrameAnnotations.filter(isClassificationAnnotation)
+  const isClassificationFrame = currentFrameTagAnnotations.length > 0 && currentFrameBoxAnnotations.length === 0
+  const selectedSubjectLabel = isClassificationAnnotation(current) ? "Classe selecionada" : "Objeto selecionado"
+  const frameAnnotationLabel = isClassificationFrame ? "classes nesta imagem" : "objetos nesta imagem"
+  const editSelectionLabel = isClassificationAnnotation(current) ? "Editar classe selecionada" : "Editar objeto selecionado"
   const reviewedFrameKeys = React.useMemo(() => {
     const keys = new Set<string>()
     for (const group of groupReviewFrames(reviewItems)) {
@@ -577,6 +636,13 @@ export function ReviewWorkspace() {
   const queuePos = queueTotal === 0 ? 0 : Math.max(1, currentQueueIndex + 1)
   const queuePct = isApprovedMode ? 100 : allQueueFrameTotal === 0 ? 0 : Math.round((reviewedCount / allQueueFrameTotal) * 100)
   const currentPreviewSrc = current.previewUrl ?? "/placeholder.svg"
+  const preloadPreviewUrls = React.useMemo(() => {
+    if (currentQueueIndex < 0) return []
+    return visibleFrameGroups
+      .slice(currentQueueIndex + 1, currentQueueIndex + 4)
+      .map((group) => group.representative.previewUrl)
+      .filter((src): src is string => Boolean(src))
+  }, [currentQueueIndex, visibleFrameGroups])
   const imageFrameStyle = React.useMemo<React.CSSProperties>(() => {
     const dimensions = current.frameDimensions
     if (!dimensions || canvasSize.width <= 0 || canvasSize.height <= 0) {
@@ -598,6 +664,20 @@ export function ReviewWorkspace() {
       height: `${(canvasAspect / imageAspect) * 100}%`,
     }
   }, [canvasSize.height, canvasSize.width, current.frameDimensions])
+
+  React.useEffect(() => {
+    const images = preloadPreviewUrls.map((src) => {
+      const image = new window.Image()
+      image.decoding = "async"
+      image.src = src
+      return image
+    })
+    return () => {
+      images.forEach((image) => {
+        image.src = ""
+      })
+    }
+  }, [preloadPreviewUrls])
 
   const selectFrame = React.useCallback(
     (direction: -1 | 1) => {
@@ -727,6 +807,7 @@ export function ReviewWorkspace() {
         ...Object.fromEntries(affectedAnnotations.map((annotation) => [annotation.id, { synced: false, error: null }])),
       }))
       setLog((l) => [{ id: selected.id, decision }, ...l].slice(0, 20))
+      if (autoAdvance && isFrameDecision) selectFrame(1)
       if (selected.externalAnnotationId) {
         try {
           const response = await createReviewDecision({
@@ -754,8 +835,8 @@ export function ReviewWorkspace() {
               ]),
             ),
           }))
-          window.dispatchEvent(new Event("review-queue-updated"))
-          void refreshReviewQueues()
+          scheduleReviewCountUpdate()
+          scheduleReviewQueueRefresh()
           if (decision === "excluido") {
             setBoxState((prev) => {
               const next = { ...prev }
@@ -773,7 +854,6 @@ export function ReviewWorkspace() {
           }))
         }
       }
-      if (autoAdvance && isFrameDecision) selectFrame(1)
     },
     [
       autoAdvance,
@@ -784,7 +864,8 @@ export function ReviewWorkspace() {
       currentUser.email,
       currentUser.id,
       isApprovedMode,
-      refreshReviewQueues,
+      scheduleReviewCountUpdate,
+      scheduleReviewQueueRefresh,
       selectFrame,
     ],
   )
@@ -1313,9 +1394,6 @@ export function ReviewWorkspace() {
               >
                 <ZoomIn className="size-4" />
               </button>
-              <button className="ml-1 inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2.5 py-1.5 text-sm hover:bg-muted">
-                Ajustar <ChevronDown className="size-3.5 text-muted-foreground" />
-              </button>
             </div>
           </div>
 
@@ -1354,8 +1432,18 @@ export function ReviewWorkspace() {
                   draggable={false}
                   className="size-full select-none object-fill"
                 />
-                {currentFrameAnnotations.map((a) => {
+                {isClassificationFrame && (
+                  <div
+                    className="pointer-events-none absolute inset-0 z-10"
+                    style={{
+                      border: `3px solid ${clsColor(clsOf(current))}`,
+                      boxShadow: "inset 0 0 0 1px rgba(0,0,0,0.35)",
+                    }}
+                  />
+                )}
+                {currentFrameBoxAnnotations.map((a) => {
                   const b = boxState[a.id]
+                  if (!b) return null
                   const active = a.id === selectedId
                   const d = decisions[a.id]
                   const color = clsColor(clsOf(a))
@@ -1429,7 +1517,7 @@ export function ReviewWorkspace() {
                     </div>
                   )
                 })}
-                {frameAnnotationTotal === 0 && (
+                {currentFrameBoxAnnotations.length === 0 && currentFrameTagAnnotations.length === 0 && (
                   <div className="absolute inset-0 flex items-center justify-center">
                     <div className="rounded-full bg-black/60 px-3 py-1.5 text-xs text-white/80">
                       Nenhuma anotação com bounding box para revisar.
@@ -1450,7 +1538,9 @@ export function ReviewWorkspace() {
                   <div>
                     <p className="text-sm font-semibold text-foreground">Trocar classe #{current.id}</p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      Troque a classe, ajuste a caixa se precisar, salve ou exclua.
+                      {isClassificationAnnotation(current)
+                        ? "Troque a classe, salve ou exclua esta classificação."
+                        : "Troque a classe, ajuste a caixa se precisar, salve ou exclua."}
                     </p>
                   </div>
                   <button
@@ -1585,7 +1675,7 @@ export function ReviewWorkspace() {
                 [
                   ["anotacoes", `Anotações (${frameAnnotationTotal})`],
                   ["tracks", "Tracks (2)"],
-                  ["tags", "Tags (0)"],
+                  ["tags", `Tags (${currentFrameTagAnnotations.length})`],
                   ["comentarios", "Comentários (0)"],
                 ] as const
               ).map(([key, label]) => (
@@ -1691,7 +1781,7 @@ export function ReviewWorkspace() {
 
           <div className="flex items-start justify-between gap-3 px-4">
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Objeto selecionado</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{selectedSubjectLabel}</p>
               <p className="text-2xl font-semibold" style={{ color: clsColor(clsOf(current)) }}>
                 {clsOf(current)}
               </p>
@@ -1700,7 +1790,7 @@ export function ReviewWorkspace() {
                 <span className="text-muted-foreground">Confiança</span>
               </p>
               <p className="mt-1 text-xs text-muted-foreground">
-                {frameAnnotationTotal.toLocaleString("pt-BR")} objetos nesta imagem
+                {frameAnnotationTotal.toLocaleString("pt-BR")} {frameAnnotationLabel}
               </p>
             </div>
             <div className="size-16 shrink-0 overflow-hidden rounded-lg border border-border">
@@ -1762,7 +1852,7 @@ export function ReviewWorkspace() {
                     onClick={() => startCorrection()}
                     className="bg-warning text-white hover:brightness-110"
                   >
-                    <ArrowUp className="size-4" /> <span className="flex-1 text-center">Editar objeto selecionado</span>{" "}
+                    <ArrowUp className="size-4" /> <span className="flex-1 text-center">{editSelectionLabel}</span>{" "}
                     <ArrowUp className="size-4" />
                   </DecisionButton>
                   <DecisionButton

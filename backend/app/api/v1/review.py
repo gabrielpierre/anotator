@@ -388,10 +388,10 @@ def _visible_task_external_ids(
 
 
 def _is_reviewable_annotation(annotation: AnnotationRecord) -> bool:
-    if annotation.annotation_type == "tag":
-        return False
     if annotation.frame is None or not annotation.task_external_id:
         return False
+    if annotation.annotation_type == "tag":
+        return bool(annotation.label_id is not None or annotation.label_name)
     if (annotation.shape_type or "").lower() not in {"rectangle", "polygon"}:
         return False
     points = _annotation_points(annotation)

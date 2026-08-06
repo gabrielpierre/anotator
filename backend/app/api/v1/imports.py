@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.datastructures import UploadFile
 
 from app.api.deps import current_user, db_session, require_project_access
 from app.api.project_scope import job_visible, project_payload
@@ -11,6 +12,7 @@ from app.services.artifacts import S3ArtifactStore
 from app.services.imports import (
     DuplicateImportImagesError,
     build_import_file_manifest,
+    dedupe_classification_folder_upload_files,
     is_import_image_file,
     record_import_storage_usage,
     validate_import_file_manifest_unique,
@@ -20,6 +22,8 @@ from app.services.jobs import attach_celery_task, create_job, fail_job
 from app.tasks import import_task_job_task
 
 router = APIRouter()
+
+IMPORT_UPLOAD_MAX_FILES = float("inf")
 
 
 @router.post("/tasks", response_model=ImportJobRead)
@@ -116,7 +120,7 @@ def _actor_payload(actor: User) -> dict[str, str]:
 @router.post("/tasks/{job_id}/files", response_model=ImportJobRead)
 async def upload_import_task_files(
     job_id: str,
-    files: list[UploadFile] = File(...),
+    request: Request,
     db: Session = Depends(db_session),
     actor: User = Depends(current_user),
 ) -> ImportJobRead:
@@ -128,6 +132,7 @@ async def upload_import_task_files(
     if job.status not in {"queued", "failed"}:
         raise HTTPException(status_code=409, detail="Import job is not accepting files")
     payload = ImportTaskCreate.model_validate((job.raw or {}).get("payload") or {})
+    files = await _upload_files_from_request(request)
     duplicate_names = _duplicate_upload_filenames(files)
     if duplicate_names:
         detail = f"Arquivos com nomes repetidos no lote: {', '.join(duplicate_names)}"
@@ -157,13 +162,25 @@ async def upload_import_task_files(
             detail="Storage de artefatos indisponivel. Inicie MinIO/Docker antes de importar imagens.",
         ) from exc
     prepared_files: list[tuple[str, bytes, str]] = []
-    total_bytes = 0
     for file in files:
         content = await file.read()
-        total_bytes += len(content)
         filename = file.filename or "upload.bin"
         content_type = file.content_type or "application/octet-stream"
         prepared_files.append((filename, content, content_type))
+    try:
+        prepared_files, duplicate_review = dedupe_classification_folder_upload_files(
+            prepared_files,
+            duplicate_policy=payload.duplicate_policy,
+        )
+    except DuplicateImportImagesError as exc:
+        fail_job(
+            db,
+            job.id,
+            reason=str(exc),
+            raw_update={"duplicate_import_conflicts": exc.conflicts},
+        )
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    total_bytes = sum(len(content) for _filename, content, _content_type in prepared_files)
     manifest = build_import_file_manifest(prepared_files)
     image_manifest = build_import_file_manifest(
         [
@@ -179,6 +196,7 @@ async def upload_import_task_files(
             image_manifest,
             artifact_store=store,
             current_job_id=job.id,
+            allow_incoming_duplicates=payload.duplicate_policy == "include",
         )
     except DuplicateImportImagesError as exc:
         fail_job(
@@ -204,7 +222,12 @@ async def upload_import_task_files(
         project = validate_import_quota(db, payload, uploaded_bytes=total_bytes)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    job.raw = {**(job.raw or {}), "upload_artifacts": uploaded, "upload_storage_bytes": total_bytes}
+    job.raw = {
+        **(job.raw or {}),
+        "upload_artifacts": uploaded,
+        "upload_storage_bytes": total_bytes,
+        "upload_duplicate_review": duplicate_review,
+    }
     job.detail = f"Queued upload of {len(uploaded)} files."
     db.add(job)
     record_import_storage_usage(db, project, total_bytes)
@@ -221,6 +244,23 @@ async def upload_import_task_files(
     attach_celery_task(db, job.id, task.id)
     db.refresh(job)
     return ImportJobRead(job=JobRead.model_validate(job))
+
+
+async def _upload_files_from_request(request: Request) -> list[UploadFile]:
+    try:
+        form = await request.form(max_files=IMPORT_UPLOAD_MAX_FILES)
+        files = [item for item in form.getlist("files") if isinstance(item, UploadFile)]
+    except Exception as exc:
+        message = str(exc)
+        if "maximum number of files" in message.casefold():
+            raise HTTPException(
+                status_code=413,
+                detail="Muitos arquivos no upload para o parser multipart.",
+            ) from exc
+        raise
+    if not files:
+        raise HTTPException(status_code=422, detail="Nenhum arquivo foi enviado para importacao.")
+    return files
 
 
 def _duplicate_upload_filenames(files: list[UploadFile]) -> list[str]:

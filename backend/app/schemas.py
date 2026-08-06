@@ -17,7 +17,8 @@ AnnotationType = Literal["shape", "track", "tag"]
 InferenceModelFamily = Literal["detection", "segmentation", "classification", "tracking"]
 InferenceApplyMode = Literal["append", "replace"]
 UserRole = Literal["admin", "anotador"]
-AnnotationImportTarget = Literal["annotation", "review"]
+AnnotationImportTarget = Literal["annotation", "review", "ready"]
+ImportDuplicatePolicy = Literal["review", "ignore", "include"]
 DatasetReleaseImageScope = Literal["all", "annotated"]
 
 
@@ -40,6 +41,11 @@ class DirectoryListingRead(BaseModel):
     path: str
     parent: str | None = None
     entries: list[DirectoryEntryRead] = Field(default_factory=list)
+
+
+class DirectoryCreate(BaseModel):
+    parent_path: str | None = Field(default=None, max_length=4096)
+    name: str = Field(min_length=1, max_length=255)
 
 
 class CvatStatusRead(BaseModel):
@@ -742,6 +748,7 @@ class ImportTaskCreate(BaseModel):
     labels: list[dict[str, Any]] = Field(default_factory=list)
     class_mappings: list[dict[str, Any]] = Field(default_factory=list)
     annotation_import_target: AnnotationImportTarget = "review"
+    duplicate_policy: ImportDuplicatePolicy = "review"
     source_path: str | None = Field(default=None, max_length=2048)
     estimated_bytes: int | None = Field(default=None, ge=0)
     sync_after_import: bool = True
